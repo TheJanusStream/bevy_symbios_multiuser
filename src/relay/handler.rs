@@ -11,13 +11,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Maximum number of queued outbound messages per peer before backpressure.
+const RELAY_CHANNEL_CAPACITY: usize = 256;
+
 /// A signaling envelope exchanged between peers via the relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEnvelope {
     /// The target peer's session ID. When received from the relay,
     /// this is the sender's session ID instead.
     pub peer_id: String,
-    /// The signaling payload (SDP offer/answer or ICE candidate).
+    /// The signaling payload (SDP offer/answer, ICE candidate, or control).
     pub signal: SignalPayload,
 }
 
@@ -31,6 +34,10 @@ pub enum SignalPayload {
     Answer(String),
     /// An ICE candidate for NAT traversal.
     IceCandidate(String),
+    /// A new peer has joined the relay.
+    PeerJoined(String),
+    /// A peer has left the relay.
+    PeerLeft(String),
 }
 
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
@@ -47,7 +54,7 @@ pub async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: RelayState) {
     let session_id = Uuid::new_v4().to_string();
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<SignalEnvelope>();
+    let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
     state.peers.insert(session_id.clone(), relay_tx);
 
@@ -74,15 +81,14 @@ async fn handle_socket(socket: WebSocket, state: RelayState) {
         .send(Message::Text(peer_list.to_string().into()))
         .await;
 
-    // Notify existing peers about the new peer.
-    let new_peer_msg = serde_json::json!({ "type": "new_peer", "id": session_id });
+    // Notify existing peers about the new peer using a proper control variant.
     for entry in state.peers.iter() {
         if *entry.key() != session_id {
             let envelope = SignalEnvelope {
                 peer_id: session_id.clone(),
-                signal: SignalPayload::Offer(new_peer_msg.to_string()),
+                signal: SignalPayload::PeerJoined(session_id.clone()),
             };
-            let _ = entry.value().send(envelope);
+            let _ = entry.value().send(envelope).await;
         }
     }
 
@@ -103,46 +109,57 @@ async fn handle_socket(socket: WebSocket, state: RelayState) {
     });
 
     // Read messages from the WebSocket and route them to the target peer.
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Close(_) => break,
-            _ => continue,
-        };
+    // If the write task dies (e.g. broken connection), stop reading too.
+    let read_task = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let text = match msg {
+                Message::Text(t) => t.to_string(),
+                Message::Close(_) => break,
+                _ => continue,
+            };
 
-        let envelope: SignalEnvelope = match serde_json::from_str(&text) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "invalid signal envelope from peer");
-                continue;
+            let envelope: SignalEnvelope = match serde_json::from_str(&text) {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(error = %err, "invalid signal envelope from peer");
+                    continue;
+                }
+            };
+
+            // Route to target peer, rewriting peer_id to the sender's ID.
+            let target_id = envelope.peer_id.clone();
+            let forwarded = SignalEnvelope {
+                peer_id: session_id.clone(),
+                signal: envelope.signal,
+            };
+
+            if let Some(sender) = state_write.peers.get(&target_id) {
+                let _ = sender.value().send(forwarded).await;
+            } else {
+                tracing::debug!(target = %target_id, "target peer not found, dropping signal");
             }
-        };
+        }
+    };
 
-        // Route to target peer, rewriting peer_id to the sender's ID.
-        let target_id = envelope.peer_id.clone();
-        let forwarded = SignalEnvelope {
-            peer_id: session_id.clone(),
-            signal: envelope.signal,
-        };
-
-        if let Some(sender) = state_write.peers.get(&target_id) {
-            let _ = sender.value().send(forwarded);
-        } else {
-            tracing::debug!(target = %target_id, "target peer not found, dropping signal");
+    // Either task finishing causes the other to be cleaned up.
+    tokio::select! {
+        _ = write_task => {
+            tracing::debug!(session = %session_id_write, "write task ended, stopping read");
+        }
+        _ = read_task => {
+            tracing::debug!(session = %session_id_write, "read task ended");
         }
     }
 
     // Cleanup: remove peer from the map and notify others.
-    state.peers.remove(&session_id);
-    let left_msg = serde_json::json!({ "type": "peer_left", "id": session_id_write });
+    state.peers.remove(&session_id_write);
     for entry in state.peers.iter() {
         let envelope = SignalEnvelope {
             peer_id: session_id_write.clone(),
-            signal: SignalPayload::IceCandidate(left_msg.to_string()),
+            signal: SignalPayload::PeerLeft(session_id_write.clone()),
         };
-        let _ = entry.value().send(envelope);
+        let _ = entry.value().send(envelope).await;
     }
 
-    write_task.abort();
     tracing::info!(session = %session_id_write, "peer disconnected");
 }

@@ -68,7 +68,8 @@ where
                     systems::poll_peers,
                     systems::receive_messages::<T>,
                     systems::transmit_messages::<T>,
-                ),
+                )
+                    .chain(),
             );
     }
 }

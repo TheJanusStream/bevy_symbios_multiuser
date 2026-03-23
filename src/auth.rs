@@ -58,19 +58,32 @@ struct RefreshSessionResponse {
     refresh_jwt: String,
 }
 
+/// Validate that a PDS URL uses HTTPS to prevent credential leakage.
+fn validate_pds_url(url: &str) -> Result<(), SymbiosError> {
+    let trimmed = url.trim_end_matches('/');
+    if !trimmed.starts_with("https://") {
+        return Err(SymbiosError::AuthFailed(format!(
+            "PDS URL must use HTTPS to protect credentials, got: {trimmed}"
+        )));
+    }
+    Ok(())
+}
+
 /// Authenticate with an ATProto PDS using `com.atproto.server.createSession`.
 ///
 /// Returns an [`AtprotoSession`] on success containing the access/refresh JWTs
 /// and the authenticated DID.
 pub async fn create_session(
+    client: &reqwest::Client,
     credentials: &AtprotoCredentials,
 ) -> Result<AtprotoSession, SymbiosError> {
+    validate_pds_url(&credentials.pds_url)?;
+
     let url = format!(
         "{}/xrpc/com.atproto.server.createSession",
         credentials.pds_url.trim_end_matches('/')
     );
 
-    let client = reqwest::Client::new();
     let response: CreateSessionResponse = client
         .post(&url)
         .json(&CreateSessionRequest {
@@ -96,15 +109,17 @@ pub async fn create_session(
 ///
 /// Returns a new [`AtprotoSession`] with updated tokens.
 pub async fn refresh_session(
+    client: &reqwest::Client,
     session: &AtprotoSession,
     pds_url: &str,
 ) -> Result<AtprotoSession, SymbiosError> {
+    validate_pds_url(pds_url)?;
+
     let url = format!(
         "{}/xrpc/com.atproto.server.refreshSession",
         pds_url.trim_end_matches('/')
     );
 
-    let client = reqwest::Client::new();
     let response: RefreshSessionResponse = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", session.refresh_jwt))

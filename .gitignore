@@ -5,5 +5,5 @@ Cargo.lock
 /.chainlink
 CHANGELOG.md
 bevy-symbios-multiuser-primer.sh
-bevy_symbios_multiuser_shape_*
+bevy_symbios_multiuser_primer_*
 .mcp.json

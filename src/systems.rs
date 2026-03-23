@@ -3,7 +3,12 @@ use crate::events::{
 };
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
+
+/// Maximum size in bytes for a single deserialized network message.
+/// Prevents OOM from malicious length-prefixed payloads.
+const MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MiB
 
 /// Polls the matchbox socket for peer connection state changes and writes
 /// [`PeerStateChanged`] messages.
@@ -45,7 +50,11 @@ pub fn receive_messages<T>(
 
         let messages = channel.receive();
         for (peer, packet) in messages {
-            match bincode::deserialize::<T>(&packet) {
+            let options = bincode::DefaultOptions::new()
+                .with_limit(MAX_MESSAGE_SIZE)
+                .with_fixint_encoding()
+                .with_little_endian();
+            match options.deserialize::<T>(&packet) {
                 Ok(payload) => {
                     tracing::trace!(
                         sender = %peer,
@@ -80,7 +89,8 @@ pub fn transmit_messages<T>(
 {
     let peers: Vec<PeerId> = socket.connected_peers().collect();
     if peers.is_empty() {
-        // Drain messages so they don't accumulate when no peers are connected.
+        // Advance the reader cursor so stale messages aren't processed
+        // if peers connect later this frame.
         broadcasts.read().for_each(drop);
         return;
     }

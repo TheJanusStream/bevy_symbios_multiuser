@@ -34,7 +34,7 @@ pub struct RelayConfig {
 }
 
 /// A connected peer's sender handle, keyed by their session identifier.
-type PeerSender = mpsc::UnboundedSender<SignalEnvelope>;
+type PeerSender = mpsc::Sender<SignalEnvelope>;
 
 /// Shared server state holding the map of connected peers.
 #[derive(Clone)]
