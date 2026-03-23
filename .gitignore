@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock
+/.claude
+/.chainlink
+CHANGELOG.md
+bevy-symbios-multiuser-primer.sh
+bevy_symbios_multiuser_shape_*
+.mcp.json

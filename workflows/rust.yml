@@ -1,0 +1,33 @@
+name: Rust
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+    branches: ["master", "main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Check Formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy (Linting)
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run Tests
+        run: cargo test --verbose

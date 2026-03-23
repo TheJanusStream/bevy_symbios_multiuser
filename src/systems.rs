@@ -1,0 +1,111 @@
+use crate::events::{
+    BroadcastMessage, ChannelKind, NetworkMessageReceived, PeerConnectionState, PeerStateChanged,
+};
+use bevy::prelude::*;
+use bevy_matchbox::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// Polls the matchbox socket for peer connection state changes and writes
+/// [`PeerStateChanged`] messages.
+pub fn poll_peers(
+    mut socket: ResMut<MatchboxSocket>,
+    mut peer_messages: MessageWriter<PeerStateChanged>,
+) {
+    let Ok(changes) = socket.try_update_peers() else {
+        return;
+    };
+
+    for (peer, state) in changes {
+        let connection_state = match state {
+            PeerState::Connected => PeerConnectionState::Connected,
+            PeerState::Disconnected => PeerConnectionState::Disconnected,
+        };
+        tracing::info!(peer = %peer, state = ?connection_state, "peer state changed");
+        peer_messages.write(PeerStateChanged {
+            peer,
+            state: connection_state,
+        });
+    }
+}
+
+/// Drains incoming data from all channels, deserializes from `bincode`,
+/// and writes [`NetworkMessageReceived<T>`] messages.
+pub fn receive_messages<T>(
+    mut socket: ResMut<MatchboxSocket>,
+    mut received: MessageWriter<NetworkMessageReceived<T>>,
+) where
+    T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    for channel_kind in [ChannelKind::Reliable, ChannelKind::Unreliable] {
+        let channel_idx = channel_kind.index();
+        let channel = match socket.get_channel_mut(channel_idx) {
+            Ok(ch) => ch,
+            Err(_) => continue,
+        };
+
+        let messages = channel.receive();
+        for (peer, packet) in messages {
+            match bincode::deserialize::<T>(&packet) {
+                Ok(payload) => {
+                    tracing::trace!(
+                        sender = %peer,
+                        channel = ?channel_kind,
+                        "received message"
+                    );
+                    received.write(NetworkMessageReceived {
+                        payload,
+                        sender: peer,
+                        channel: channel_kind,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        sender = %peer,
+                        error = %err,
+                        "failed to deserialize incoming message"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Reads [`BroadcastMessage<T>`] messages, serializes them via `bincode`, and
+/// sends the bytes to all connected peers on the specified channel.
+pub fn transmit_messages<T>(
+    mut socket: ResMut<MatchboxSocket>,
+    mut broadcasts: MessageReader<BroadcastMessage<T>>,
+) where
+    T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    let peers: Vec<PeerId> = socket.connected_peers().collect();
+    if peers.is_empty() {
+        // Drain messages so they don't accumulate when no peers are connected.
+        broadcasts.read().for_each(drop);
+        return;
+    }
+
+    for event in broadcasts.read() {
+        let bytes = match bincode::serialize(&event.payload) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize broadcast message");
+                continue;
+            }
+        };
+        let packet: Box<[u8]> = bytes.into_boxed_slice();
+        let channel_idx = event.channel.index();
+
+        let channel = match socket.get_channel_mut(channel_idx) {
+            Ok(ch) => ch,
+            Err(err) => {
+                tracing::error!(channel = channel_idx, error = ?err, "channel unavailable");
+                continue;
+            }
+        };
+
+        for &peer in &peers {
+            channel.send(packet.clone(), peer);
+        }
+    }
+}
