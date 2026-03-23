@@ -3,12 +3,13 @@ use super::auth;
 use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
     extract::{
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use serde::Deserialize;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -16,12 +17,22 @@ use uuid::Uuid;
 /// Maximum number of queued outbound messages per peer before backpressure.
 const RELAY_CHANNEL_CAPACITY: usize = 256;
 
+/// Optional query parameters on the WebSocket upgrade URL.
+///
+/// WASM clients cannot set custom HTTP headers on the browser `WebSocket`
+/// constructor, so they pass the ATProto JWT via `?token=<jwt>` instead.
+#[derive(Debug, Deserialize)]
+pub struct WsQueryParams {
+    token: Option<String>,
+}
+
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
 ///
 /// When `auth_required` is enabled on the relay, the handler extracts a
-/// `Bearer` token from the `Authorization` header, validates it as an ATProto
-/// JWT, and uses the authenticated DID as the peer's session identity.
-/// Unauthenticated requests receive HTTP 401.
+/// `Bearer` token from the `Authorization` header **or** a `token` query
+/// parameter (for WASM clients), validates it as an ATProto JWT, and uses the
+/// authenticated DID as the peer's session identity. Unauthenticated requests
+/// receive HTTP 401.
 ///
 /// When `auth_required` is disabled, authentication is opportunistic: a valid
 /// JWT will still be used for identity, but missing or invalid tokens are
@@ -29,9 +40,10 @@ const RELAY_CHANNEL_CAPACITY: usize = 256;
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
+    Query(query): Query<WsQueryParams>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    let identity = extract_identity(&headers, state.auth_required);
+    let identity = extract_identity(&headers, query.token.as_deref(), state.auth_required);
 
     match identity {
         Err(rejection) => rejection.into_response(),
@@ -42,28 +54,28 @@ pub async fn ws_handler(
 }
 
 /// Attempt to extract a [`ValidatedIdentity`](auth::ValidatedIdentity) from
-/// the `Authorization: Bearer <token>` header.
+/// the `Authorization: Bearer <token>` header, falling back to a `token`
+/// query parameter (used by WASM clients that cannot set custom headers).
 ///
 /// Returns `Err` with a 401 response only when `auth_required` is true and
-/// the token is missing or invalid.
+/// no valid token is found in either location.
 fn extract_identity(
     headers: &HeaderMap,
+    query_token: Option<&str>,
     auth_required: bool,
 ) -> Result<Option<auth::ValidatedIdentity>, (StatusCode, &'static str)> {
-    let Some(auth_header) = headers.get("authorization") else {
-        if auth_required {
-            return Err((StatusCode::UNAUTHORIZED, "Authorization header required"));
-        }
-        return Ok(None);
-    };
+    // 1. Try the Authorization header first (native clients).
+    let header_token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
 
-    let auth_str = auth_header
-        .to_str()
-        .unwrap_or("");
+    // 2. Fall back to the query parameter (WASM clients).
+    let token = header_token.or(query_token);
 
-    let Some(token) = auth_str.strip_prefix("Bearer ") else {
+    let Some(token) = token else {
         if auth_required {
-            return Err((StatusCode::UNAUTHORIZED, "Missing Bearer token"));
+            return Err((StatusCode::UNAUTHORIZED, "Authorization required"));
         }
         return Ok(None);
     };
