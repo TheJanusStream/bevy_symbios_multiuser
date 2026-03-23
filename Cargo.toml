@@ -21,10 +21,9 @@ thiserror = "2"
 matchbox_socket = "0.14"
 
 # Client-side ATProto authentication
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json"], optional = true }
 
-# Client-side custom signaller
-async-tungstenite = { version = "0.32", default-features = false, features = ["async-std-runtime"], optional = true }
+# Client-side custom signaller (shared)
 futures-util = { version = "0.3", optional = true }
 futures-timer = { version = "3", optional = true }
 uuid = { version = "1", features = ["v4", "v5", "serde"], optional = true }
@@ -35,9 +34,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optio
 dashmap = { version = "6", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 
+# Native-only signaller transport
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+async-tungstenite = { version = "0.32", default-features = false, features = ["async-std-runtime"], optional = true }
+
+# WASM-only signaller transport
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ws_stream_wasm = { version = "0.7", optional = true }
+
 [features]
-default = ["client"]
-client = ["dep:reqwest", "dep:async-tungstenite", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
+default = ["client", "native-tls"]
+client = ["dep:reqwest", "dep:async-tungstenite", "dep:ws_stream_wasm", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
+native-tls = ["reqwest/rustls-tls"]
 relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken"]
 
 [dev-dependencies]

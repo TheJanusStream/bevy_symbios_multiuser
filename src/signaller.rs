@@ -8,11 +8,17 @@
 //! When an [`AtprotoSession`](crate::auth::AtprotoSession) resource is present
 //! in the Bevy world, the plugin automatically uses this signaller instead of
 //! the default (unauthenticated) matchbox WebSocket signaller.
+//!
+//! # Platform Support
+//!
+//! On native targets, the WebSocket connection uses `async-tungstenite` with
+//! the JWT passed as an `Authorization` header during the upgrade handshake.
+//!
+//! On WASM targets, the browser's `WebSocket` API (via `ws_stream_wasm`) is
+//! used instead. Because the browser `WebSocket` constructor does not support
+//! custom headers, the JWT is passed as a `token` query parameter on the URL.
 
 use crate::protocol::{SignalEnvelope, SignalPayload};
-use async_tungstenite::async_std::{connect_async, ConnectStream};
-use async_tungstenite::tungstenite;
-use async_tungstenite::WebSocketStream;
 #[allow(unused_imports)] // SinkExt is used by .send() inside async_trait impls
 use futures_util::SinkExt;
 use futures_util::StreamExt;
@@ -25,6 +31,22 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+// ── Native-only imports ──────────────────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+use async_tungstenite::async_std::{connect_async, ConnectStream};
+#[cfg(not(target_arch = "wasm32"))]
+use async_tungstenite::tungstenite;
+#[cfg(not(target_arch = "wasm32"))]
+use async_tungstenite::WebSocketStream;
+
+// ── WASM-only imports ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+use ws_stream_wasm::{WsMeta, WsStream, WsMessage as WasmWsMessage};
+
+// ── Shared constants & helpers ───────────────────────────────────────────────
 
 /// Namespace UUID for deterministic `PeerId` generation from DID strings.
 /// Produced by `Uuid::new_v5(Uuid::NAMESPACE_URL, b"symbios:did")`.
@@ -45,6 +67,8 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
     }
 }
 
+// ── SignallerBuilder ─────────────────────────────────────────────────────────
+
 /// A [`SignallerBuilder`] that injects an ATProto JWT into the WebSocket
 /// upgrade request's `Authorization` header.
 #[derive(Debug, Clone)]
@@ -62,17 +86,12 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
         room_url: String,
     ) -> Result<Box<dyn Signaller>, SignalingError> {
         let ws = 'connect: loop {
-            let request = build_ws_request(&room_url, self.access_jwt.as_deref())
-                .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
-
-            match connect_async(request).await {
-                Ok((stream, _)) => break stream,
+            match self.try_connect(&room_url).await {
+                Ok(stream) => break stream,
                 Err(e) => {
                     if let Some(ref mut remaining) = attempts {
                         if *remaining <= 1 {
-                            return Err(SignalingError::NegotiationFailed(
-                                Box::new(SignalingError::from(e)),
-                            ));
+                            return Err(SignalingError::NegotiationFailed(Box::new(e)));
                         }
                         *remaining -= 1;
                         tracing::warn!(
@@ -105,7 +124,22 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
     }
 }
 
-/// Build a `tungstenite::http::Request` with an optional `Authorization` header.
+// ── Native connection ────────────────────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SymbiosSignallerBuilder {
+    async fn try_connect(
+        &self,
+        room_url: &str,
+    ) -> Result<WebSocketStream<ConnectStream>, SignalingError> {
+        let request = build_ws_request(room_url, self.access_jwt.as_deref())
+            .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
+        let (stream, _) = connect_async(request).await.map_err(SignalingError::from)?;
+        Ok(stream)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn build_ws_request(
     url: &str,
     access_jwt: Option<&str>,
@@ -117,10 +151,38 @@ fn build_ws_request(
     builder.body(())
 }
 
+// ── WASM connection ──────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+impl SymbiosSignallerBuilder {
+    async fn try_connect(&self, room_url: &str) -> Result<WsStream, SignalingError> {
+        // The browser WebSocket API does not support custom headers, so we pass
+        // the JWT as a query parameter instead.
+        let url = match self.access_jwt.as_deref() {
+            Some(token) => {
+                let separator = if room_url.contains('?') { "&" } else { "?" };
+                format!("{room_url}{separator}token={token}")
+            }
+            None => room_url.to_owned(),
+        };
+
+        let (_meta, stream) = WsMeta::connect(&url, None)
+            .await
+            .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
+
+        Ok(stream)
+    }
+}
+
+// ── Signaller ────────────────────────────────────────────────────────────────
+
 /// A [`Signaller`] that bridges between the matchbox protocol and the Symbios
 /// relay's [`SignalEnvelope`] wire format.
 pub struct SymbiosSignaller {
+    #[cfg(not(target_arch = "wasm32"))]
     ws: WebSocketStream<ConnectStream>,
+    #[cfg(target_arch = "wasm32")]
+    ws: WsStream,
     local_peer_id: PeerId,
     session_to_peer: HashMap<String, PeerId>,
     peer_to_session: HashMap<PeerId, String>,
@@ -169,20 +231,6 @@ impl SymbiosSignaller {
         Ok(())
     }
 
-    /// Read the next text frame from the WebSocket.
-    async fn read_text(&mut self) -> Result<String, SignalingError> {
-        loop {
-            match self.ws.next().await {
-                Some(Ok(tungstenite::Message::Text(t))) => return Ok(t.to_string()),
-                Some(Ok(tungstenite::Message::Close(_))) | None => {
-                    return Err(SignalingError::StreamExhausted);
-                }
-                Some(Ok(_)) => continue, // skip pings, binary, etc.
-                Some(Err(e)) => return Err(SignalingError::from(e)),
-            }
-        }
-    }
-
     /// Look up or create a `PeerId` for the given session ID string.
     fn get_or_create_peer_id(&mut self, session_id: &str) -> PeerId {
         if let Some(&pid) = self.session_to_peer.get(session_id) {
@@ -207,6 +255,39 @@ impl SymbiosSignaller {
             .unwrap_or_else(|| session_id_to_peer_id(session_id));
         self.peer_to_session.remove(&pid);
         pid
+    }
+}
+
+// ── Platform-specific read_text / Signaller impl ─────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SymbiosSignaller {
+    /// Read the next text frame from the WebSocket (native).
+    async fn read_text(&mut self) -> Result<String, SignalingError> {
+        loop {
+            match self.ws.next().await {
+                Some(Ok(tungstenite::Message::Text(t))) => return Ok(t.to_string()),
+                Some(Ok(tungstenite::Message::Close(_))) | None => {
+                    return Err(SignalingError::StreamExhausted);
+                }
+                Some(Ok(_)) => continue, // skip pings, binary, etc.
+                Some(Err(e)) => return Err(SignalingError::from(e)),
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SymbiosSignaller {
+    /// Read the next text frame from the WebSocket (WASM).
+    async fn read_text(&mut self) -> Result<String, SignalingError> {
+        loop {
+            match self.ws.next().await {
+                Some(WasmWsMessage::Text(t)) => return Ok(t),
+                Some(WasmWsMessage::Binary(_)) => continue,
+                None => return Err(SignalingError::StreamExhausted),
+            }
+        }
     }
 }
 
@@ -236,17 +317,9 @@ impl Signaller for SymbiosSignaller {
                 let json = serde_json::to_string(&envelope)
                     .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
 
-                self.ws
-                    .send(tungstenite::Message::Text(json.into()))
-                    .await
-                    .map_err(SignalingError::from)
+                self.send_text(json).await
             }
-            PeerRequest::KeepAlive => {
-                self.ws
-                    .send(tungstenite::Message::Ping(vec![].into()))
-                    .await
-                    .map_err(SignalingError::from)
-            }
+            PeerRequest::KeepAlive => self.send_ping().await,
         }
     }
 
@@ -301,6 +374,42 @@ impl Signaller for SymbiosSignaller {
         }
     }
 }
+
+// ── Platform-specific send helpers ───────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SymbiosSignaller {
+    async fn send_text(&mut self, text: String) -> Result<(), SignalingError> {
+        self.ws
+            .send(tungstenite::Message::Text(text.into()))
+            .await
+            .map_err(SignalingError::from)
+    }
+
+    async fn send_ping(&mut self) -> Result<(), SignalingError> {
+        self.ws
+            .send(tungstenite::Message::Ping(vec![].into()))
+            .await
+            .map_err(SignalingError::from)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SymbiosSignaller {
+    async fn send_text(&mut self, text: String) -> Result<(), SignalingError> {
+        self.ws
+            .send(WasmWsMessage::Text(text))
+            .await
+            .map_err(|e| SignalingError::UserImplementationError(e.to_string()))
+    }
+
+    async fn send_ping(&mut self) -> Result<(), SignalingError> {
+        // The browser handles WebSocket pings/pongs automatically — no-op.
+        Ok(())
+    }
+}
+
+// ── Public constructor ───────────────────────────────────────────────────────
 
 /// Create an [`Arc`]-wrapped [`SymbiosSignallerBuilder`] ready for use with
 /// [`WebRtcSocketBuilder::signaller_builder`](matchbox_socket::WebRtcSocket).

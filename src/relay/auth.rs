@@ -45,6 +45,10 @@ pub struct ValidatedIdentity {
 pub fn validate_atproto_jwt(token: &str) -> Result<ValidatedIdentity, String> {
     let mut validation = Validation::default();
     validation.insecure_disable_signature_validation();
+    tracing::warn!(
+        "JWT signature verification is disabled — implement DID-document key \
+         resolution before production deployment"
+    );
     validation.validate_exp = true;
     // ATProto JWTs typically use ES256 (P-256). Accept common algorithms
     // since signature verification is disabled.
