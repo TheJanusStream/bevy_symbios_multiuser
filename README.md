@@ -78,8 +78,8 @@ fn send_movement(mut writer: MessageWriter<BroadcastMessage<GameMessage>>) {
 
 | Feature  | Default | Description                                         |
 |----------|---------|-----------------------------------------------------|
-| `client` | Yes     | ATProto authentication via `reqwest`                 |
-| `relay`  | No      | XRPC relay signaling server built on `axum`/`tokio`  |
+| `client` | Yes     | ATProto authentication via `reqwest`                |
+| `relay`  | No      | XRPC relay signaling server built on `axum`/`tokio` |
 
 ### Running the Relay Server
 
