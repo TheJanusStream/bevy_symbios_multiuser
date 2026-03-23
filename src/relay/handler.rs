@@ -1,58 +1,95 @@
 use super::RelayState;
+use super::auth;
+use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
     extract::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Maximum number of queued outbound messages per peer before backpressure.
 const RELAY_CHANNEL_CAPACITY: usize = 256;
 
-/// A signaling envelope exchanged between peers via the relay.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalEnvelope {
-    /// The target peer's session ID. When received from the relay,
-    /// this is the sender's session ID instead.
-    pub peer_id: String,
-    /// The signaling payload (SDP offer/answer, ICE candidate, or control).
-    pub signal: SignalPayload,
-}
-
-/// WebRTC signaling data carried inside a [`SignalEnvelope`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum SignalPayload {
-    /// An SDP offer from the initiating peer.
-    Offer(String),
-    /// An SDP answer from the responding peer.
-    Answer(String),
-    /// An ICE candidate for NAT traversal.
-    IceCandidate(String),
-    /// A new peer has joined the relay.
-    PeerJoined(String),
-    /// A peer has left the relay.
-    PeerLeft(String),
-}
-
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
 ///
-/// Each connected client is assigned a unique session ID and registered in the
-/// relay's peer map. Incoming signal envelopes are routed to the target peer.
+/// When `auth_required` is enabled on the relay, the handler extracts a
+/// `Bearer` token from the `Authorization` header, validates it as an ATProto
+/// JWT, and uses the authenticated DID as the peer's session identity.
+/// Unauthenticated requests receive HTTP 401.
+///
+/// When `auth_required` is disabled, authentication is opportunistic: a valid
+/// JWT will still be used for identity, but missing or invalid tokens are
+/// silently ignored and a random UUID is assigned instead.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    let identity = extract_identity(&headers, state.auth_required);
+
+    match identity {
+        Err(rejection) => rejection.into_response(),
+        Ok(id) => ws
+            .on_upgrade(move |socket| handle_socket(socket, state, id))
+            .into_response(),
+    }
 }
 
-async fn handle_socket(socket: WebSocket, state: RelayState) {
-    let session_id = Uuid::new_v4().to_string();
+/// Attempt to extract a [`ValidatedIdentity`](auth::ValidatedIdentity) from
+/// the `Authorization: Bearer <token>` header.
+///
+/// Returns `Err` with a 401 response only when `auth_required` is true and
+/// the token is missing or invalid.
+fn extract_identity(
+    headers: &HeaderMap,
+    auth_required: bool,
+) -> Result<Option<auth::ValidatedIdentity>, (StatusCode, &'static str)> {
+    let Some(auth_header) = headers.get("authorization") else {
+        if auth_required {
+            return Err((StatusCode::UNAUTHORIZED, "Authorization header required"));
+        }
+        return Ok(None);
+    };
+
+    let auth_str = auth_header
+        .to_str()
+        .unwrap_or("");
+
+    let Some(token) = auth_str.strip_prefix("Bearer ") else {
+        if auth_required {
+            return Err((StatusCode::UNAUTHORIZED, "Missing Bearer token"));
+        }
+        return Ok(None);
+    };
+
+    match auth::validate_atproto_jwt(token) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(e) => {
+            tracing::warn!(error = %e, "JWT validation failed");
+            if auth_required {
+                Err((StatusCode::UNAUTHORIZED, "Invalid JWT"))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: RelayState,
+    identity: Option<auth::ValidatedIdentity>,
+) {
+    let session_id = match identity {
+        Some(ref id) => id.did.clone(),
+        None => Uuid::new_v4().to_string(),
+    };
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 

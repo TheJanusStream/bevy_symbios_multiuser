@@ -17,6 +17,7 @@ fn main() {
         rt.block_on(async {
             let config = RelayConfig {
                 bind_addr: "0.0.0.0:3536".to_string(),
+                auth_required: false,
             };
 
             println!("Starting relay server on {}", config.bind_addr);

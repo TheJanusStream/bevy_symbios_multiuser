@@ -23,17 +23,22 @@ matchbox_socket = "0.14"
 # Client-side ATProto authentication
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
+# Client-side custom signaller
+async-tungstenite = { version = "0.32", default-features = false, features = ["async-std-runtime"], optional = true }
+futures-util = { version = "0.3", optional = true }
+futures-timer = { version = "3", optional = true }
+uuid = { version = "1", features = ["v4", "v5", "serde"], optional = true }
+
 # Relay server dependencies
 axum = { version = "0.8", features = ["ws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
 dashmap = { version = "6", optional = true }
-futures-util = { version = "0.3", optional = true }
-uuid = { version = "1", features = ["v4", "serde"], optional = true }
+jsonwebtoken = { version = "9", optional = true }
 
 [features]
 default = ["client"]
-client = ["dep:reqwest"]
-relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid"]
+client = ["dep:reqwest", "dep:async-tungstenite", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
+relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

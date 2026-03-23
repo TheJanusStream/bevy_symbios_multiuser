@@ -22,4 +22,9 @@ pub enum SymbiosError {
     #[cfg(feature = "client")]
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
+
+    /// JWT validation failed on the relay.
+    #[cfg(feature = "relay")]
+    #[error("JWT validation failed: {0}")]
+    JwtValidationFailed(String),
 }

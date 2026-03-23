@@ -6,6 +6,9 @@ use matchbox_socket::RtcIceServerConfig;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
+#[cfg(feature = "client")]
+use crate::auth::AtprotoSession;
+
 /// Configuration for the symbios multiuser plugin.
 #[derive(Resource, Debug, Clone)]
 pub struct SymbiosMultiuserConfig {
@@ -74,13 +77,24 @@ where
     }
 }
 
-fn open_socket(mut commands: Commands, config: Res<SymbiosMultiuserConfig>) {
+fn open_socket(
+    mut commands: Commands,
+    config: Res<SymbiosMultiuserConfig>,
+    #[cfg(feature = "client")] session: Option<Res<AtprotoSession>>,
+) {
     let mut builder = WebRtcSocketBuilder::new(&config.room_url)
         .add_channel(ChannelConfig::reliable())
         .add_channel(ChannelConfig::unreliable());
 
     if let Some(ref ice) = config.ice_servers {
         builder = builder.ice_server(ice.clone());
+    }
+
+    // When an authenticated ATProto session is available, use the custom
+    // signaller that passes the JWT to our relay via Authorization header.
+    #[cfg(feature = "client")]
+    if let Some(session) = session {
+        builder = builder.signaller_builder(crate::signaller::signaller_for_session(&session));
     }
 
     commands.open_socket(builder);

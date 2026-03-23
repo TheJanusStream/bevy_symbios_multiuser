@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 /// Prevents OOM from malicious length-prefixed payloads.
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MiB
 
+/// Returns the canonical bincode options used for all network serialization.
+/// Both transmit and receive **must** use this to avoid encoding mismatches.
+fn bincode_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_MESSAGE_SIZE)
+        .with_fixint_encoding()
+        .with_little_endian()
+}
+
 /// Polls the matchbox socket for peer connection state changes and writes
 /// [`PeerStateChanged`] messages.
 pub fn poll_peers(
@@ -50,11 +59,7 @@ pub fn receive_messages<T>(
 
         let messages = channel.receive();
         for (peer, packet) in messages {
-            let options = bincode::DefaultOptions::new()
-                .with_limit(MAX_MESSAGE_SIZE)
-                .with_fixint_encoding()
-                .with_little_endian();
-            match options.deserialize::<T>(&packet) {
+            match bincode_options().deserialize::<T>(&packet) {
                 Ok(payload) => {
                     tracing::trace!(
                         sender = %peer,
@@ -96,7 +101,7 @@ pub fn transmit_messages<T>(
     }
 
     for event in broadcasts.read() {
-        let bytes = match bincode::serialize(&event.payload) {
+        let bytes = match bincode_options().serialize(&event.payload) {
             Ok(b) => b,
             Err(err) => {
                 tracing::error!(error = %err, "failed to serialize broadcast message");
