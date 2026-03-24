@@ -21,8 +21,8 @@ use jsonwebtoken::DecodingKey;
 use p256::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default cache TTL for resolved DID signing keys (5 minutes).
@@ -79,10 +79,7 @@ pub struct DidResolver {
 /// Percent-encoded port separators (`%3A`) in the domain are decoded.
 fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
     if did.starts_with("did:plc:") {
-        Ok(format!(
-            "{}/{did}",
-            plc_directory.trim_end_matches('/')
-        ))
+        Ok(format!("{}/{did}", plc_directory.trim_end_matches('/')))
     } else if did.starts_with("did:web:") {
         let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
         // Split into domain (first segment) and optional path segments.
@@ -129,11 +126,7 @@ fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, Str
 
     for addr in &addrs {
         let ip = addr.ip();
-        if ip.is_loopback()
-            || ip.is_unspecified()
-            || is_private_ip(&ip)
-            || is_link_local(&ip)
-        {
+        if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) || is_link_local(&ip) {
             return Err(format!(
                 "did:web domain '{domain}' resolves to private/loopback address {ip}, \
                  request blocked (SSRF protection)"
@@ -398,7 +391,10 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
 
     // Multibase `z` prefix = base58btc encoding.
     let encoded = multibase.strip_prefix('z').ok_or_else(|| {
-        let prefix = multibase.chars().next().map_or("(empty)", |_| &multibase[..1]);
+        let prefix = multibase
+            .chars()
+            .next()
+            .map_or("(empty)", |_| &multibase[..1]);
         format!("unsupported multibase prefix: {prefix}")
     })?;
 
@@ -572,8 +568,7 @@ mod tests {
 
     #[test]
     fn did_web_percent_encoded_port() {
-        let url =
-            did_document_url("did:web:example.com%3A8443", DEFAULT_PLC_DIRECTORY).unwrap();
+        let url = did_document_url("did:web:example.com%3A8443", DEFAULT_PLC_DIRECTORY).unwrap();
         assert_eq!(url, "https://example.com:8443/.well-known/did.json");
     }
 
