@@ -282,10 +282,11 @@ impl DidResolver {
             let parts: Vec<&str> = raw.splitn(2, ':').collect();
             let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
             let validated_addr = validate_and_resolve_domain(&domain)?;
+            let host_only = domain.split(':').next().unwrap_or(&domain);
             // Build a one-off client that pins DNS resolution to the validated IP.
             let pinned = reqwest::Client::builder()
                 .timeout(DID_FETCH_TIMEOUT)
-                .resolve(&domain, validated_addr)
+                .resolve(host_only, validated_addr)
                 .build()
                 .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;
             Some(pinned)
