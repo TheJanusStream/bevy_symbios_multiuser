@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy_symbios_multiuser::messages::{BroadcastMessage, ChannelKind};
+use bevy_symbios_multiuser::messages::{Broadcast, ChannelKind};
 use bevy_symbios_multiuser::plugin::{SymbiosMultiuserConfig, SymbiosMultiuserPlugin};
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +44,7 @@ fn config_with_custom_url() {
 
 #[test]
 fn broadcast_message_fields() {
-    let msg = BroadcastMessage {
+    let msg = Broadcast {
         payload: TestMsg::Ping,
         channel: ChannelKind::Reliable,
     };
@@ -53,7 +53,7 @@ fn broadcast_message_fields() {
 
 #[test]
 fn broadcast_message_unreliable_channel() {
-    let msg = BroadcastMessage {
+    let msg = Broadcast {
         payload: TestMsg::Pong,
         channel: ChannelKind::Unreliable,
     };

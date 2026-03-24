@@ -31,7 +31,7 @@ fn main() {
 }
 
 /// Reads incoming chat messages and logs them.
-fn handle_incoming(mut reader: MessageReader<NetworkMessageReceived<ChatMessage>>) {
+fn handle_incoming(mut reader: MessageReader<NetworkReceived<ChatMessage>>) {
     for msg in reader.read() {
         match &msg.payload {
             ChatMessage::Text { author, body } => {
@@ -51,12 +51,12 @@ fn handle_incoming(mut reader: MessageReader<NetworkMessageReceived<ChatMessage>
 fn send_periodic_hello(
     time: Res<Time>,
     mut timer: Local<Option<Timer>>,
-    mut writer: MessageWriter<BroadcastMessage<ChatMessage>>,
+    mut writer: MessageWriter<Broadcast<ChatMessage>>,
 ) {
     let timer = timer.get_or_insert_with(|| Timer::from_seconds(3.0, TimerMode::Repeating));
     timer.tick(time.delta());
     if timer.just_finished() {
-        writer.write(BroadcastMessage {
+        writer.write(Broadcast {
             payload: ChatMessage::Text {
                 author: "local_peer".to_string(),
                 body: "Hello from bevy_symbios_multiuser!".to_string(),

@@ -43,14 +43,14 @@ fn main() {
         .run();
 }
 
-fn handle_incoming(mut reader: MessageReader<NetworkMessageReceived<GameMessage>>) {
+fn handle_incoming(mut reader: MessageReader<NetworkReceived<GameMessage>>) {
     for msg in reader.read() {
         info!("From {:?}: {:?}", msg.sender, msg.payload);
     }
 }
 
-fn send_movement(mut writer: MessageWriter<BroadcastMessage<GameMessage>>) {
-    writer.write(BroadcastMessage {
+fn send_movement(mut writer: MessageWriter<Broadcast<GameMessage>>) {
+    writer.write(Broadcast {
         payload: GameMessage::Move { x: 1.0, y: 2.0 },
         channel: ChannelKind::Unreliable,
     });
@@ -129,7 +129,7 @@ app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
 | Module      | Description                                                                       |
 |-------------|-----------------------------------------------------------------------------------|
 | `plugin`    | `SymbiosMultiuserPlugin<T>` — the main Bevy plugin                                |
-| `messages`  | `BroadcastMessage<T>`, `NetworkMessageReceived<T>`, `PeerStateChanged`            |
+| `messages`  | `Broadcast<T>`, `NetworkReceived<T>`, `PeerStateChanged`                          |
 | `systems`   | ECS systems for transmit, receive, and peer state polling                         |
 | `protocol`  | Shared signaling wire format (`SignalEnvelope`, `SignalPayload`)                  |
 | `auth`      | ATProto session creation and refresh (feature: `client`)                          |

@@ -1,16 +1,16 @@
 use bevy::prelude::*;
 use matchbox_socket::PeerId;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
-/// Message sent by the host application to broadcast a payload to all connected peers.
+/// Broadcast a payload to all connected peers.
 ///
 /// The payload is serialized via `bincode` and pushed to the appropriate channel
 /// based on the [`ChannelKind`] field.
 ///
 /// # Type Parameters
-/// * `T` - The domain-specific message type. Must implement `Serialize + Deserialize`.
+/// * `T` - The domain-specific payload type. Must implement `Serialize + Deserialize`.
 #[derive(Message, Debug, Clone)]
-pub struct BroadcastMessage<T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static> {
+pub struct Broadcast<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
     /// The payload to broadcast to all connected peers.
     pub payload: T,
     /// Which channel to send on: [`ChannelKind::Reliable`] for state mutations,
@@ -18,14 +18,14 @@ pub struct BroadcastMessage<T: Serialize + for<'de> Deserialize<'de> + Send + Sy
     pub channel: ChannelKind,
 }
 
-/// Message broadcast when a network payload is received from a remote peer.
+/// A network payload received from a remote peer.
 ///
-/// The host application reads these messages to react to incoming network data.
+/// The host application reads these to react to incoming network data.
 ///
 /// # Type Parameters
-/// * `T` - The domain-specific message type. Must implement `Serialize + Deserialize`.
+/// * `T` - The domain-specific payload type. Must implement `Serialize + Deserialize`.
 #[derive(Message, Debug, Clone)]
-pub struct NetworkMessageReceived<T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static>
+pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'static>
 {
     /// The deserialized payload from the remote peer.
     pub payload: T,

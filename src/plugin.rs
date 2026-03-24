@@ -1,9 +1,9 @@
-use crate::messages::{BroadcastMessage, NetworkMessageReceived, PeerStateChanged};
+use crate::messages::{Broadcast, NetworkReceived, PeerStateChanged};
 use crate::systems;
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
 use matchbox_socket::RtcIceServerConfig;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 
 #[cfg(feature = "client")]
@@ -26,8 +26,8 @@ pub struct SymbiosMultiuserConfig {
 /// - **Channel 0** (Reliable): ordered, guaranteed delivery for state mutations.
 /// - **Channel 1** (Unreliable): unordered, best-effort for ephemeral presence.
 ///
-/// The plugin exposes Bevy messages [`BroadcastMessage<T>`] and
-/// [`NetworkMessageReceived<T>`] so the host application can send and receive
+/// The plugin exposes Bevy messages [`Broadcast<T>`] and
+/// [`NetworkReceived<T>`] so the host application can send and receive
 /// domain-specific messages without touching the network layer directly.
 pub struct SymbiosMultiuserPlugin<T> {
     config: SymbiosMultiuserConfig,
@@ -57,12 +57,12 @@ impl<T> SymbiosMultiuserPlugin<T> {
 
 impl<T> Plugin for SymbiosMultiuserPlugin<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static + std::fmt::Debug + Clone,
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
     fn build(&self, app: &mut App) {
         app.insert_resource(self.config.clone())
-            .add_message::<BroadcastMessage<T>>()
-            .add_message::<NetworkMessageReceived<T>>()
+            .add_message::<Broadcast<T>>()
+            .add_message::<NetworkReceived<T>>()
             .add_message::<PeerStateChanged>()
             .add_systems(Startup, open_socket)
             .add_systems(

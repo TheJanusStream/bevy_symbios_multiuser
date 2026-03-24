@@ -1,10 +1,10 @@
 use crate::messages::{
-    BroadcastMessage, ChannelKind, NetworkMessageReceived, PeerConnectionState, PeerStateChanged,
+    Broadcast, ChannelKind, NetworkReceived, PeerConnectionState, PeerStateChanged,
 };
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
 use bincode::Options;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Maximum size in bytes for a single deserialized network message.
 /// Prevents OOM from malicious length-prefixed payloads.
@@ -49,12 +49,12 @@ pub fn poll_peers(
 }
 
 /// Drains incoming data from all channels, deserializes from `bincode`,
-/// and writes [`NetworkMessageReceived<T>`] messages.
+/// and writes [`NetworkReceived<T>`] messages.
 pub fn receive_messages<T>(
     mut socket: ResMut<MatchboxSocket>,
-    mut received: MessageWriter<NetworkMessageReceived<T>>,
+    mut received: MessageWriter<NetworkReceived<T>>,
 ) where
-    T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static + std::fmt::Debug + Clone,
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
     for channel_kind in [ChannelKind::Reliable, ChannelKind::Unreliable] {
         let channel_idx = channel_kind.index();
@@ -72,7 +72,7 @@ pub fn receive_messages<T>(
                         channel = ?channel_kind,
                         "received message"
                     );
-                    received.write(NetworkMessageReceived {
+                    received.write(NetworkReceived {
                         payload,
                         sender: peer,
                         channel: channel_kind,
@@ -90,13 +90,13 @@ pub fn receive_messages<T>(
     }
 }
 
-/// Reads [`BroadcastMessage<T>`] messages, serializes them via `bincode`, and
+/// Reads [`Broadcast<T>`] messages, serializes them via `bincode`, and
 /// sends the bytes to all connected peers on the specified channel.
 pub fn transmit_messages<T>(
     mut socket: ResMut<MatchboxSocket>,
-    mut broadcasts: MessageReader<BroadcastMessage<T>>,
+    mut broadcasts: MessageReader<Broadcast<T>>,
 ) where
-    T: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static + std::fmt::Debug + Clone,
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
     let peers: Vec<PeerId> = socket.connected_peers().collect();
     if peers.is_empty() {

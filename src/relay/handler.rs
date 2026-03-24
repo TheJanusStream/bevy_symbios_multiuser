@@ -36,6 +36,10 @@ const RELAY_CHANNEL_CAPACITY: usize = 256;
 /// SDP offers/answers and ICE candidates are typically a few KiB at most.
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 
+/// Number of consecutive invalid messages before disconnecting a peer.
+/// Prevents log exhaustion from attackers spamming malformed JSON.
+const MAX_INVALID_MESSAGES: usize = 10;
+
 /// Optional query parameters on the WebSocket upgrade URL.
 ///
 /// Used as a legacy fallback for WASM clients that pass the ATProto JWT via
@@ -269,7 +273,7 @@ async fn handle_socket(
         .await;
 
     // Notify existing peers in the same room about the new peer.
-    // Collect senders first to avoid holding DashMap read locks across `.await`.
+    // Collect senders first to avoid holding DashMap read locks across channel sends.
     let peer_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
         .peers
         .iter()
@@ -303,6 +307,7 @@ async fn handle_socket(
     // Read messages from the WebSocket and route them to the target peer.
     // If the write task dies (e.g. broken connection), stop reading too.
     let read_task = async {
+        let mut invalid_count: usize = 0;
         while let Some(Ok(msg)) = ws_rx.next().await {
             let text = match msg {
                 Message::Text(t) => t.to_string(),
@@ -311,9 +316,24 @@ async fn handle_socket(
             };
 
             let envelope: SignalEnvelope = match serde_json::from_str(&text) {
-                Ok(e) => e,
+                Ok(e) => {
+                    invalid_count = 0;
+                    e
+                }
                 Err(err) => {
-                    tracing::warn!(error = %err, "invalid signal envelope from peer");
+                    invalid_count += 1;
+                    tracing::warn!(
+                        error = %err,
+                        count = invalid_count,
+                        "invalid signal envelope from peer"
+                    );
+                    if invalid_count >= MAX_INVALID_MESSAGES {
+                        tracing::warn!(
+                            session = %session_id,
+                            "disconnecting peer after {MAX_INVALID_MESSAGES} consecutive invalid messages"
+                        );
+                        break;
+                    }
                     continue;
                 }
             };

@@ -112,7 +112,17 @@ fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, Str
     }
 
     for addr in &addrs {
-        let ip = addr.ip();
+        // Unmap IPv4-mapped IPv6 (::ffff:a.b.c.d) back to IPv4 before safety
+        // checks. Without this, an attacker can bypass loopback/private checks
+        // by resolving to e.g. ::ffff:127.0.0.1 (std's is_loopback() returns
+        // false for the V6 mapped form).
+        let ip = match addr.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            v4 => v4,
+        };
         if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) || is_link_local(&ip) {
             return Err(format!(
                 "did:web domain '{domain}' resolves to private/loopback address {ip}, \

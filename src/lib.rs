@@ -78,7 +78,7 @@ pub mod relay;
 pub mod prelude {
     pub use crate::error::SymbiosError;
     pub use crate::messages::{
-        BroadcastMessage, ChannelKind, NetworkMessageReceived, PeerConnectionState,
+        Broadcast, ChannelKind, NetworkReceived, PeerConnectionState,
         PeerStateChanged,
     };
     pub use crate::plugin::{SymbiosMultiuserConfig, SymbiosMultiuserPlugin};
