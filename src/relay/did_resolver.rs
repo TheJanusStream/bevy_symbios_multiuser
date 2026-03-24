@@ -3,12 +3,25 @@
 //! Supports `did:plc` (via the PLC directory at `plc.directory`) and `did:web`
 //! (via `/.well-known/did.json`). Resolved keys are cached in memory with a
 //! configurable TTL to avoid redundant network requests.
+//!
+//! # Security
+//!
+//! - **SSRF protection** — `did:web` domains are resolved and validated against
+//!   private/loopback IP ranges before fetching. The validated IP is pinned via
+//!   `reqwest::ClientBuilder::resolve` to prevent TOCTOU DNS rebinding attacks.
+//! - **Streaming body limit** — DID document responses are streamed with an
+//!   incremental size check (max 256 KiB), aborting early rather than buffering
+//!   an unbounded payload into memory.
+//! - **Cache hardening** — The key cache is capped at 10,000 entries and uses
+//!   rate-limited eviction (max once per 5 seconds) to prevent algorithmic
+//!   complexity attacks from triggering O(N) scans on every connection.
 
 use dashmap::DashMap;
 use jsonwebtoken::DecodingKey;
 use p256::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use std::net::ToSocketAddrs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +43,11 @@ const MAX_DID_DOCUMENT_SIZE: usize = 256 * 1024;
 /// automatically, but new inserts are rejected until expired entries are pruned.
 const MAX_CACHE_ENTRIES: usize = 10_000;
 
+/// Minimum interval between full cache eviction scans (in seconds).
+/// Prevents an attacker from triggering O(N) scans on every connection by
+/// rapidly connecting with uncached DIDs while the cache is at capacity.
+const EVICTION_COOLDOWN_SECS: u64 = 5;
+
 /// A cached signing key with expiration time.
 struct CachedKey {
     key: DecodingKey,
@@ -46,6 +64,9 @@ pub struct DidResolver {
     cache: Arc<DashMap<String, CachedKey>>,
     plc_directory: String,
     cache_ttl: Duration,
+    /// Unix-epoch seconds of the last full eviction scan, used to rate-limit
+    /// eviction and prevent algorithmic complexity attacks.
+    last_eviction: Arc<AtomicU64>,
 }
 
 /// Build the URL for fetching a DID document.
@@ -82,12 +103,14 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
     }
 }
 
-/// Reject domains that resolve to loopback, private, or link-local IP addresses.
+/// Resolve a domain's DNS records, reject private/loopback IPs (SSRF protection),
+/// and return the first safe [`std::net::SocketAddr`].
 ///
-/// This prevents SSRF attacks where a crafted `did:web` identifier tricks the
-/// relay into making requests to internal services (e.g. Kubernetes Kubelet,
-/// cloud metadata endpoints).
-fn validate_domain_not_private(domain: &str) -> Result<(), String> {
+/// The caller **must** pin the returned address when issuing the HTTP request
+/// (via `reqwest::ClientBuilder::resolve`) to prevent TOCTOU DNS rebinding
+/// attacks where the domain resolves to a different (private) IP on the second
+/// lookup performed by reqwest.
+fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, String> {
     // Add default HTTPS port if no port is present, so ToSocketAddrs works.
     let host_port = if domain.contains(':') {
         domain.to_string()
@@ -95,11 +118,16 @@ fn validate_domain_not_private(domain: &str) -> Result<(), String> {
         format!("{domain}:443")
     };
 
-    let addrs = host_port
+    let addrs: Vec<std::net::SocketAddr> = host_port
         .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve domain '{domain}': {e}"))?;
+        .map_err(|e| format!("failed to resolve domain '{domain}': {e}"))?
+        .collect();
 
-    for addr in addrs {
+    if addrs.is_empty() {
+        return Err(format!("domain '{domain}' resolved to no addresses"));
+    }
+
+    for addr in &addrs {
         let ip = addr.ip();
         if ip.is_loopback()
             || ip.is_unspecified()
@@ -113,7 +141,7 @@ fn validate_domain_not_private(domain: &str) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    Ok(addrs[0])
 }
 
 /// Check if an IP address is in a private range (RFC 1918 / RFC 4193).
@@ -161,6 +189,7 @@ impl DidResolver {
             cache: Arc::new(DashMap::new()),
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
             cache_ttl: DEFAULT_CACHE_TTL,
+            last_eviction: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -175,25 +204,43 @@ impl DidResolver {
     /// Resolve the signing [`DecodingKey`] for a DID.
     ///
     /// Returns a cached key if available and not expired, otherwise fetches
-    /// the DID document from the network.
+    /// the DID document from the network. Expired cache entries are removed
+    /// using `remove_if` to avoid racing with concurrent insertions. When the
+    /// cache is at capacity, expired entries are evicted at most once per
+    /// [`EVICTION_COOLDOWN_SECS`] to prevent O(N) scans on every request.
     pub async fn resolve_key(&self, did: &str) -> Result<DecodingKey, String> {
         // Check cache first.
         if let Some(entry) = self.cache.get(did) {
             if entry.expires_at > Instant::now() {
                 return Ok(entry.key.clone());
             }
-            // Expired — drop the reference before removing.
             drop(entry);
-            self.cache.remove(did);
+            // Only remove if still expired — avoids racing with a concurrent
+            // thread that just inserted a fresh key between our drop and remove.
+            self.cache
+                .remove_if(did, |_, v| v.expires_at <= Instant::now());
         }
 
         let doc = self.fetch_did_document(did).await?;
         let key = extract_signing_key(&doc)?;
 
-        // Evict expired entries before checking capacity, so legitimate clients
-        // aren't rejected just because stale entries are sitting around.
+        // Evict expired entries before checking capacity, but rate-limit the
+        // full scan to prevent an attacker from triggering O(N) work on every
+        // connection by flooding with uncached DIDs.
         if self.cache.len() >= MAX_CACHE_ENTRIES {
-            self.evict_expired();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last = self.last_eviction.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_eviction
+                    .compare_exchange(last, now_secs, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.evict_expired();
+            }
         }
 
         // Only cache if we're under the limit. This prevents an attacker from
@@ -224,22 +271,37 @@ impl DidResolver {
 
     /// Fetch the DID document from the appropriate directory.
     ///
-    /// The response body is limited to [`MAX_DID_DOCUMENT_SIZE`] to prevent
-    /// a malicious server from exhausting memory with an oversized response.
+    /// The response body is **streamed** with an incremental size check against
+    /// [`MAX_DID_DOCUMENT_SIZE`] (256 KiB). The stream is aborted as soon as
+    /// the accumulated size exceeds the limit, preventing a malicious server
+    /// from exhausting memory with an oversized or infinite response.
+    ///
+    /// For `did:web`, the domain is resolved and validated against private/loopback
+    /// IPs, and the validated address is pinned to prevent DNS rebinding (SSRF).
     async fn fetch_did_document(&self, did: &str) -> Result<DidDocument, String> {
         let url = did_document_url(did, &self.plc_directory)?;
 
-        // SSRF protection: for did:web, validate that the domain does not
-        // resolve to private/loopback addresses before making the request.
-        if did.starts_with("did:web:") {
+        // SSRF protection: for did:web, resolve DNS once, validate IPs, and
+        // pin the validated address so reqwest cannot re-resolve to a different
+        // (potentially private) IP (prevents TOCTOU DNS rebinding attacks).
+        let pinned_client = if did.starts_with("did:web:") {
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
             let parts: Vec<&str> = raw.splitn(2, ':').collect();
             let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
-            validate_domain_not_private(&domain)?;
-        }
+            let validated_addr = validate_and_resolve_domain(&domain)?;
+            // Build a one-off client that pins DNS resolution to the validated IP.
+            let pinned = reqwest::Client::builder()
+                .timeout(DID_FETCH_TIMEOUT)
+                .resolve(&domain, validated_addr)
+                .build()
+                .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;
+            Some(pinned)
+        } else {
+            None
+        };
 
-        let resp = self
-            .client
+        let client = pinned_client.as_ref().unwrap_or(&self.client);
+        let resp = client
             .get(&url)
             .header("Accept", "application/json")
             .send()
@@ -260,20 +322,23 @@ impl DidResolver {
             }
         }
 
-        // Read the body with a hard size limit to prevent memory exhaustion.
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("failed to read DID document body: {e}"))?;
-
-        if bytes.len() > MAX_DID_DOCUMENT_SIZE {
-            return Err(format!(
-                "DID document response too large ({} bytes, max {MAX_DID_DOCUMENT_SIZE})",
-                bytes.len()
-            ));
+        // Stream the body with a hard size limit to prevent memory exhaustion.
+        // Unlike `resp.bytes()`, this aborts early without buffering an
+        // unbounded payload from a malicious server.
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("failed to read DID document body: {e}"))?;
+            if body.len() + chunk.len() > MAX_DID_DOCUMENT_SIZE {
+                return Err(format!(
+                    "DID document response too large (>{MAX_DID_DOCUMENT_SIZE} bytes), aborting"
+                ));
+            }
+            body.extend_from_slice(&chunk);
         }
 
-        serde_json::from_slice::<DidDocument>(&bytes)
+        serde_json::from_slice::<DidDocument>(&body)
             .map_err(|e| format!("invalid DID document JSON: {e}"))
     }
 }
@@ -332,9 +397,10 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
         .ok_or("verification method missing publicKeyMultibase")?;
 
     // Multibase `z` prefix = base58btc encoding.
-    let encoded = multibase
-        .strip_prefix('z')
-        .ok_or_else(|| format!("unsupported multibase prefix: {}", &multibase[..1]))?;
+    let encoded = multibase.strip_prefix('z').ok_or_else(|| {
+        let prefix = multibase.chars().next().map_or("(empty)", |_| &multibase[..1]);
+        format!("unsupported multibase prefix: {prefix}")
+    })?;
 
     let bytes = bs58::decode(encoded)
         .into_vec()
@@ -538,7 +604,7 @@ mod tests {
 
     #[test]
     fn ssrf_rejects_loopback() {
-        let result = validate_domain_not_private("localhost");
+        let result = validate_and_resolve_domain("localhost");
         assert!(result.is_err(), "expected loopback to be rejected");
         assert!(
             result.unwrap_err().contains("SSRF protection"),
@@ -548,37 +614,37 @@ mod tests {
 
     #[test]
     fn ssrf_rejects_127_0_0_1() {
-        let result = validate_domain_not_private("127.0.0.1");
+        let result = validate_and_resolve_domain("127.0.0.1");
         assert!(result.is_err(), "expected 127.0.0.1 to be rejected");
     }
 
     #[test]
     fn ssrf_rejects_private_10_network() {
-        let result = validate_domain_not_private("10.0.0.1");
+        let result = validate_and_resolve_domain("10.0.0.1");
         assert!(result.is_err(), "expected 10.x.x.x to be rejected");
     }
 
     #[test]
     fn ssrf_rejects_private_172_network() {
-        let result = validate_domain_not_private("172.16.0.1");
+        let result = validate_and_resolve_domain("172.16.0.1");
         assert!(result.is_err(), "expected 172.16.x.x to be rejected");
     }
 
     #[test]
     fn ssrf_rejects_private_192_168_network() {
-        let result = validate_domain_not_private("192.168.1.1");
+        let result = validate_and_resolve_domain("192.168.1.1");
         assert!(result.is_err(), "expected 192.168.x.x to be rejected");
     }
 
     #[test]
     fn ssrf_rejects_link_local() {
-        let result = validate_domain_not_private("169.254.1.1");
+        let result = validate_and_resolve_domain("169.254.1.1");
         assert!(result.is_err(), "expected link-local to be rejected");
     }
 
     #[test]
     fn ssrf_rejects_loopback_with_port() {
-        let result = validate_domain_not_private("127.0.0.1:10250");
+        let result = validate_and_resolve_domain("127.0.0.1:10250");
         assert!(result.is_err(), "expected 127.0.0.1:port to be rejected");
     }
 }

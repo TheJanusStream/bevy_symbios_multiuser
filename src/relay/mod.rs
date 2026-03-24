@@ -27,15 +27,31 @@
 //! opportunistic — valid tokens are used for identity, but unauthenticated
 //! clients fall back to random UUIDs. Signature verification is skipped.
 //!
+//! # Room Isolation
+//!
+//! The URL path used during WebSocket upgrade determines the peer's **room**.
+//! For example, `wss://relay/game_A` and `wss://relay/game_B` are separate
+//! rooms — peers only see `PeerJoined`/`PeerLeft` events and can only exchange
+//! signals with other peers in the same room. Cross-room signals are dropped.
+//! Connecting to `/` (or with no path) places the peer in a `"default"` room.
+//!
 //! # Hardening
 //!
 //! - **Connection limits** — [`RelayConfig::max_peers`] caps the number of
-//!   concurrent connections (default `512`). New connections are rejected with
-//!   HTTP 503 once the limit is reached.
+//!   concurrent connections (default `512`). The limit is enforced via an atomic
+//!   counter that reserves a slot *before* async identity extraction, preventing
+//!   TOCTOU bypasses from concurrent handshakes. New connections are rejected
+//!   with HTTP 503 once the limit is reached.
 //! - **Message size cap** — Incoming WebSocket messages are limited to 64 KiB.
 //!   SDP offers/answers and ICE candidates are typically a few KiB at most.
 //! - **Control signal filtering** — Clients cannot forge `PeerJoined`/`PeerLeft`
 //!   control signals; only the relay may originate these.
+//! - **SSRF protection** — `did:web` domain resolution validates against
+//!   private/loopback IPs and pins the resolved address to prevent DNS rebinding.
+//! - **DID document size limit** — Responses are streamed with an incremental
+//!   256 KiB cap, aborting before buffering oversized payloads.
+//! - **Backpressure logging** — When the per-peer relay channel (256 slots)
+//!   is full, dropped signals are logged instead of silently discarded.
 //!
 //! # Usage
 //!
@@ -59,6 +75,7 @@ mod handler;
 
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
 
 // Re-export protocol types so existing `use relay::SignalEnvelope` still works.
@@ -91,6 +108,9 @@ pub struct PeerEntry {
     /// Unique ID for this specific WebSocket connection, used to distinguish
     /// reconnects and prevent stale cleanup from clobbering a newer session.
     pub conn_id: uuid::Uuid,
+    /// The room this peer belongs to, derived from the WebSocket URL path.
+    /// Peers only see and communicate with other peers in the same room.
+    pub room: String,
 }
 
 /// Shared server state holding the map of connected peers.
@@ -105,6 +125,10 @@ pub struct RelayState {
     /// DID document resolver for JWT signature verification.
     /// `None` disables cryptographic signature checks.
     pub did_resolver: Option<did_resolver::DidResolver>,
+    /// Atomic counter tracking active + in-handshake connections.
+    /// Prevents TOCTOU bypasses where concurrent handshakes all pass the
+    /// `max_peers` check before any of them insert into `peers`.
+    pub active_connections: Arc<AtomicUsize>,
 }
 
 impl RelayState {
@@ -122,6 +146,7 @@ impl RelayState {
             auth_required,
             max_peers,
             did_resolver,
+            active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 }

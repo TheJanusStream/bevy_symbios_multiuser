@@ -14,7 +14,7 @@ The architecture follows a **Sovereign Broker** pattern: clients authenticate wi
 - **Generic Message Bus** — Define your own domain-specific protocol type `T: Serialize + Deserialize`, and the plugin handles serialization (via `bincode`) and transport.
 - **Dual Channels** — Reliable (ordered, guaranteed) for state mutations and Unreliable (best-effort) for ephemeral presence data.
 - **ATProto Authentication** — Federated identity via `com.atproto.server.createSession` for Bluesky/ATProto-based auth. The JWT is passed to the relay via the `Authorization` header (native) or `Sec-WebSocket-Protocol` subprotocol trick (WASM).
-- **Sovereign Broker Relay** — Optional signaling server built on Axum with full ATProto JWT verification. When `auth_required` is enabled, the relay resolves the signer's DID document (via `plc.directory` or `did:web`), extracts the `#atproto` P-256 signing key, and cryptographically verifies the JWT signature. Resolved keys are cached in memory. Includes configurable connection limits (`max_peers`) and a 64 KiB WebSocket message size cap.
+- **Sovereign Broker Relay** — Optional signaling server built on Axum with full ATProto JWT verification, room-based peer isolation, and defense-in-depth hardening. When `auth_required` is enabled, the relay resolves the signer's DID document (via `plc.directory` or `did:web`), extracts the `#atproto` P-256 signing key, and cryptographically verifies the JWT signature. Resolved keys are cached in memory. The URL path determines the room — peers in different rooms are fully isolated and cannot exchange signals. Includes atomic connection limits (`max_peers`), a 64 KiB WebSocket message size cap, SSRF protection with DNS-pinning for `did:web`, and streamed DID document body limits.
 - **Custom Signaller** — A `matchbox_socket::Signaller` implementation (`SymbiosSignallerBuilder`) that bridges between the matchbox protocol and the relay's wire format, injecting the JWT during WebSocket upgrade.
 - **Cross-Platform** — Runs on native targets (via `async-tungstenite`) and in the browser (via `ws_stream_wasm` on WASM).
 - **Bevy-Native** — Uses Bevy's `MessageWriter`/`MessageReader` system for seamless ECS integration.
@@ -78,17 +78,17 @@ fn send_movement(mut writer: MessageWriter<BroadcastMessage<GameMessage>>) {
 ```
 
 1. **Authentication** — Each peer authenticates with their ATProto PDS to obtain a JWT access token.
-2. **Signaling** — Peers connect to the relay and present the JWT during the WebSocket handshake. On native targets, the token is sent as an `Authorization: Bearer` header. On WASM targets, the token is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the browser `WebSocket` API does not support custom headers; the relay echoes the selected subprotocol back per RFC 6455). A legacy `?token=<jwt>` query parameter fallback is also supported. When `auth_required` is enabled, the relay resolves the issuer's DID document, extracts the `#atproto` signing key, and cryptographically verifies the JWT's ES256 signature. The authenticated DID becomes the peer's session identity. SDP offers/answers and ICE candidates are exchanged via the relay's `SignalEnvelope` wire format.
+2. **Signaling** — Peers connect to the relay via a room-specific URL (e.g. `wss://relay/my_room`) and present the JWT during the WebSocket handshake. The URL path determines the **room** — peers only see and communicate with other peers in the same room. On native targets, the token is sent as an `Authorization: Bearer` header. On WASM targets, the token is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the browser `WebSocket` API does not support custom headers; the relay echoes the selected subprotocol back per RFC 6455). A legacy `?token=<jwt>` query parameter fallback is also supported. When `auth_required` is enabled, the relay resolves the issuer's DID document, extracts the `#atproto` signing key, and cryptographically verifies the JWT's ES256 signature. The authenticated DID becomes the peer's session identity. SDP offers/answers and ICE candidates are exchanged via the relay's `SignalEnvelope` wire format.
 3. **P2P Transport** — Once signaling completes, data flows directly between peers over WebRTC data channels.
 4. **Message Bus** — The `SymbiosMultiuserPlugin<T>` serializes/deserializes `T` via bincode (with a 1 MiB size limit) and exposes Bevy messages for the host app.
 
 ## Features
 
-| Feature      | Default | Description                                                                                                                             |
-|--------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------|
-| `client`     | Yes     | ATProto authentication, custom signaller for authenticated relay connections                                                            |
-| `native-tls` | Yes     | Enables TLS for both `reqwest` HTTPS (PDS) and `async-tungstenite` WebSocket (`wss://`) connections                                     |
-| `relay`      | No      | Sovereign Broker relay with DID-based JWT signature verification, connection limits, and message size caps (`axum`/`tokio`/`p256`)      |
+| Feature | Default | Description |
+| --- | --- | --- |
+| `client` | Yes | ATProto authentication, custom signaller for authenticated relay connections |
+| `native-tls` | Yes | Enables TLS for both `reqwest` HTTPS (PDS) and `async-tungstenite` WebSocket (`wss://`) connections |
+| `relay` | No | Sovereign Broker relay with DID-based JWT signature verification, room isolation, atomic connection limits, SSRF-hardened DID resolution, and message size caps (`axum`/`tokio`/`p256`) |
 
 ### Running the Relay Server
 

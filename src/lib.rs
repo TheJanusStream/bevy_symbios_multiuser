@@ -56,7 +56,8 @@
 //! - `native-tls` (default) — Enables TLS for both `reqwest` HTTPS and
 //!   `async-tungstenite` WebSocket (`wss://`) connections.
 //! - `relay` — Sovereign Broker relay server with DID-based JWT signature
-//!   verification, connection limits, and message size caps. Built on `axum`.
+//!   verification, room-based peer isolation, atomic connection limits, SSRF
+//!   protection, and message size caps. Built on `axum`.
 
 pub mod error;
 pub mod events;

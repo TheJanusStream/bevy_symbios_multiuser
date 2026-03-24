@@ -4,7 +4,7 @@ use super::{PeerEntry, RelayState};
 use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
     extract::{
-        Query, State, WebSocketUpgrade,
+        OriginalUri, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
@@ -34,6 +34,10 @@ pub struct WsQueryParams {
 
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
 ///
+/// The URL path determines the peer's **room** — e.g. `wss://relay/game_A`
+/// joins room `"game_A"`. Connecting to `/` joins the `"default"` room. Peers
+/// only see and communicate with other peers in the same room.
+///
 /// When `auth_required` is enabled on the relay, the handler extracts an
 /// ATProto JWT from one of three sources (checked in order):
 ///
@@ -47,15 +51,37 @@ pub struct WsQueryParams {
 /// When `auth_required` is disabled, authentication is opportunistic: a valid
 /// JWT will still be used for identity, but missing or invalid tokens are
 /// silently ignored and a random UUID is assigned instead.
+///
+/// Connection capacity is enforced atomically *before* the async identity
+/// extraction step to prevent concurrent handshakes from bypassing the limit.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Query(query): Query<WsQueryParams>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    // Reject new connections if we've hit the max peer limit.
-    if state.max_peers > 0 && state.peers.len() >= state.max_peers {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Relay is at capacity").into_response();
+    // Extract the room from the URL path. Normalize so "/" and "" both map to
+    // the same default room, and strip trailing slashes for consistency.
+    let room = uri.path().trim_matches('/').to_string();
+    let room = if room.is_empty() {
+        "default".to_string()
+    } else {
+        room
+    };
+    // Atomically reserve a connection slot *before* the async identity
+    // extraction to prevent TOCTOU bypasses where thousands of concurrent
+    // handshakes all see `len < max_peers` before any inserts happen.
+    if state.max_peers > 0 {
+        let prev = state
+            .active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev >= state.max_peers {
+            state
+                .active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return (StatusCode::SERVICE_UNAVAILABLE, "Relay is at capacity").into_response();
+        }
     }
 
     let identity = extract_identity(
@@ -78,7 +104,14 @@ pub async fn ws_handler(
         .unwrap_or(false);
 
     match identity {
-        Err(rejection) => rejection.into_response(),
+        Err(rejection) => {
+            if state.max_peers > 0 {
+                state
+                    .active_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            rejection.into_response()
+        }
         Ok(id) => {
             let upgrade = ws.max_message_size(MAX_WS_MESSAGE_SIZE);
             let upgrade = if used_subprotocol {
@@ -87,7 +120,7 @@ pub async fn ws_handler(
                 upgrade
             };
             upgrade
-                .on_upgrade(move |socket| handle_socket(socket, state, id))
+                .on_upgrade(move |socket| handle_socket(socket, state, id, room))
                 .into_response()
         }
     }
@@ -155,6 +188,7 @@ async fn handle_socket(
     socket: WebSocket,
     state: RelayState,
     identity: Option<auth::ValidatedIdentity>,
+    room: String,
 ) {
     let session_id = match identity {
         Some(ref id) => id.did.clone(),
@@ -164,15 +198,13 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    // If this session ID already exists (reconnect), notify other peers that
-    // the old connection is gone before inserting the new one. This prevents
-    // remote clients from seeing two PeerJoined events without an intervening
-    // PeerLeft, which would corrupt WebRTC signaling state.
+    // If this session ID already exists (reconnect), notify peers in the same
+    // room that the old connection is gone before inserting the new one.
     if state.peers.contains_key(&session_id) {
         let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
             .peers
             .iter()
-            .filter(|entry| *entry.key() != session_id)
+            .filter(|entry| *entry.key() != session_id && entry.value().room == room)
             .map(|entry| entry.value().tx.clone())
             .collect();
         for sender in leave_senders {
@@ -189,6 +221,7 @@ async fn handle_socket(
         PeerEntry {
             tx: relay_tx,
             conn_id,
+            room: room.clone(),
         },
     );
 
@@ -202,14 +235,19 @@ async fn handle_socket(
         state
             .peers
             .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
+        if state.max_peers > 0 {
+            state
+                .active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         return;
     }
 
-    // Broadcast peer list to the new peer.
+    // Broadcast peer list to the new peer (same room only).
     let existing_peers: Vec<String> = state
         .peers
         .iter()
-        .filter(|entry| *entry.key() != session_id)
+        .filter(|entry| *entry.key() != session_id && entry.value().room == room)
         .map(|entry| entry.key().clone())
         .collect();
     let peer_list = serde_json::json!({ "type": "peer_list", "peers": existing_peers });
@@ -217,12 +255,12 @@ async fn handle_socket(
         .send(Message::Text(peer_list.to_string().into()))
         .await;
 
-    // Notify existing peers about the new peer using a proper control variant.
+    // Notify existing peers in the same room about the new peer.
     // Collect senders first to avoid holding DashMap read locks across `.await`.
     let peer_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
         .peers
         .iter()
-        .filter(|entry| *entry.key() != session_id)
+        .filter(|entry| *entry.key() != session_id && entry.value().room == room)
         .map(|entry| entry.value().tx.clone())
         .collect();
     for sender in peer_senders {
@@ -289,7 +327,21 @@ async fn handle_socket(
             };
 
             if let Some(entry) = state_write.peers.get(&target_id) {
-                let _ = entry.value().tx.try_send(forwarded);
+                if entry.value().room != room {
+                    tracing::warn!(
+                        session = %session_id,
+                        target = %target_id,
+                        "dropping cross-room signal"
+                    );
+                } else if let Err(mpsc::error::TrySendError::Full(_)) =
+                    entry.value().tx.try_send(forwarded)
+                {
+                    tracing::warn!(
+                        target = %target_id,
+                        sender = %session_id,
+                        "relay channel full, dropping signal (backpressure)"
+                    );
+                }
             } else {
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");
             }
@@ -313,6 +365,11 @@ async fn handle_socket(
         .remove_if(&session_id_write, |_, entry| entry.conn_id == conn_id);
     if was_removed.is_none() {
         // Another connection owns this session ID now — skip broadcast.
+        if state.max_peers > 0 {
+            state
+                .active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         tracing::debug!(
             session = %session_id_write,
             "stale connection cleanup skipped (session was replaced)"
@@ -322,6 +379,7 @@ async fn handle_socket(
     let remaining_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
         .peers
         .iter()
+        .filter(|entry| entry.value().room == room)
         .map(|entry| entry.value().tx.clone())
         .collect();
     for sender in remaining_senders {
@@ -332,5 +390,10 @@ async fn handle_socket(
         let _ = sender.try_send(envelope);
     }
 
+    if state.max_peers > 0 {
+        state
+            .active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
     tracing::info!(session = %session_id_write, "peer disconnected");
 }

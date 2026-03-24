@@ -49,7 +49,7 @@ ws_stream_wasm = { version = "0.7", optional = true }
 default = ["client", "native-tls"]
 client = ["dep:reqwest", "dep:async-tungstenite", "dep:ws_stream_wasm", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
 native-tls = ["reqwest/rustls-tls", "async-tungstenite/async-native-tls", "dep:async-native-tls"]
-relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "dep:p256", "dep:bs58"]
+relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "dep:p256", "dep:bs58"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
