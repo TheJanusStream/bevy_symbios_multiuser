@@ -18,7 +18,7 @@ pub struct BroadcastMessage<T: Serialize + for<'de> Deserialize<'de> + Send + Sy
     pub channel: ChannelKind,
 }
 
-/// Message fired when a network payload is received from a remote peer.
+/// Message broadcast when a network payload is received from a remote peer.
 ///
 /// The host application reads these messages to react to incoming network data.
 ///
@@ -35,7 +35,7 @@ pub struct NetworkMessageReceived<T: Serialize + for<'de> Deserialize<'de> + Sen
     pub channel: ChannelKind,
 }
 
-/// Message fired when a peer's connection state changes.
+/// Message broadcast when a peer's connection state changes.
 #[derive(Message, Debug, Clone)]
 pub struct PeerStateChanged {
     /// The peer whose state changed.

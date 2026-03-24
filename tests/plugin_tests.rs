@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy_symbios_multiuser::events::{BroadcastMessage, ChannelKind};
+use bevy_symbios_multiuser::messages::{BroadcastMessage, ChannelKind};
 use bevy_symbios_multiuser::plugin::{SymbiosMultiuserConfig, SymbiosMultiuserPlugin};
 use serde::{Deserialize, Serialize};
 

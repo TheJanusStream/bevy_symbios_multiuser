@@ -12,8 +12,22 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// RAII guard that decrements the active connection counter on drop.
+///
+/// Ensures the counter is always decremented even if the `on_upgrade` callback
+/// is never executed (e.g. TCP drops during the HTTP upgrade handshake).
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Maximum number of queued outbound messages per peer before backpressure.
 const RELAY_CHANNEL_CAPACITY: usize = 256;
@@ -72,7 +86,7 @@ pub async fn ws_handler(
     // Atomically reserve a connection slot *before* the async identity
     // extraction to prevent TOCTOU bypasses where thousands of concurrent
     // handshakes all see `len < max_peers` before any inserts happen.
-    if state.max_peers > 0 {
+    let _conn_guard = if state.max_peers > 0 {
         let prev = state
             .active_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -82,7 +96,13 @@ pub async fn ws_handler(
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return (StatusCode::SERVICE_UNAVAILABLE, "Relay is at capacity").into_response();
         }
-    }
+        // RAII guard: if the on_upgrade callback is never executed (e.g. TCP
+        // drops during the HTTP upgrade handshake), the guard's Drop impl
+        // ensures the counter is still decremented.
+        Some(ConnectionGuard(Arc::clone(&state.active_connections)))
+    } else {
+        None
+    };
 
     let identity = extract_identity(
         &headers,
@@ -105,11 +125,7 @@ pub async fn ws_handler(
 
     match identity {
         Err(rejection) => {
-            if state.max_peers > 0 {
-                state
-                    .active_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            // _conn_guard drops here, decrementing the counter.
             rejection.into_response()
         }
         Ok(id) => {
@@ -120,7 +136,7 @@ pub async fn ws_handler(
                 upgrade
             };
             upgrade
-                .on_upgrade(move |socket| handle_socket(socket, state, id, room))
+                .on_upgrade(move |socket| handle_socket(socket, state, id, room, _conn_guard))
                 .into_response()
         }
     }
@@ -189,6 +205,7 @@ async fn handle_socket(
     state: RelayState,
     identity: Option<auth::ValidatedIdentity>,
     room: String,
+    _conn_guard: Option<ConnectionGuard>,
 ) {
     let session_id = match identity {
         Some(ref id) => id.did.clone(),
@@ -235,11 +252,7 @@ async fn handle_socket(
         state
             .peers
             .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
-        if state.max_peers > 0 {
-            state
-                .active_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        // _conn_guard drops here, decrementing the counter.
         return;
     }
 
@@ -365,11 +378,7 @@ async fn handle_socket(
         .remove_if(&session_id_write, |_, entry| entry.conn_id == conn_id);
     if was_removed.is_none() {
         // Another connection owns this session ID now — skip broadcast.
-        if state.max_peers > 0 {
-            state
-                .active_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        // _conn_guard drops here, decrementing the counter.
         tracing::debug!(
             session = %session_id_write,
             "stale connection cleanup skipped (session was replaced)"
@@ -390,10 +399,6 @@ async fn handle_socket(
         let _ = sender.try_send(envelope);
     }
 
-    if state.max_peers > 0 {
-        state
-            .active_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
+    // _conn_guard drops here, decrementing the counter.
     tracing::info!(session = %session_id_write, "peer disconnected");
 }

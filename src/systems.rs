@@ -1,4 +1,4 @@
-use crate::events::{
+use crate::messages::{
     BroadcastMessage, ChannelKind, NetworkMessageReceived, PeerConnectionState, PeerStateChanged,
 };
 use bevy::prelude::*;

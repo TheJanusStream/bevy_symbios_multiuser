@@ -53,14 +53,14 @@
 //!
 //! - `client` (default) — ATProto authentication, custom signaller for
 //!   authenticated relay connections.
-//! - `native-tls` (default) — Enables TLS for both `reqwest` HTTPS and
-//!   `async-tungstenite` WebSocket (`wss://`) connections.
+//! - `tls` (default) — Enables TLS (via `rustls`) for both `reqwest` HTTPS
+//!   and `async-tungstenite` WebSocket (`wss://`) connections.
 //! - `relay` — Sovereign Broker relay server with DID-based JWT signature
 //!   verification, room-based peer isolation, atomic connection limits, SSRF
 //!   protection, and message size caps. Built on `axum`.
 
 pub mod error;
-pub mod events;
+pub mod messages;
 pub mod plugin;
 pub mod protocol;
 pub mod systems;
@@ -77,7 +77,7 @@ pub mod relay;
 /// Re-exports for convenient use.
 pub mod prelude {
     pub use crate::error::SymbiosError;
-    pub use crate::events::{
+    pub use crate::messages::{
         BroadcastMessage, ChannelKind, NetworkMessageReceived, PeerConnectionState,
         PeerStateChanged,
     };

@@ -1,4 +1,4 @@
-use bevy_symbios_multiuser::events::{ChannelKind, PeerConnectionState};
+use bevy_symbios_multiuser::messages::{ChannelKind, PeerConnectionState};
 
 #[test]
 fn channel_kind_default_is_reliable() {

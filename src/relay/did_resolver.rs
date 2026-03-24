@@ -9,21 +9,23 @@
 //! - **SSRF protection** — `did:web` domains are resolved and validated against
 //!   private/loopback IP ranges before fetching. The validated IP is pinned via
 //!   `reqwest::ClientBuilder::resolve` to prevent TOCTOU DNS rebinding attacks.
+//!   HTTP redirects are disabled to prevent attackers from bouncing pinned
+//!   requests to internal endpoints (e.g. cloud metadata services).
 //! - **Streaming body limit** — DID document responses are streamed with an
 //!   incremental size check (max 256 KiB), aborting early rather than buffering
 //!   an unbounded payload into memory.
-//! - **Cache hardening** — The key cache is capped at 10,000 entries and uses
-//!   rate-limited eviction (max once per 5 seconds) to prevent algorithmic
-//!   complexity attacks from triggering O(N) scans on every connection.
+//! - **Cache hardening** — The key cache uses a bounded W-TinyLFU cache
+//!   ([`moka`]) capped at 10,000 entries with a 5-minute TTL. When full,
+//!   the least-frequently/recently-used entries are evicted automatically,
+//!   preventing an attacker from filling the cache with garbage DIDs and
+//!   starving legitimate users of cached lookups.
 
-use dashmap::DashMap;
 use jsonwebtoken::DecodingKey;
+use moka::sync::Cache;
 use p256::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use std::net::ToSocketAddrs;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Default cache TTL for resolved DID signing keys (5 minutes).
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -39,34 +41,19 @@ const DID_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DID_DOCUMENT_SIZE: usize = 256 * 1024;
 
 /// Maximum number of cached DID signing keys.
-/// Beyond this limit, the least-recently-inserted entries are not evicted
-/// automatically, but new inserts are rejected until expired entries are pruned.
-const MAX_CACHE_ENTRIES: usize = 10_000;
-
-/// Minimum interval between full cache eviction scans (in seconds).
-/// Prevents an attacker from triggering O(N) scans on every connection by
-/// rapidly connecting with uncached DIDs while the cache is at capacity.
-const EVICTION_COOLDOWN_SECS: u64 = 5;
-
-/// A cached signing key with expiration time.
-struct CachedKey {
-    key: DecodingKey,
-    expires_at: Instant,
-}
+const MAX_CACHE_ENTRIES: u64 = 10_000;
 
 /// Resolves ATProto DIDs to their signing public keys.
 ///
 /// Fetches DID documents over HTTPS, extracts the `#atproto` verification
 /// method, decodes the multibase/multicodec public key, and caches the result.
+/// The cache uses moka's W-TinyLFU admission policy, which automatically
+/// evicts the least-valuable entries when at capacity.
 #[derive(Clone)]
 pub struct DidResolver {
     client: reqwest::Client,
-    cache: Arc<DashMap<String, CachedKey>>,
+    cache: Cache<String, DecodingKey>,
     plc_directory: String,
-    cache_ttl: Duration,
-    /// Unix-epoch seconds of the last full eviction scan, used to rate-limit
-    /// eviction and prevent algorithmic complexity attacks.
-    last_eviction: Arc<AtomicU64>,
 }
 
 /// Build the URL for fetching a DID document.
@@ -174,15 +161,19 @@ impl DidResolver {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(DID_FETCH_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build reqwest client");
 
+        let cache = Cache::builder()
+            .max_capacity(MAX_CACHE_ENTRIES)
+            .time_to_live(DEFAULT_CACHE_TTL)
+            .build();
+
         Self {
             client,
-            cache: Arc::new(DashMap::new()),
+            cache,
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
-            cache_ttl: DEFAULT_CACHE_TTL,
-            last_eviction: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -197,69 +188,19 @@ impl DidResolver {
     /// Resolve the signing [`DecodingKey`] for a DID.
     ///
     /// Returns a cached key if available and not expired, otherwise fetches
-    /// the DID document from the network. Expired cache entries are removed
-    /// using `remove_if` to avoid racing with concurrent insertions. When the
-    /// cache is at capacity, expired entries are evicted at most once per
-    /// [`EVICTION_COOLDOWN_SECS`] to prevent O(N) scans on every request.
+    /// the DID document from the network. The moka cache handles TTL expiry
+    /// and W-TinyLFU eviction automatically.
     pub async fn resolve_key(&self, did: &str) -> Result<DecodingKey, String> {
-        // Check cache first.
-        if let Some(entry) = self.cache.get(did) {
-            if entry.expires_at > Instant::now() {
-                return Ok(entry.key.clone());
-            }
-            drop(entry);
-            // Only remove if still expired — avoids racing with a concurrent
-            // thread that just inserted a fresh key between our drop and remove.
-            self.cache
-                .remove_if(did, |_, v| v.expires_at <= Instant::now());
+        if let Some(key) = self.cache.get(did) {
+            return Ok(key);
         }
 
         let doc = self.fetch_did_document(did).await?;
         let key = extract_signing_key(&doc)?;
 
-        // Evict expired entries before checking capacity, but rate-limit the
-        // full scan to prevent an attacker from triggering O(N) work on every
-        // connection by flooding with uncached DIDs.
-        if self.cache.len() >= MAX_CACHE_ENTRIES {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let last = self.last_eviction.load(Ordering::Relaxed);
-            if now_secs.saturating_sub(last) >= EVICTION_COOLDOWN_SECS
-                && self
-                    .last_eviction
-                    .compare_exchange(last, now_secs, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-            {
-                self.evict_expired();
-            }
-        }
-
-        // Only cache if we're under the limit. This prevents an attacker from
-        // flooding the cache with unique DIDs to exhaust memory.
-        if self.cache.len() < MAX_CACHE_ENTRIES {
-            self.cache.insert(
-                did.to_string(),
-                CachedKey {
-                    key: key.clone(),
-                    expires_at: Instant::now() + self.cache_ttl,
-                },
-            );
-        } else {
-            tracing::warn!(
-                cache_size = self.cache.len(),
-                "DID key cache at capacity, skipping cache insert"
-            );
-        }
+        self.cache.insert(did.to_string(), key.clone());
 
         Ok(key)
-    }
-
-    /// Remove all expired entries from the cache.
-    fn evict_expired(&self) {
-        let now = Instant::now();
-        self.cache.retain(|_, entry| entry.expires_at > now);
     }
 
     /// Fetch the DID document from the appropriate directory.
@@ -286,6 +227,7 @@ impl DidResolver {
             // Build a one-off client that pins DNS resolution to the validated IP.
             let pinned = reqwest::Client::builder()
                 .timeout(DID_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .resolve(host_only, validated_addr)
                 .build()
                 .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;

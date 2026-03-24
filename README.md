@@ -87,7 +87,7 @@ fn send_movement(mut writer: MessageWriter<BroadcastMessage<GameMessage>>) {
 | Feature | Default | Description |
 | --- | --- | --- |
 | `client` | Yes | ATProto authentication, custom signaller for authenticated relay connections |
-| `native-tls` | Yes | Enables TLS for both `reqwest` HTTPS (PDS) and `async-tungstenite` WebSocket (`wss://`) connections |
+| `tls` | Yes | Enables TLS (via `rustls`) for both `reqwest` HTTPS (PDS) and `async-tungstenite` WebSocket (`wss://`) connections |
 | `relay` | No | Sovereign Broker relay with DID-based JWT signature verification, room isolation, atomic connection limits, SSRF-hardened DID resolution, and message size caps (`axum`/`tokio`/`p256`) |
 
 ### Running the Relay Server
@@ -129,7 +129,7 @@ app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
 | Module      | Description                                                                       |
 |-------------|-----------------------------------------------------------------------------------|
 | `plugin`    | `SymbiosMultiuserPlugin<T>` — the main Bevy plugin                                |
-| `events`    | `BroadcastMessage<T>`, `NetworkMessageReceived<T>`, `PeerStateChanged`            |
+| `messages`  | `BroadcastMessage<T>`, `NetworkMessageReceived<T>`, `PeerStateChanged`            |
 | `systems`   | ECS systems for transmit, receive, and peer state polling                         |
 | `protocol`  | Shared signaling wire format (`SignalEnvelope`, `SignalPayload`)                  |
 | `auth`      | ATProto session creation and refresh (feature: `client`)                          |

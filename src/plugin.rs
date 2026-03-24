@@ -1,4 +1,4 @@
-use crate::events::{BroadcastMessage, NetworkMessageReceived, PeerStateChanged};
+use crate::messages::{BroadcastMessage, NetworkMessageReceived, PeerStateChanged};
 use crate::systems;
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;

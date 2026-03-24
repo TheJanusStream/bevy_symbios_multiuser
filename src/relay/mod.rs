@@ -40,8 +40,10 @@
 //! - **Connection limits** — [`RelayConfig::max_peers`] caps the number of
 //!   concurrent connections (default `512`). The limit is enforced via an atomic
 //!   counter that reserves a slot *before* async identity extraction, preventing
-//!   TOCTOU bypasses from concurrent handshakes. New connections are rejected
-//!   with HTTP 503 once the limit is reached.
+//!   TOCTOU bypasses from concurrent handshakes. An RAII `ConnectionGuard`
+//!   ensures the counter is decremented even if the WebSocket upgrade callback
+//!   is never executed (e.g. TCP drops during the HTTP handshake). New
+//!   connections are rejected with HTTP 503 once the limit is reached.
 //! - **Message size cap** — Incoming WebSocket messages are limited to 64 KiB.
 //!   SDP offers/answers and ICE candidates are typically a few KiB at most.
 //! - **Control signal filtering** — Clients cannot forge `PeerJoined`/`PeerLeft`
