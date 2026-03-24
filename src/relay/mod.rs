@@ -32,6 +32,7 @@ mod handler;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 // Re-export protocol types so existing `use relay::SignalEnvelope` still works.
 pub use crate::protocol::{SignalEnvelope, SignalPayload};
@@ -46,14 +47,22 @@ pub struct RelayConfig {
     pub auth_required: bool,
 }
 
-/// A connected peer's sender handle, keyed by their session identifier.
-type PeerSender = mpsc::Sender<SignalEnvelope>;
+/// A connected peer's sender handle paired with a unique connection ID.
+///
+/// The connection ID distinguishes multiple WebSocket connections from the
+/// same user (e.g. reconnects), preventing stale cleanup from clobbering a
+/// newer connection.
+#[derive(Clone)]
+pub struct PeerEntry {
+    pub tx: mpsc::Sender<SignalEnvelope>,
+    pub conn_id: uuid::Uuid,
+}
 
 /// Shared server state holding the map of connected peers.
 #[derive(Clone)]
 pub struct RelayState {
     /// Maps peer session IDs to their WebSocket message senders.
-    pub peers: Arc<DashMap<String, PeerSender>>,
+    pub peers: Arc<DashMap<String, PeerEntry>>,
     /// Whether authentication is mandatory for new connections.
     pub auth_required: bool,
 }

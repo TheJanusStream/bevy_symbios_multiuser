@@ -12,7 +12,7 @@ const MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MiB
 
 /// Returns the canonical bincode options used for all network serialization.
 /// Both transmit and receive **must** use this to avoid encoding mismatches.
-fn bincode_options() -> impl Options {
+pub fn bincode_options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_limit(MAX_MESSAGE_SIZE)
         .with_fixint_encoding()

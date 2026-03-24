@@ -84,18 +84,24 @@ pub async fn create_session(
         credentials.pds_url.trim_end_matches('/')
     );
 
-    let response: CreateSessionResponse = client
+    let resp = client
         .post(&url)
         .json(&CreateSessionRequest {
             identifier: &credentials.identifier,
             password: &credentials.password,
         })
         .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| SymbiosError::AuthFailed(e.to_string()))?
-        .json()
         .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SymbiosError::AuthFailed(format!(
+            "PDS returned {status}: {body}"
+        )));
+    }
+
+    let response: CreateSessionResponse = resp.json().await?;
 
     Ok(AtprotoSession {
         did: response.did,
@@ -120,15 +126,21 @@ pub async fn refresh_session(
         pds_url.trim_end_matches('/')
     );
 
-    let response: RefreshSessionResponse = client
+    let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", session.refresh_jwt))
         .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| SymbiosError::AuthFailed(e.to_string()))?
-        .json()
         .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SymbiosError::AuthFailed(format!(
+            "PDS returned {status}: {body}"
+        )));
+    }
+
+    let response: RefreshSessionResponse = resp.json().await?;
 
     Ok(AtprotoSession {
         did: response.did,

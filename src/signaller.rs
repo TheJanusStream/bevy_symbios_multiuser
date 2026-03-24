@@ -156,17 +156,18 @@ fn build_ws_request(
 #[cfg(target_arch = "wasm32")]
 impl SymbiosSignallerBuilder {
     async fn try_connect(&self, room_url: &str) -> Result<WsStream, SignalingError> {
-        // The browser WebSocket API does not support custom headers, so we pass
-        // the JWT as a query parameter instead.
-        let url = match self.access_jwt.as_deref() {
-            Some(token) => {
-                let separator = if room_url.contains('?') { "&" } else { "?" };
-                format!("{room_url}{separator}token={token}")
-            }
-            None => room_url.to_owned(),
+        // The browser WebSocket API does not support custom headers. We pass
+        // the JWT via the Sec-WebSocket-Protocol header using the two-element
+        // subprotocol trick: `["access_token", "<jwt>"]`. This avoids leaking
+        // the token in URL query parameters (which are logged by proxies and
+        // load balancers).
+        let protocols: Vec<&str> = match self.access_jwt.as_deref() {
+            Some(token) => vec!["access_token", token],
+            None => vec![],
         };
 
-        let (_meta, stream) = WsMeta::connect(&url, None)
+        let proto_refs: Vec<&str> = protocols.iter().copied().collect();
+        let (_meta, stream) = WsMeta::connect(room_url, Some(proto_refs.as_slice()))
             .await
             .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
 

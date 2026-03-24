@@ -1,4 +1,4 @@
-use super::RelayState;
+use super::{PeerEntry, RelayState};
 use super::auth;
 use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
@@ -70,8 +70,22 @@ fn extract_identity(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
 
-    // 2. Fall back to the query parameter (WASM clients).
-    let token = header_token.or(query_token);
+    // 2. Fall back to Sec-WebSocket-Protocol subprotocol (WASM clients).
+    //    The browser sends `Sec-WebSocket-Protocol: access_token, <jwt>`.
+    let protocol_token = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+            if parts.len() == 2 && parts[0] == "access_token" {
+                Some(parts[1])
+            } else {
+                None
+            }
+        });
+
+    // 3. Fall back to query parameter (legacy WASM clients).
+    let token = header_token.or(protocol_token).or(query_token);
 
     let Some(token) = token else {
         if auth_required {
@@ -102,10 +116,14 @@ async fn handle_socket(
         Some(ref id) => id.did.clone(),
         None => Uuid::new_v4().to_string(),
     };
+    let conn_id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    state.peers.insert(session_id.clone(), relay_tx);
+    state.peers.insert(session_id.clone(), PeerEntry {
+        tx: relay_tx,
+        conn_id,
+    });
 
     // Announce the assigned session ID to the connecting client.
     let welcome = serde_json::json!({ "type": "session_id", "id": session_id });
@@ -114,7 +132,7 @@ async fn handle_socket(
         .await
         .is_err()
     {
-        state.peers.remove(&session_id);
+        state.peers.remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
         return;
     }
 
@@ -131,14 +149,19 @@ async fn handle_socket(
         .await;
 
     // Notify existing peers about the new peer using a proper control variant.
-    for entry in state.peers.iter() {
-        if *entry.key() != session_id {
-            let envelope = SignalEnvelope {
-                peer_id: session_id.clone(),
-                signal: SignalPayload::PeerJoined(session_id.clone()),
-            };
-            let _ = entry.value().send(envelope).await;
-        }
+    // Collect senders first to avoid holding DashMap read locks across `.await`.
+    let peer_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
+        .peers
+        .iter()
+        .filter(|entry| *entry.key() != session_id)
+        .map(|entry| entry.value().tx.clone())
+        .collect();
+    for sender in peer_senders {
+        let envelope = SignalEnvelope {
+            peer_id: session_id.clone(),
+            signal: SignalPayload::PeerJoined(session_id.clone()),
+        };
+        let _ = sender.try_send(envelope);
     }
 
     let session_id_write = session_id.clone();
@@ -175,6 +198,20 @@ async fn handle_socket(
                 }
             };
 
+            // Reject control signals from clients — only the relay may
+            // originate PeerJoined/PeerLeft to prevent mesh spoofing.
+            if matches!(
+                envelope.signal,
+                SignalPayload::PeerJoined(_) | SignalPayload::PeerLeft(_)
+            ) {
+                tracing::warn!(
+                    session = %session_id,
+                    signal = ?envelope.signal,
+                    "dropping forged control signal from client"
+                );
+                continue;
+            }
+
             // Route to target peer, rewriting peer_id to the sender's ID.
             let target_id = envelope.peer_id.clone();
             let forwarded = SignalEnvelope {
@@ -182,8 +219,8 @@ async fn handle_socket(
                 signal: envelope.signal,
             };
 
-            if let Some(sender) = state_write.peers.get(&target_id) {
-                let _ = sender.value().send(forwarded).await;
+            if let Some(entry) = state_write.peers.get(&target_id) {
+                let _ = entry.value().tx.try_send(forwarded);
             } else {
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");
             }
@@ -200,14 +237,30 @@ async fn handle_socket(
         }
     }
 
-    // Cleanup: remove peer from the map and notify others.
-    state.peers.remove(&session_id_write);
-    for entry in state.peers.iter() {
+    // Cleanup: only remove the peer entry if it still belongs to *this*
+    // connection. A reconnect may have already replaced it with a new sender.
+    let was_removed = state
+        .peers
+        .remove_if(&session_id_write, |_, entry| entry.conn_id == conn_id);
+    if was_removed.is_none() {
+        // Another connection owns this session ID now — skip broadcast.
+        tracing::debug!(
+            session = %session_id_write,
+            "stale connection cleanup skipped (session was replaced)"
+        );
+        return;
+    }
+    let remaining_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
+        .peers
+        .iter()
+        .map(|entry| entry.value().tx.clone())
+        .collect();
+    for sender in remaining_senders {
         let envelope = SignalEnvelope {
             peer_id: session_id_write.clone(),
             signal: SignalPayload::PeerLeft(session_id_write.clone()),
         };
-        let _ = entry.value().send(envelope).await;
+        let _ = sender.try_send(envelope);
     }
 
     tracing::info!(session = %session_id_write, "peer disconnected");
