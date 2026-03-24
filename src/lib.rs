@@ -7,7 +7,7 @@
 //!
 //! ## Architecture
 //!
-//! The crate provides a generic message bus via [`SymbiosMultiuserPlugin<T>`]
+//! The crate provides a generic message bus via [`plugin::SymbiosMultiuserPlugin`]
 //! that accepts any serializable domain type `T`. Messages are transported over
 //! WebRTC data channels: one **reliable** channel for state mutations and one
 //! **unreliable** channel for ephemeral presence data.
@@ -21,7 +21,7 @@
 //!    sent as an `Authorization: Bearer` header. On WASM targets, the token
 //!    is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the
 //!    browser `WebSocket` API does not support custom headers).
-//! 3. The relay ([`relay`] module) validates the JWT claims and — when
+//! 3. The relay (`relay` module, feature-gated) validates the JWT claims and — when
 //!    `auth_required` is enabled — resolves the issuer's DID document to
 //!    cryptographically verify the ES256 signature against the `#atproto`
 //!    signing key. The authenticated DID becomes the peer's session identity.
@@ -41,12 +41,28 @@
 //!     Chat(String),
 //! }
 //!
-//! App::new()
-//!     .add_plugins(DefaultPlugins)
-//!     .add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
-//!         "wss://matchbox.example.com/my_room",
-//!     ))
-//!     .run();
+//! fn main() {
+//!     App::new()
+//!         .add_plugins(DefaultPlugins)
+//!         .add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
+//!             "wss://matchbox.example.com/my_room",
+//!         ))
+//!         .add_systems(Update, (handle_incoming, send_movement))
+//!         .run();
+//! }
+//!
+//! fn handle_incoming(mut queue: ResMut<NetworkQueue<GameMessage>>) {
+//!     for msg in queue.drain() {
+//!         info!("From {:?}: {:?}", msg.sender, msg.payload);
+//!     }
+//! }
+//!
+//! fn send_movement(mut writer: MessageWriter<Broadcast<GameMessage>>) {
+//!     writer.write(Broadcast {
+//!         payload: GameMessage::Move { x: 1.0, y: 2.0 },
+//!         channel: ChannelKind::Unreliable,
+//!     });
+//! }
 //! ```
 //!
 //! ## Features

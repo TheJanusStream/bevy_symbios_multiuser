@@ -26,9 +26,11 @@ pub struct SymbiosMultiuserConfig {
 /// - **Channel 0** (Reliable): ordered, guaranteed delivery for state mutations.
 /// - **Channel 1** (Unreliable): unordered, best-effort for ephemeral presence.
 ///
-/// The plugin exposes Bevy messages [`Broadcast<T>`] and
-/// [`NetworkReceived<T>`] so the host application can send and receive
-/// domain-specific messages without touching the network layer directly.
+/// The plugin exposes a Bevy [`Message`] type [`Broadcast<T>`] for outbound
+/// traffic and a [`NetworkQueue<T>`] resource for inbound traffic. Peer
+/// connection state changes are delivered via [`PeerStateQueue`]. The host
+/// application interacts with these to send and receive domain-specific
+/// messages without touching the network layer directly.
 pub struct SymbiosMultiuserPlugin<T> {
     config: SymbiosMultiuserConfig,
     _marker: PhantomData<T>,
