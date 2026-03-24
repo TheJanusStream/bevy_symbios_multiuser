@@ -12,11 +12,15 @@
 //! # Platform Support
 //!
 //! On native targets, the WebSocket connection uses `async-tungstenite` with
-//! the JWT passed as an `Authorization` header during the upgrade handshake.
+//! the JWT passed as an `Authorization: Bearer <token>` header during the
+//! upgrade handshake.
 //!
 //! On WASM targets, the browser's `WebSocket` API (via `ws_stream_wasm`) is
 //! used instead. Because the browser `WebSocket` constructor does not support
-//! custom headers, the JWT is passed as a `token` query parameter on the URL.
+//! custom headers, the JWT is passed via the `Sec-WebSocket-Protocol`
+//! subprotocol trick: the client sends `["access_token", "<jwt>"]` as the
+//! requested subprotocols during the handshake. The relay extracts the token
+//! from the second element.
 
 use crate::protocol::{SignalEnvelope, SignalPayload};
 #[allow(unused_imports)] // SinkExt is used by .send() inside async_trait impls

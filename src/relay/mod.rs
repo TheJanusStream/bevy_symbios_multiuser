@@ -6,8 +6,15 @@
 //! between peers using an in-memory connection map.
 //!
 //! When [`RelayConfig::auth_required`] is `true`, every connecting client must
-//! present a valid ATProto access JWT in the `Authorization: Bearer <token>`
-//! header. The authenticated DID becomes the peer's session identity.
+//! present a valid ATProto access JWT. The relay accepts the token from three
+//! sources, checked in order:
+//!
+//! 1. `Authorization: Bearer <token>` header (native clients).
+//! 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients
+//!    using the subprotocol trick).
+//! 3. `?token=<token>` query parameter (legacy WASM fallback).
+//!
+//! The authenticated DID becomes the peer's session identity.
 //! When `false` (the default), authentication is opportunistic — valid tokens
 //! are used for identity, but unauthenticated clients fall back to random UUIDs.
 //!
@@ -42,8 +49,8 @@ pub use crate::protocol::{SignalEnvelope, SignalPayload};
 pub struct RelayConfig {
     /// The address to bind the server to (e.g. `"0.0.0.0:3536"`).
     pub bind_addr: String,
-    /// If `true`, reject WebSocket connections that do not carry a valid
-    /// ATProto JWT in the `Authorization` header. Defaults to `false`.
+    /// If `true`, reject WebSocket connections that do not present a valid
+    /// ATProto JWT (via header, subprotocol, or query param). Defaults to `false`.
     pub auth_required: bool,
 }
 
@@ -54,7 +61,11 @@ pub struct RelayConfig {
 /// newer connection.
 #[derive(Clone)]
 pub struct PeerEntry {
+    /// Channel sender for delivering signaling envelopes to this peer's
+    /// WebSocket write task.
     pub tx: mpsc::Sender<SignalEnvelope>,
+    /// Unique ID for this specific WebSocket connection, used to distinguish
+    /// reconnects and prevent stale cleanup from clobbering a newer session.
     pub conn_id: uuid::Uuid,
 }
 

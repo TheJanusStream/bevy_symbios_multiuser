@@ -19,8 +19,9 @@ const RELAY_CHANNEL_CAPACITY: usize = 256;
 
 /// Optional query parameters on the WebSocket upgrade URL.
 ///
-/// WASM clients cannot set custom HTTP headers on the browser `WebSocket`
-/// constructor, so they pass the ATProto JWT via `?token=<jwt>` instead.
+/// Used as a legacy fallback for WASM clients that pass the ATProto JWT via
+/// `?token=<jwt>`. The preferred WASM transport is the `Sec-WebSocket-Protocol`
+/// subprotocol trick; this query parameter exists for compatibility.
 #[derive(Debug, Deserialize)]
 pub struct WsQueryParams {
     token: Option<String>,
@@ -28,11 +29,15 @@ pub struct WsQueryParams {
 
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
 ///
-/// When `auth_required` is enabled on the relay, the handler extracts a
-/// `Bearer` token from the `Authorization` header **or** a `token` query
-/// parameter (for WASM clients), validates it as an ATProto JWT, and uses the
-/// authenticated DID as the peer's session identity. Unauthenticated requests
-/// receive HTTP 401.
+/// When `auth_required` is enabled on the relay, the handler extracts an
+/// ATProto JWT from one of three sources (checked in order):
+///
+/// 1. `Authorization: Bearer <token>` header (native clients).
+/// 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients).
+/// 3. `?token=<token>` query parameter (legacy WASM fallback).
+///
+/// The token is validated and the authenticated DID becomes the peer's session
+/// identity. Unauthenticated requests receive HTTP 401.
 ///
 /// When `auth_required` is disabled, authentication is opportunistic: a valid
 /// JWT will still be used for identity, but missing or invalid tokens are
@@ -54,11 +59,14 @@ pub async fn ws_handler(
 }
 
 /// Attempt to extract a [`ValidatedIdentity`](auth::ValidatedIdentity) from
-/// the `Authorization: Bearer <token>` header, falling back to a `token`
-/// query parameter (used by WASM clients that cannot set custom headers).
+/// one of three sources (checked in order):
+///
+/// 1. `Authorization: Bearer <token>` header (native clients).
+/// 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients).
+/// 3. `?token=<token>` query parameter (legacy WASM fallback).
 ///
 /// Returns `Err` with a 401 response only when `auth_required` is true and
-/// no valid token is found in either location.
+/// no valid token is found in any source.
 fn extract_identity(
     headers: &HeaderMap,
     query_token: Option<&str>,

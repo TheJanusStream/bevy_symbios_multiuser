@@ -16,10 +16,15 @@
 //!
 //! 1. The client authenticates with an ATProto PDS via
 //!    [`auth::create_session`], obtaining a JWT access token.
-//! 2. The [`signaller::SymbiosSignallerBuilder`] passes this JWT in the
-//!    `Authorization` header when connecting to the relay.
-//! 3. The relay ([`relay`] module) verifies the JWT and uses the
-//!    authenticated DID as the peer's session identity.
+//! 2. The [`signaller::SymbiosSignallerBuilder`] passes this JWT to the
+//!    relay during the WebSocket handshake. On native targets, the token is
+//!    sent as an `Authorization: Bearer` header. On WASM targets, the token
+//!    is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the
+//!    browser `WebSocket` API does not support custom headers).
+//! 3. The relay ([`relay`] module) validates the JWT claims (structure and
+//!    expiry) and uses the authenticated DID as the peer's session identity.
+//!    Note: cryptographic signature verification is not yet implemented —
+//!    see [`relay::auth`](relay/auth) module docs for details.
 //! 4. Once signaling completes, data flows directly peer-to-peer over
 //!    WebRTC data channels.
 //!
