@@ -131,10 +131,10 @@ app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
 | `plugin`    | `SymbiosMultiuserPlugin<T>` — the main Bevy plugin                                |
 | `events`    | `BroadcastMessage<T>`, `NetworkMessageReceived<T>`, `PeerStateChanged`            |
 | `systems`   | ECS systems for transmit, receive, and peer state polling                         |
-| `protocol`  | Shared signaling wire format (`SignalEnvelope`, `SignalPayload`)                   |
+| `protocol`  | Shared signaling wire format (`SignalEnvelope`, `SignalPayload`)                  |
 | `auth`      | ATProto session creation and refresh (feature: `client`)                          |
 | `signaller` | Custom `matchbox_socket::Signaller` with JWT injection (feature: `client`)        |
-| `relay`     | Sovereign Broker relay server with DID-based JWT verification (feature: `relay`)   |
+| `relay`     | Sovereign Broker relay server with DID-based JWT verification (feature: `relay`)  |
 | `error`     | `SymbiosError` error types                                                        |
 
 ## Platform Support
