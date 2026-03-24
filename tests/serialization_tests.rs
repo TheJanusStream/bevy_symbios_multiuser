@@ -80,5 +80,8 @@ fn rejects_oversized_payload() {
         data: vec![0u8; 2 * 1024 * 1024], // 2 MiB
     };
     let bytes = bincode_options().serialize(&oversized);
-    assert!(bytes.is_err(), "serialization should reject oversized payloads");
+    assert!(
+        bytes.is_err(),
+        "serialization should reject oversized payloads"
+    );
 }

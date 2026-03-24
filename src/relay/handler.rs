@@ -1,5 +1,5 @@
-use super::{PeerEntry, RelayState};
 use super::auth;
+use super::{PeerEntry, RelayState};
 use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
     extract::{
@@ -9,8 +9,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use serde::Deserialize;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -120,10 +120,13 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    state.peers.insert(session_id.clone(), PeerEntry {
-        tx: relay_tx,
-        conn_id,
-    });
+    state.peers.insert(
+        session_id.clone(),
+        PeerEntry {
+            tx: relay_tx,
+            conn_id,
+        },
+    );
 
     // Announce the assigned session ID to the connecting client.
     let welcome = serde_json::json!({ "type": "session_id", "id": session_id });
@@ -132,7 +135,9 @@ async fn handle_socket(
         .await
         .is_err()
     {
-        state.peers.remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
+        state
+            .peers
+            .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
         return;
     }
 

@@ -69,9 +69,7 @@ pub fn validate_atproto_jwt(token: &str) -> Result<ValidatedIdentity, String> {
         return Err(format!("invalid DID in JWT issuer: {did}"));
     }
 
-    Ok(ValidatedIdentity {
-        did: did.clone(),
-    })
+    Ok(ValidatedIdentity { did: did.clone() })
 }
 
 #[cfg(test)]

@@ -24,8 +24,7 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 use matchbox_socket::async_trait::async_trait;
 use matchbox_socket::{
-    PeerId, PeerEvent, PeerRequest, PeerSignal, Signaller, SignallerBuilder,
-    SignalingError,
+    PeerEvent, PeerId, PeerRequest, PeerSignal, SignalingError, Signaller, SignallerBuilder,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -35,24 +34,23 @@ use uuid::Uuid;
 // ── Native-only imports ──────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
-use async_tungstenite::async_std::{connect_async, ConnectStream};
+use async_tungstenite::WebSocketStream;
+#[cfg(not(target_arch = "wasm32"))]
+use async_tungstenite::async_std::{ConnectStream, connect_async};
 #[cfg(not(target_arch = "wasm32"))]
 use async_tungstenite::tungstenite;
-#[cfg(not(target_arch = "wasm32"))]
-use async_tungstenite::WebSocketStream;
 
 // ── WASM-only imports ────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "wasm32")]
-use ws_stream_wasm::{WsMeta, WsStream, WsMessage as WasmWsMessage};
+use ws_stream_wasm::{WsMessage as WasmWsMessage, WsMeta, WsStream};
 
 // ── Shared constants & helpers ───────────────────────────────────────────────
 
 /// Namespace UUID for deterministic `PeerId` generation from DID strings.
 /// Produced by `Uuid::new_v5(Uuid::NAMESPACE_URL, b"symbios:did")`.
 const DID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
-    0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 /// Convert a session ID string to a [`PeerId`].
@@ -196,17 +194,16 @@ impl SymbiosSignaller {
     async fn read_welcome(&mut self) -> Result<(), SignalingError> {
         // 1. session_id message
         let session_msg = self.read_text().await?;
-        let session_json: serde_json::Value = serde_json::from_str(&session_msg)
-            .map_err(|e| SignalingError::UserImplementationError(
-                format!("invalid session_id message: {e}"),
-            ))?;
+        let session_json: serde_json::Value = serde_json::from_str(&session_msg).map_err(|e| {
+            SignalingError::UserImplementationError(format!("invalid session_id message: {e}"))
+        })?;
 
         let session_id = session_json
             .get("id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| SignalingError::UserImplementationError(
-                "missing 'id' in session_id message".into(),
-            ))?;
+            .ok_or_else(|| {
+                SignalingError::UserImplementationError("missing 'id' in session_id message".into())
+            })?;
 
         self.local_peer_id = session_id_to_peer_id(session_id);
         self.track_session(session_id.to_owned(), self.local_peer_id);
@@ -215,10 +212,10 @@ impl SymbiosSignaller {
 
         // 2. peer_list message
         let peer_list_msg = self.read_text().await?;
-        let peer_list_json: serde_json::Value = serde_json::from_str(&peer_list_msg)
-            .map_err(|e| SignalingError::UserImplementationError(
-                format!("invalid peer_list message: {e}"),
-            ))?;
+        let peer_list_json: serde_json::Value =
+            serde_json::from_str(&peer_list_msg).map_err(|e| {
+                SignalingError::UserImplementationError(format!("invalid peer_list message: {e}"))
+            })?;
 
         if let Some(peers) = peer_list_json.get("peers").and_then(|v| v.as_array()) {
             for peer_val in peers {
@@ -300,9 +297,9 @@ impl Signaller for SymbiosSignaller {
                 let target_session = self
                     .peer_to_session
                     .get(&receiver)
-                    .ok_or_else(|| SignalingError::UserImplementationError(
-                        format!("unknown peer {receiver}"),
-                    ))?
+                    .ok_or_else(|| {
+                        SignalingError::UserImplementationError(format!("unknown peer {receiver}"))
+                    })?
                     .clone();
 
                 let signal = match data {
@@ -414,9 +411,7 @@ impl SymbiosSignaller {
 
 /// Create an [`Arc`]-wrapped [`SymbiosSignallerBuilder`] ready for use with
 /// [`WebRtcSocketBuilder::signaller_builder`](matchbox_socket::WebRtcSocket).
-pub fn signaller_for_session(
-    session: &crate::auth::AtprotoSession,
-) -> Arc<dyn SignallerBuilder> {
+pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
         access_jwt: Some(session.access_jwt.clone()),
     })
