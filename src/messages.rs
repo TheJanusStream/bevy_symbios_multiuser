@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use matchbox_socket::PeerId;
 use serde::{Serialize, de::DeserializeOwned};
+use std::collections::VecDeque;
 
 /// Broadcast a payload to all connected peers.
 ///
@@ -24,7 +25,7 @@ pub struct Broadcast<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
 ///
 /// # Type Parameters
 /// * `T` - The domain-specific payload type. Must implement `Serialize + Deserialize`.
-#[derive(Message, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'static>
 {
     /// The deserialized payload from the remote peer.
@@ -35,13 +36,97 @@ pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'stat
     pub channel: ChannelKind,
 }
 
-/// Message broadcast when a peer's connection state changes.
-#[derive(Message, Debug, Clone)]
+/// Unbounded queue for incoming network messages.
+///
+/// Unlike Bevy's double-buffered `Messages`, this resource is **not** cleared
+/// automatically each frame. This prevents silent message loss when the
+/// consumer runs in `FixedUpdate` at a lower tick rate than the render
+/// framerate. The host application must drain the queue manually.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// fn handle_incoming(mut queue: ResMut<NetworkQueue<MyMsg>>) {
+///     for msg in queue.drain() {
+///         // process msg
+///     }
+/// }
+/// ```
+#[derive(Resource, Debug)]
+pub struct NetworkQueue<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
+    incoming: VecDeque<NetworkReceived<T>>,
+}
+
+impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Default for NetworkQueue<T> {
+    fn default() -> Self {
+        Self {
+            incoming: VecDeque::new(),
+        }
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
+    /// Push a received message onto the queue.
+    pub(crate) fn push(&mut self, msg: NetworkReceived<T>) {
+        self.incoming.push_back(msg);
+    }
+
+    /// Drain all queued messages. The caller owns the returned iterator and
+    /// no messages are dropped until consumed.
+    pub fn drain(&mut self) -> impl Iterator<Item = NetworkReceived<T>> + '_ {
+        self.incoming.drain(..)
+    }
+
+    /// Returns `true` if there are no queued messages.
+    pub fn is_empty(&self) -> bool {
+        self.incoming.is_empty()
+    }
+
+    /// Returns the number of queued messages.
+    pub fn len(&self) -> usize {
+        self.incoming.len()
+    }
+}
+
+/// A peer connection state change event.
+#[derive(Debug, Clone)]
 pub struct PeerStateChanged {
     /// The peer whose state changed.
     pub peer: PeerId,
     /// The new connection state.
     pub state: PeerConnectionState,
+}
+
+/// Unbounded queue for peer state change events.
+///
+/// Like [`NetworkQueue`], this avoids the double-buffer clearing issue with
+/// Bevy `Messages` so that `FixedUpdate` consumers never miss a peer
+/// connect/disconnect event.
+#[derive(Resource, Debug, Default)]
+pub struct PeerStateQueue {
+    events: VecDeque<PeerStateChanged>,
+}
+
+impl PeerStateQueue {
+    /// Push a peer state change onto the queue.
+    pub(crate) fn push(&mut self, event: PeerStateChanged) {
+        self.events.push_back(event);
+    }
+
+    /// Drain all queued events.
+    pub fn drain(&mut self) -> impl Iterator<Item = PeerStateChanged> + '_ {
+        self.events.drain(..)
+    }
+
+    /// Returns `true` if there are no queued events.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Returns the number of queued events.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
 }
 
 /// The connection state of a remote peer.

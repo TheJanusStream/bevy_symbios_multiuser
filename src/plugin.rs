@@ -1,4 +1,4 @@
-use crate::messages::{Broadcast, NetworkReceived, PeerStateChanged};
+use crate::messages::{Broadcast, NetworkQueue, PeerStateQueue};
 use crate::systems;
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
@@ -61,9 +61,9 @@ where
 {
     fn build(&self, app: &mut App) {
         app.insert_resource(self.config.clone())
+            .init_resource::<NetworkQueue<T>>()
+            .init_resource::<PeerStateQueue>()
             .add_message::<Broadcast<T>>()
-            .add_message::<NetworkReceived<T>>()
-            .add_message::<PeerStateChanged>()
             .add_systems(Startup, open_socket)
             .add_systems(
                 Update,

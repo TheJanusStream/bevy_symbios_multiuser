@@ -1,5 +1,6 @@
 use crate::messages::{
-    Broadcast, ChannelKind, NetworkReceived, PeerConnectionState, PeerStateChanged,
+    Broadcast, ChannelKind, NetworkQueue, NetworkReceived, PeerConnectionState, PeerStateChanged,
+    PeerStateQueue,
 };
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
@@ -29,7 +30,7 @@ pub fn bincode_options() -> impl Options {
 /// [`PeerStateChanged`] messages.
 pub fn poll_peers(
     mut socket: ResMut<MatchboxSocket>,
-    mut peer_messages: MessageWriter<PeerStateChanged>,
+    mut peer_queue: ResMut<PeerStateQueue>,
 ) {
     let Ok(changes) = socket.try_update_peers() else {
         return;
@@ -41,7 +42,7 @@ pub fn poll_peers(
             PeerState::Disconnected => PeerConnectionState::Disconnected,
         };
         tracing::info!(peer = %peer, state = ?connection_state, "peer state changed");
-        peer_messages.write(PeerStateChanged {
+        peer_queue.push(PeerStateChanged {
             peer,
             state: connection_state,
         });
@@ -52,7 +53,7 @@ pub fn poll_peers(
 /// and writes [`NetworkReceived<T>`] messages.
 pub fn receive_messages<T>(
     mut socket: ResMut<MatchboxSocket>,
-    mut received: MessageWriter<NetworkReceived<T>>,
+    mut queue: ResMut<NetworkQueue<T>>,
 ) where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
@@ -72,7 +73,7 @@ pub fn receive_messages<T>(
                         channel = ?channel_kind,
                         "received message"
                     );
-                    received.write(NetworkReceived {
+                    queue.push(NetworkReceived {
                         payload,
                         sender: peer,
                         channel: channel_kind,

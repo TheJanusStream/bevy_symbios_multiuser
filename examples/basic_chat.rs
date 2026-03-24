@@ -13,7 +13,7 @@ use bevy_symbios_multiuser::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Domain-specific chat message.
-#[derive(Serialize, Deserialize, Debug, Clone, Message)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum ChatMessage {
     Text { author: String, body: String },
     Join(String),
@@ -31,8 +31,8 @@ fn main() {
 }
 
 /// Reads incoming chat messages and logs them.
-fn handle_incoming(mut reader: MessageReader<NetworkReceived<ChatMessage>>) {
-    for msg in reader.read() {
+fn handle_incoming(mut queue: ResMut<NetworkQueue<ChatMessage>>) {
+    for msg in queue.drain() {
         match &msg.payload {
             ChatMessage::Text { author, body } => {
                 info!("[{author}]: {body}");

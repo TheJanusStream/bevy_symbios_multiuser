@@ -43,8 +43,8 @@ fn main() {
         .run();
 }
 
-fn handle_incoming(mut reader: MessageReader<NetworkReceived<GameMessage>>) {
-    for msg in reader.read() {
+fn handle_incoming(mut queue: ResMut<NetworkQueue<GameMessage>>) {
+    for msg in queue.drain() {
         info!("From {:?}: {:?}", msg.sender, msg.payload);
     }
 }
