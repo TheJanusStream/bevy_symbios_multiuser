@@ -18,6 +18,7 @@ fn main() {
             let config = RelayConfig {
                 bind_addr: "0.0.0.0:3536".to_string(),
                 auth_required: false,
+                max_peers: 512,
             };
 
             println!("Starting relay server on {}", config.bind_addr);

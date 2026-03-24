@@ -87,9 +87,9 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
         mut attempts: Option<u16>,
         room_url: String,
     ) -> Result<Box<dyn Signaller>, SignalingError> {
-        let ws = 'connect: loop {
-            match self.try_connect(&room_url).await {
-                Ok(stream) => break stream,
+        let signaller = 'connect: loop {
+            let ws = match self.try_connect(&room_url).await {
+                Ok(stream) => stream,
                 Err(e) => {
                     if let Some(ref mut remaining) = attempts {
                         if *remaining <= 1 {
@@ -108,19 +108,39 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                     futures_timer::Delay::new(Duration::from_secs(3)).await;
                     continue 'connect;
                 }
+            };
+
+            let mut signaller = SymbiosSignaller {
+                ws,
+                local_peer_id: PeerId(Uuid::nil()),
+                session_to_peer: HashMap::new(),
+                peer_to_session: HashMap::new(),
+                pending_events: VecDeque::new(),
+            };
+
+            // Read the relay's welcome messages (session_id + peer_list).
+            // If this fails, treat it like a connection failure and retry.
+            match signaller.read_welcome().await {
+                Ok(()) => break signaller,
+                Err(e) => {
+                    if let Some(ref mut remaining) = attempts {
+                        if *remaining <= 1 {
+                            return Err(e);
+                        }
+                        *remaining -= 1;
+                        tracing::warn!(
+                            attempts_remaining = *remaining,
+                            "welcome handshake failed, retrying in 3s"
+                        );
+                        futures_timer::Delay::new(Duration::from_secs(3)).await;
+                        continue 'connect;
+                    }
+                    tracing::warn!("welcome handshake failed, retrying in 3s");
+                    futures_timer::Delay::new(Duration::from_secs(3)).await;
+                    continue 'connect;
+                }
             }
         };
-
-        let mut signaller = SymbiosSignaller {
-            ws,
-            local_peer_id: PeerId(Uuid::nil()),
-            session_to_peer: HashMap::new(),
-            peer_to_session: HashMap::new(),
-            pending_events: VecDeque::new(),
-        };
-
-        // Read the relay's welcome messages: session_id then peer_list.
-        signaller.read_welcome().await?;
 
         Ok(Box::new(signaller))
     }
@@ -298,13 +318,15 @@ impl Signaller for SymbiosSignaller {
     async fn send(&mut self, request: PeerRequest) -> Result<(), SignalingError> {
         match request {
             PeerRequest::Signal { receiver, data } => {
-                let target_session = self
-                    .peer_to_session
-                    .get(&receiver)
-                    .ok_or_else(|| {
-                        SignalingError::UserImplementationError(format!("unknown peer {receiver}"))
-                    })?
-                    .clone();
+                let target_session = match self.peer_to_session.get(&receiver) {
+                    Some(s) => s.clone(),
+                    None => {
+                        // Peer disconnected between the signal being queued and
+                        // sent — this is a normal race condition, not fatal.
+                        tracing::debug!(%receiver, "dropping signal to unknown peer (likely disconnected)");
+                        return Ok(());
+                    }
+                };
 
                 let signal = match data {
                     PeerSignal::Offer(sdp) => SignalPayload::Offer(sdp),

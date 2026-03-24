@@ -33,10 +33,13 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
 dashmap = { version = "6", optional = true }
 jsonwebtoken = { version = "9", optional = true }
+p256 = { version = "0.13", features = ["pkcs8"], optional = true }
+bs58 = { version = "0.5", optional = true }
 
 # Native-only signaller transport
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-tungstenite = { version = "0.32", default-features = false, features = ["async-std-runtime"], optional = true }
+async-native-tls = { version = "0.5", optional = true }
 
 # WASM-only signaller transport
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -45,8 +48,8 @@ ws_stream_wasm = { version = "0.7", optional = true }
 [features]
 default = ["client", "native-tls"]
 client = ["dep:reqwest", "dep:async-tungstenite", "dep:ws_stream_wasm", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
-native-tls = ["reqwest/rustls-tls"]
-relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken"]
+native-tls = ["reqwest/rustls-tls", "async-tungstenite/async-native-tls", "dep:async-native-tls"]
+relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "dep:p256", "dep:bs58"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

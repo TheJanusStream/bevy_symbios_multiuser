@@ -28,18 +28,19 @@
 //!     let config = RelayConfig {
 //!         bind_addr: "0.0.0.0:3536".to_string(),
 //!         auth_required: false,
+//!         max_peers: 512,
 //!     };
 //!     run_relay(config).await.expect("relay crashed");
 //! }
 //! ```
 
 pub(crate) mod auth;
+pub(crate) mod did_resolver;
 mod handler;
 
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 // Re-export protocol types so existing `use relay::SignalEnvelope` still works.
 pub use crate::protocol::{SignalEnvelope, SignalPayload};
@@ -52,6 +53,10 @@ pub struct RelayConfig {
     /// If `true`, reject WebSocket connections that do not present a valid
     /// ATProto JWT (via header, subprotocol, or query param). Defaults to `false`.
     pub auth_required: bool,
+    /// Maximum number of concurrent peer connections. New connections are
+    /// rejected with HTTP 503 once this limit is reached. `0` means unlimited.
+    /// Defaults to `512`.
+    pub max_peers: usize,
 }
 
 /// A connected peer's sender handle paired with a unique connection ID.
@@ -76,13 +81,28 @@ pub struct RelayState {
     pub peers: Arc<DashMap<String, PeerEntry>>,
     /// Whether authentication is mandatory for new connections.
     pub auth_required: bool,
+    /// Maximum concurrent peers (`0` = unlimited).
+    pub max_peers: usize,
+    /// DID document resolver for JWT signature verification.
+    /// `None` disables cryptographic signature checks.
+    pub did_resolver: Option<did_resolver::DidResolver>,
 }
 
 impl RelayState {
-    fn new(auth_required: bool) -> Self {
+    fn new(auth_required: bool, max_peers: usize) -> Self {
+        // Enable DID resolution (and thus signature verification) whenever
+        // authentication is required.
+        let did_resolver = if auth_required {
+            Some(did_resolver::DidResolver::new())
+        } else {
+            None
+        };
+
         Self {
             peers: Arc::new(DashMap::new()),
             auth_required,
+            max_peers,
+            did_resolver,
         }
     }
 }
@@ -92,7 +112,7 @@ impl RelayState {
 /// Binds to the configured address and serves WebSocket connections.
 /// This function runs until the server is shut down.
 pub async fn run_relay(config: RelayConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let state = RelayState::new(config.auth_required);
+    let state = RelayState::new(config.auth_required, config.max_peers);
 
     let app = axum::Router::new()
         .route("/ws", axum::routing::get(handler::ws_handler))

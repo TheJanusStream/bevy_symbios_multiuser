@@ -1,4 +1,5 @@
 use super::auth;
+use super::did_resolver::DidResolver;
 use super::{PeerEntry, RelayState};
 use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
@@ -16,6 +17,10 @@ use uuid::Uuid;
 
 /// Maximum number of queued outbound messages per peer before backpressure.
 const RELAY_CHANNEL_CAPACITY: usize = 256;
+
+/// Maximum size of a single incoming WebSocket message in bytes (64 KiB).
+/// SDP offers/answers and ICE candidates are typically a few KiB at most.
+const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 
 /// Optional query parameters on the WebSocket upgrade URL.
 ///
@@ -48,13 +53,43 @@ pub async fn ws_handler(
     Query(query): Query<WsQueryParams>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    let identity = extract_identity(&headers, query.token.as_deref(), state.auth_required);
+    // Reject new connections if we've hit the max peer limit.
+    if state.max_peers > 0 && state.peers.len() >= state.max_peers {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Relay is at capacity").into_response();
+    }
+
+    let identity = extract_identity(
+        &headers,
+        query.token.as_deref(),
+        state.auth_required,
+        state.did_resolver.as_ref(),
+    )
+    .await;
+
+    // If the client used the Sec-WebSocket-Protocol subprotocol trick to pass
+    // the JWT, we must echo "access_token" back or the browser will abort.
+    let used_subprotocol = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+            parts.len() == 2 && parts[0] == "access_token"
+        })
+        .unwrap_or(false);
 
     match identity {
         Err(rejection) => rejection.into_response(),
-        Ok(id) => ws
-            .on_upgrade(move |socket| handle_socket(socket, state, id))
-            .into_response(),
+        Ok(id) => {
+            let upgrade = ws.max_message_size(MAX_WS_MESSAGE_SIZE);
+            let upgrade = if used_subprotocol {
+                upgrade.protocols(["access_token"])
+            } else {
+                upgrade
+            };
+            upgrade
+                .on_upgrade(move |socket| handle_socket(socket, state, id))
+                .into_response()
+        }
     }
 }
 
@@ -67,10 +102,11 @@ pub async fn ws_handler(
 ///
 /// Returns `Err` with a 401 response only when `auth_required` is true and
 /// no valid token is found in any source.
-fn extract_identity(
+async fn extract_identity(
     headers: &HeaderMap,
     query_token: Option<&str>,
     auth_required: bool,
+    resolver: Option<&DidResolver>,
 ) -> Result<Option<auth::ValidatedIdentity>, (StatusCode, &'static str)> {
     // 1. Try the Authorization header first (native clients).
     let header_token = headers
@@ -102,7 +138,7 @@ fn extract_identity(
         return Ok(None);
     };
 
-    match auth::validate_atproto_jwt(token) {
+    match auth::validate_atproto_jwt(token, resolver).await {
         Ok(identity) => Ok(Some(identity)),
         Err(e) => {
             tracing::warn!(error = %e, "JWT validation failed");
