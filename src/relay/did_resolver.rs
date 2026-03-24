@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use jsonwebtoken::DecodingKey;
 use p256::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,15 @@ const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
 
 /// HTTP timeout for DID document fetches.
 const DID_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum response body size for DID document fetches (256 KiB).
+/// DID documents are small JSON; anything larger is suspicious.
+const MAX_DID_DOCUMENT_SIZE: usize = 256 * 1024;
+
+/// Maximum number of cached DID signing keys.
+/// Beyond this limit, the least-recently-inserted entries are not evicted
+/// automatically, but new inserts are rejected until expired entries are pruned.
+const MAX_CACHE_ENTRIES: usize = 10_000;
 
 /// A cached signing key with expiration time.
 struct CachedKey {
@@ -58,6 +68,7 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
         // Percent-decode %3A back to : for port numbers (e.g. example.com%3A8443).
         let parts: Vec<&str> = raw.splitn(2, ':').collect();
         let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
+
         if parts.len() > 1 {
             // Path-based: did:web:example.com:u:alice → example.com/u/alice/did.json
             let path = parts[1].replace(':', "/");
@@ -68,6 +79,72 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
         }
     } else {
         Err(format!("unsupported DID method: {did}"))
+    }
+}
+
+/// Reject domains that resolve to loopback, private, or link-local IP addresses.
+///
+/// This prevents SSRF attacks where a crafted `did:web` identifier tricks the
+/// relay into making requests to internal services (e.g. Kubernetes Kubelet,
+/// cloud metadata endpoints).
+fn validate_domain_not_private(domain: &str) -> Result<(), String> {
+    // Add default HTTPS port if no port is present, so ToSocketAddrs works.
+    let host_port = if domain.contains(':') {
+        domain.to_string()
+    } else {
+        format!("{domain}:443")
+    };
+
+    let addrs = host_port
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve domain '{domain}': {e}"))?;
+
+    for addr in addrs {
+        let ip = addr.ip();
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || is_private_ip(&ip)
+            || is_link_local(&ip)
+        {
+            return Err(format!(
+                "did:web domain '{domain}' resolves to private/loopback address {ip}, \
+                 request blocked (SSRF protection)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if an IP address is in a private range (RFC 1918 / RFC 4193).
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 10.0.0.0/8
+            octets[0] == 10
+            // 172.16.0.0/12
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+            // 192.168.0.0/16
+            || (octets[0] == 192 && octets[1] == 168)
+            // 100.64.0.0/10 (carrier-grade NAT)
+            || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+            // 169.254.0.0/16 (link-local, also caught by is_link_local)
+            || (octets[0] == 169 && octets[1] == 254)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            // fc00::/7 (unique local)
+            (segments[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Check if an IP is link-local (169.254.0.0/16 or fe80::/10).
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
@@ -113,20 +190,53 @@ impl DidResolver {
         let doc = self.fetch_did_document(did).await?;
         let key = extract_signing_key(&doc)?;
 
-        self.cache.insert(
-            did.to_string(),
-            CachedKey {
-                key: key.clone(),
-                expires_at: Instant::now() + self.cache_ttl,
-            },
-        );
+        // Evict expired entries before checking capacity, so legitimate clients
+        // aren't rejected just because stale entries are sitting around.
+        if self.cache.len() >= MAX_CACHE_ENTRIES {
+            self.evict_expired();
+        }
+
+        // Only cache if we're under the limit. This prevents an attacker from
+        // flooding the cache with unique DIDs to exhaust memory.
+        if self.cache.len() < MAX_CACHE_ENTRIES {
+            self.cache.insert(
+                did.to_string(),
+                CachedKey {
+                    key: key.clone(),
+                    expires_at: Instant::now() + self.cache_ttl,
+                },
+            );
+        } else {
+            tracing::warn!(
+                cache_size = self.cache.len(),
+                "DID key cache at capacity, skipping cache insert"
+            );
+        }
 
         Ok(key)
     }
 
+    /// Remove all expired entries from the cache.
+    fn evict_expired(&self) {
+        let now = Instant::now();
+        self.cache.retain(|_, entry| entry.expires_at > now);
+    }
+
     /// Fetch the DID document from the appropriate directory.
+    ///
+    /// The response body is limited to [`MAX_DID_DOCUMENT_SIZE`] to prevent
+    /// a malicious server from exhausting memory with an oversized response.
     async fn fetch_did_document(&self, did: &str) -> Result<DidDocument, String> {
         let url = did_document_url(did, &self.plc_directory)?;
+
+        // SSRF protection: for did:web, validate that the domain does not
+        // resolve to private/loopback addresses before making the request.
+        if did.starts_with("did:web:") {
+            let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
+            let parts: Vec<&str> = raw.splitn(2, ':').collect();
+            let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
+            validate_domain_not_private(&domain)?;
+        }
 
         let resp = self
             .client
@@ -141,8 +251,29 @@ impl DidResolver {
             return Err(format!("DID directory returned {status} for {did}"));
         }
 
-        resp.json::<DidDocument>()
+        // Check Content-Length hint if present (not authoritative, but fast).
+        if let Some(len) = resp.content_length() {
+            if len as usize > MAX_DID_DOCUMENT_SIZE {
+                return Err(format!(
+                    "DID document response too large ({len} bytes, max {MAX_DID_DOCUMENT_SIZE})"
+                ));
+            }
+        }
+
+        // Read the body with a hard size limit to prevent memory exhaustion.
+        let bytes = resp
+            .bytes()
             .await
+            .map_err(|e| format!("failed to read DID document body: {e}"))?;
+
+        if bytes.len() > MAX_DID_DOCUMENT_SIZE {
+            return Err(format!(
+                "DID document response too large ({} bytes, max {MAX_DID_DOCUMENT_SIZE})",
+                bytes.len()
+            ));
+        }
+
+        serde_json::from_slice::<DidDocument>(&bytes)
             .map_err(|e| format!("invalid DID document JSON: {e}"))
     }
 }
@@ -401,5 +532,53 @@ mod tests {
             err.contains("unsupported DID method"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── SSRF protection tests ─────────────────────────────────────────
+
+    #[test]
+    fn ssrf_rejects_loopback() {
+        let result = validate_domain_not_private("localhost");
+        assert!(result.is_err(), "expected loopback to be rejected");
+        assert!(
+            result.unwrap_err().contains("SSRF protection"),
+            "error should mention SSRF"
+        );
+    }
+
+    #[test]
+    fn ssrf_rejects_127_0_0_1() {
+        let result = validate_domain_not_private("127.0.0.1");
+        assert!(result.is_err(), "expected 127.0.0.1 to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_private_10_network() {
+        let result = validate_domain_not_private("10.0.0.1");
+        assert!(result.is_err(), "expected 10.x.x.x to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_private_172_network() {
+        let result = validate_domain_not_private("172.16.0.1");
+        assert!(result.is_err(), "expected 172.16.x.x to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_private_192_168_network() {
+        let result = validate_domain_not_private("192.168.1.1");
+        assert!(result.is_err(), "expected 192.168.x.x to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_link_local() {
+        let result = validate_domain_not_private("169.254.1.1");
+        assert!(result.is_err(), "expected link-local to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_loopback_with_port() {
+        let result = validate_domain_not_private("127.0.0.1:10250");
+        assert!(result.is_err(), "expected 127.0.0.1:port to be rejected");
     }
 }

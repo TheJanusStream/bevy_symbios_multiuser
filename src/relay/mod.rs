@@ -133,8 +133,10 @@ impl RelayState {
 pub async fn run_relay(config: RelayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let state = RelayState::new(config.auth_required, config.max_peers);
 
+    // Accept WebSocket upgrades on any path so clients can use room-based
+    // URLs (e.g. `/my_room`) as well as the canonical `/ws` endpoint.
     let app = axum::Router::new()
-        .route("/ws", axum::routing::get(handler::ws_handler))
+        .fallback(axum::routing::get(handler::ws_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

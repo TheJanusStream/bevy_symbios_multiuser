@@ -164,6 +164,26 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
+    // If this session ID already exists (reconnect), notify other peers that
+    // the old connection is gone before inserting the new one. This prevents
+    // remote clients from seeing two PeerJoined events without an intervening
+    // PeerLeft, which would corrupt WebRTC signaling state.
+    if state.peers.contains_key(&session_id) {
+        let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
+            .peers
+            .iter()
+            .filter(|entry| *entry.key() != session_id)
+            .map(|entry| entry.value().tx.clone())
+            .collect();
+        for sender in leave_senders {
+            let envelope = SignalEnvelope {
+                peer_id: session_id.clone(),
+                signal: SignalPayload::PeerLeft(session_id.clone()),
+            };
+            let _ = sender.try_send(envelope);
+        }
+    }
+
     state.peers.insert(
         session_id.clone(),
         PeerEntry {

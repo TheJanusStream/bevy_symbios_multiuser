@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 /// Prevents OOM from malicious length-prefixed payloads.
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024; // 1 MiB
 
+/// Safe upper bound for WebRTC unreliable (SCTP unordered) data channel messages.
+/// WebRTC data channels fragment over SCTP, but unreliable messages that exceed
+/// the path MTU are silently dropped by many implementations. 1200 bytes is a
+/// conservative limit that fits within typical MTUs.
+const MAX_UNRELIABLE_MESSAGE_SIZE: usize = 1200;
+
 /// Returns the canonical bincode options used for all network serialization.
 /// Both transmit and receive **must** use this to avoid encoding mismatches.
 pub fn bincode_options() -> impl Options {
@@ -110,6 +116,15 @@ pub fn transmit_messages<T>(
         };
         let packet: Box<[u8]> = bytes.into_boxed_slice();
         let channel_idx = event.channel.index();
+
+        if event.channel == ChannelKind::Unreliable && packet.len() > MAX_UNRELIABLE_MESSAGE_SIZE {
+            tracing::warn!(
+                size = packet.len(),
+                max = MAX_UNRELIABLE_MESSAGE_SIZE,
+                "dropping oversized unreliable message (exceeds WebRTC MTU safe limit)"
+            );
+            continue;
+        }
 
         let channel = match socket.get_channel_mut(channel_idx) {
             Ok(ch) => ch,

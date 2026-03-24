@@ -90,11 +90,17 @@ fn open_socket(
         builder = builder.ice_server(ice.clone());
     }
 
-    // When an authenticated ATProto session is available, use the custom
-    // signaller that passes the JWT to our relay via Authorization header.
+    // Always use the Symbios signaller so the relay receives SignalEnvelope
+    // payloads. When an authenticated ATProto session is available, the JWT
+    // is included in the WebSocket handshake; otherwise, the signaller
+    // connects without authentication (anonymous mode).
     #[cfg(feature = "client")]
-    if let Some(session) = session {
-        builder = builder.signaller_builder(crate::signaller::signaller_for_session(&session));
+    {
+        let signaller = match session {
+            Some(s) => crate::signaller::signaller_for_session(&s),
+            None => crate::signaller::signaller_anonymous(),
+        };
+        builder = builder.signaller_builder(signaller);
     }
 
     commands.open_socket(builder);

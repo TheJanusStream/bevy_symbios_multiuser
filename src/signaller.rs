@@ -442,3 +442,13 @@ pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn S
         access_jwt: Some(session.access_jwt.clone()),
     })
 }
+
+/// Create an anonymous [`SymbiosSignallerBuilder`] that connects without
+/// authentication but still speaks the relay's [`SignalEnvelope`] wire format.
+///
+/// This ensures anonymous clients are understood by the relay, rather than
+/// falling back to matchbox's default signaller which uses an incompatible
+/// JSON format.
+pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
+    Arc::new(SymbiosSignallerBuilder { access_jwt: None })
+}
