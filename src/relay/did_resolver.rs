@@ -38,6 +38,39 @@ pub struct DidResolver {
     cache_ttl: Duration,
 }
 
+/// Build the URL for fetching a DID document.
+///
+/// Follows the W3C DID specification:
+/// - `did:plc:*` → `{plc_directory}/{did}`
+/// - `did:web:example.com` → `https://example.com/.well-known/did.json`
+/// - `did:web:example.com:u:alice` → `https://example.com/u/alice/did.json`
+///
+/// Percent-encoded port separators (`%3A`) in the domain are decoded.
+fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
+    if did.starts_with("did:plc:") {
+        Ok(format!(
+            "{}/{did}",
+            plc_directory.trim_end_matches('/')
+        ))
+    } else if did.starts_with("did:web:") {
+        let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
+        // Split into domain (first segment) and optional path segments.
+        // Percent-decode %3A back to : for port numbers (e.g. example.com%3A8443).
+        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+        let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
+        if parts.len() > 1 {
+            // Path-based: did:web:example.com:u:alice → example.com/u/alice/did.json
+            let path = parts[1].replace(':', "/");
+            Ok(format!("https://{domain}/{path}/did.json"))
+        } else {
+            // Domain-only: did:web:example.com → example.com/.well-known/did.json
+            Ok(format!("https://{domain}/.well-known/did.json"))
+        }
+    } else {
+        Err(format!("unsupported DID method: {did}"))
+    }
+}
+
 impl DidResolver {
     /// Create a new resolver with default settings.
     pub fn new() -> Self {
@@ -93,17 +126,7 @@ impl DidResolver {
 
     /// Fetch the DID document from the appropriate directory.
     async fn fetch_did_document(&self, did: &str) -> Result<DidDocument, String> {
-        let url = if did.starts_with("did:plc:") {
-            format!("{}/{did}", self.plc_directory.trim_end_matches('/'))
-        } else if did.starts_with("did:web:") {
-            let domain = did
-                .strip_prefix("did:web:")
-                .ok_or("invalid did:web")?
-                .replace(':', "/");
-            format!("https://{domain}/.well-known/did.json")
-        } else {
-            return Err(format!("unsupported DID method: {did}"));
-        };
+        let url = did_document_url(did, &self.plc_directory)?;
 
         let resp = self
             .client
@@ -327,6 +350,56 @@ mod tests {
         assert_err_contains(
             extract_signing_key(&doc),
             "unsupported verification method type",
+        );
+    }
+
+    // ── did_document_url tests ──────────────────────────────────────────
+
+    #[test]
+    fn did_web_domain_only_resolves_to_well_known() {
+        let url = did_document_url("did:web:example.com", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://example.com/.well-known/did.json");
+    }
+
+    #[test]
+    fn did_web_path_based_resolves_without_well_known() {
+        let url = did_document_url("did:web:example.com:u:alice", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://example.com/u/alice/did.json");
+    }
+
+    #[test]
+    fn did_web_single_path_segment() {
+        let url = did_document_url("did:web:example.com:users", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://example.com/users/did.json");
+    }
+
+    #[test]
+    fn did_web_percent_encoded_port() {
+        let url =
+            did_document_url("did:web:example.com%3A8443", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://example.com:8443/.well-known/did.json");
+    }
+
+    #[test]
+    fn did_web_percent_encoded_port_with_path() {
+        let url =
+            did_document_url("did:web:example.com%3A8443:u:bob", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://example.com:8443/u/bob/did.json");
+    }
+
+    #[test]
+    fn did_plc_resolves_to_plc_directory() {
+        let url = did_document_url("did:plc:abc123", "https://plc.directory").unwrap();
+        assert_eq!(url, "https://plc.directory/did:plc:abc123");
+    }
+
+    #[test]
+    fn unsupported_did_method_returns_error() {
+        let result = did_document_url("did:key:z123", DEFAULT_PLC_DIRECTORY);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported DID method"),
+            "unexpected error: {err}"
         );
     }
 }
