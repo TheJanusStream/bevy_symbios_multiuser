@@ -30,6 +30,11 @@ use std::time::Duration;
 /// Default cache TTL for resolved DID signing keys (5 minutes).
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// Negative cache TTL for failed DID resolutions (60 seconds).
+/// Prevents attackers from using the relay as a DDoS reflector by spamming
+/// handshakes with the same DID pointing at a victim server.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
 /// Default PLC directory base URL.
 const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
 
@@ -53,6 +58,9 @@ const MAX_CACHE_ENTRIES: u64 = 10_000;
 pub struct DidResolver {
     client: reqwest::Client,
     cache: Cache<String, DecodingKey>,
+    /// Caches failed DID resolutions to prevent repeated outbound requests
+    /// for the same bad DID (DDoS reflection protection).
+    negative_cache: Cache<String, String>,
     plc_directory: String,
 }
 
@@ -180,9 +188,15 @@ impl DidResolver {
             .time_to_live(DEFAULT_CACHE_TTL)
             .build();
 
+        let negative_cache = Cache::builder()
+            .max_capacity(MAX_CACHE_ENTRIES)
+            .time_to_live(NEGATIVE_CACHE_TTL)
+            .build();
+
         Self {
             client,
             cache,
+            negative_cache,
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
         }
     }
@@ -205,12 +219,28 @@ impl DidResolver {
             return Ok(key);
         }
 
-        let doc = self.fetch_did_document(did).await?;
-        let key = extract_signing_key(&doc)?;
+        // Reject DIDs that recently failed resolution to prevent repeated
+        // outbound requests (DDoS reflection / resource exhaustion).
+        if let Some(cached_err) = self.negative_cache.get(did) {
+            return Err(format!("DID resolution recently failed (cached): {cached_err}"));
+        }
 
-        self.cache.insert(did.to_string(), key.clone());
+        let result = async {
+            let doc = self.fetch_did_document(did).await?;
+            extract_signing_key(&doc)
+        }
+        .await;
 
-        Ok(key)
+        match result {
+            Ok(key) => {
+                self.cache.insert(did.to_string(), key.clone());
+                Ok(key)
+            }
+            Err(e) => {
+                self.negative_cache.insert(did.to_string(), e.clone());
+                Err(e)
+            }
+        }
     }
 
     /// Fetch the DID document from the appropriate directory.

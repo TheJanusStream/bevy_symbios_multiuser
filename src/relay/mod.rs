@@ -24,8 +24,9 @@
 //! The authenticated DID becomes the peer's session identity.
 //!
 //! When `auth_required` is `false` (the default), authentication is
-//! opportunistic — valid tokens are used for identity, but unauthenticated
-//! clients fall back to random UUIDs. Signature verification is skipped.
+//! opportunistic — clients presenting a valid, signature-verified token are
+//! identified by their DID, while unauthenticated clients fall back to random
+//! UUIDs. Tokens are only trusted when a DID resolver is configured.
 //!
 //! # Room Isolation
 //!

@@ -191,7 +191,19 @@ async fn extract_identity(
         return Ok(None);
     };
 
-    match auth::validate_atproto_jwt(token, resolver).await {
+    // Without a resolver, signature verification is impossible — trusting
+    // unverified JWT claims would let anyone spoof any DID. Treat the token
+    // as absent (caller gets a random UUID) unless auth is required, in
+    // which case reject outright since we can't verify.
+    let Some(resolver) = resolver else {
+        if auth_required {
+            return Err((StatusCode::UNAUTHORIZED, "No DID resolver configured"));
+        }
+        tracing::debug!("ignoring JWT — no DID resolver available to verify signature");
+        return Ok(None);
+    };
+
+    match auth::validate_atproto_jwt(token, &resolver).await {
         Ok(identity) => Ok(Some(identity)),
         Err(e) => {
             tracing::warn!(error = %e, "JWT validation failed");
@@ -219,13 +231,17 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    // If this session ID already exists (reconnect), notify peers in the same
+    // If this session ID already exists (reconnect), notify peers in the OLD
     // room that the old connection is gone before inserting the new one.
-    if state.peers.contains_key(&session_id) {
+    // We must read the old peer's room — not the new connection's room — to
+    // avoid sending PeerLeft to the wrong room when a user switches rooms.
+    if let Some(old_entry) = state.peers.get(&session_id) {
+        let old_room = old_entry.value().room.clone();
+        drop(old_entry); // Release DashMap read lock before iterating.
         let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
             .peers
             .iter()
-            .filter(|entry| *entry.key() != session_id && entry.value().room == room)
+            .filter(|entry| *entry.key() != session_id && entry.value().room == old_room)
             .map(|entry| entry.value().tx.clone())
             .collect();
         for sender in leave_senders {

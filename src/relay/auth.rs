@@ -12,8 +12,8 @@
 //! for `did:web`), extracts the `#atproto` signing key, and verifies the
 //! JWT's ES256 signature. Resolved keys are cached in memory.
 //!
-//! When no resolver is available, only structural validation (expiry,
-//! issuer format) is performed and a warning is logged.
+//! Callers must ensure a resolver is available before calling
+//! [`validate_atproto_jwt`] — unverified JWTs are never trusted for identity.
 
 use super::did_resolver::DidResolver;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
@@ -46,8 +46,8 @@ pub struct ValidatedIdentity {
 /// 2. Resolve the DID document and extract the signing public key.
 /// 3. Re-validate the JWT *with* the resolved key to verify the signature.
 ///
-/// If `resolver` is `None`, step 2–3 are skipped and only structural
-/// validation (expiry, issuer format) is performed.
+/// The caller is responsible for ensuring a resolver is available before
+/// calling this function — unverified JWTs must never be trusted for identity.
 ///
 /// # Errors
 ///
@@ -55,7 +55,7 @@ pub struct ValidatedIdentity {
 /// has an invalid issuer, or fails signature verification.
 pub async fn validate_atproto_jwt(
     token: &str,
-    resolver: Option<&DidResolver>,
+    resolver: &DidResolver,
 ) -> Result<ValidatedIdentity, String> {
     // Step 1: Decode without signature verification to read claims.
     let claims = decode_claims(token)?;
@@ -65,17 +65,10 @@ pub async fn validate_atproto_jwt(
         return Err(format!("invalid DID in JWT issuer: {did}"));
     }
 
-    // Step 2–3: If a resolver is available, verify the signature.
-    match resolver {
-        Some(resolver) => {
-            let key = resolver.resolve_key(did).await?;
-            verify_signature(token, &key)?;
-            tracing::debug!(did = %did, "JWT signature verified via DID document");
-        }
-        None => {
-            tracing::warn!("JWT signature verification skipped — no DID resolver configured");
-        }
-    }
+    // Step 2–3: Verify the signature against the DID document key.
+    let key = resolver.resolve_key(did).await?;
+    verify_signature(token, &key)?;
+    tracing::debug!(did = %did, "JWT signature verified via DID document");
 
     Ok(ValidatedIdentity { did: did.clone() })
 }
@@ -143,14 +136,20 @@ mod tests {
         .expect("valid test key")
     }
 
+    /// A resolver that points nowhere — used for tests that check token
+    /// decoding failures before any network call is attempted.
+    fn dummy_resolver() -> DidResolver {
+        DidResolver::with_plc_directory("http://127.0.0.1:1".to_string())
+    }
+
     #[tokio::test]
     async fn rejects_empty_token() {
-        assert!(validate_atproto_jwt("", None).await.is_err());
+        assert!(validate_atproto_jwt("", &dummy_resolver()).await.is_err());
     }
 
     #[tokio::test]
     async fn rejects_garbage_token() {
-        assert!(validate_atproto_jwt("not.a.jwt", None).await.is_err());
+        assert!(validate_atproto_jwt("not.a.jwt", &dummy_resolver()).await.is_err());
     }
 
     /// Build a [`DecodingKey`] from a p256 public key using PEM encoding,
@@ -203,12 +202,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_without_resolver_skips_signature() {
+    async fn rejects_valid_jwt_with_no_matching_key() {
+        // A resolver with no reachable backend should fail resolution,
+        // preventing identity spoofing from unverified claims.
         let secret = test_key_pair();
         let token = sign_test_jwt("did:plc:testuser", &secret);
+        let resolver = DidResolver::with_plc_directory("http://127.0.0.1:1".to_string());
 
-        // Without a resolver, validation should pass (signature not checked).
-        let identity = validate_atproto_jwt(&token, None).await.unwrap();
-        assert_eq!(identity.did, "did:plc:testuser");
+        let result = validate_atproto_jwt(&token, &resolver).await;
+        assert!(result.is_err(), "should reject when key resolution fails");
     }
 }
