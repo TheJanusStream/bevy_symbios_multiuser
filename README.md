@@ -5,7 +5,7 @@ Combines [ATProto](https://atproto.com/) for federated identity with WebRTC (via
 
 ## Overview
 
-`bevy_symbios_multiuser` provides a plug-and-play networking crate that allows any Symbios canvas to support collaborative, real-time multiplayer without requiring a centralized, authoritative game server.
+`bevy_symbios_multiuser` provides a plug-and-play networking crate that allows any Bevy app to support collaborative, real-time multiplayer without requiring a centralized, authoritative game server.
 
 The architecture follows a **Sovereign Broker** pattern: clients authenticate with an ATProto PDS to obtain a JWT, present it to the relay during WebSocket signaling, and then communicate peer-to-peer over WebRTC data channels. The plugin accepts any serializable type `T` and exposes Bevy messages for broadcasting and receiving, completely decoupled from specific game logic.
 
@@ -60,21 +60,21 @@ fn send_movement(mut writer: MessageWriter<BroadcastMessage<GameMessage>>) {
 ## Architecture
 
 ```text
-  ┌─────────────┐                                     ┌─────────────┐
-  │   ATProto   │                                     │   ATProto   │
-  │     PDS     │                                     │     PDS     │
-  └──────┬──────┘                                     └──────┬──────┘
+   ┌────────────┐                                      ┌────────────┐
+   │  ATProto   │                                      │  ATProto   │
+   │    PDS     │                                      │    PDS     │
+   └─────┬──────┘                                      └─────┬──────┘
          │ JWT                                               │ JWT
+         │                ┌──────────────────┐               │
+   ┌─────┴──────┐         │  Broker (Relay)  │         ┌─────┴──────┐
+   │  Peer A    │   JWT   │                  │   JWT   │  Peer B    │
+   │ (Bevy App) │────────►│    Axum + JWT    │◄────────│ (Bevy App) │
+   └─────┬──────┘         │    Validation    │         └─────┬──────┘
+         │                └──────────────────┘               │
          │                                                   │
-   ┌─────┴─────┐        ┌──────────────────┐          ┌─────┴─────┐
-   │  Peer A   │  JWT   │  Sovereign Broker │   JWT   │  Peer B   │
-   │ (Bevy App)│───────►│     (Relay)       │◄────────│ (Bevy App)│
-   └─────┬─────┘        │  Axum + JWT       │         └─────┬─────┘
-         │              │  Validation       │               │
-         │              └──────────────────┘                │
-         │                                                  │
-         └──────────────────────────────────────────────────┘
-                         WebRTC P2P Data
+         │                                                   │
+         └───────────────────────────────────────────────────┘
+                            WebRTC P2P Data
 ```
 
 1. **Authentication** — Each peer authenticates with their ATProto PDS to obtain a JWT access token.
