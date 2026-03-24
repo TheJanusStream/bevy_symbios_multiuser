@@ -1,9 +1,11 @@
 //! XRPC Relay — a WebRTC signaling broker built on Axum with optional
-//! ATProto JWT authentication.
+//! ATProto JWT authentication and DID-based signature verification.
 //!
 //! The relay accepts WebSocket connections, optionally verifies ATProto JWT
 //! bearer tokens, and routes WebRTC SDP offers/answers and ICE candidates
 //! between peers using an in-memory connection map.
+//!
+//! # Authentication
 //!
 //! When [`RelayConfig::auth_required`] is `true`, every connecting client must
 //! present a valid ATProto access JWT. The relay accepts the token from three
@@ -11,12 +13,29 @@
 //!
 //! 1. `Authorization: Bearer <token>` header (native clients).
 //! 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients
-//!    using the subprotocol trick).
+//!    using the subprotocol trick — the relay echoes the selected subprotocol
+//!    back per RFC 6455).
 //! 3. `?token=<token>` query parameter (legacy WASM fallback).
 //!
+//! The relay resolves the issuer's DID document (via `plc.directory` for
+//! `did:plc`, or `/.well-known/did.json` for `did:web`), extracts the
+//! `#atproto` P-256 signing key, and cryptographically verifies the JWT's
+//! ES256 signature. Resolved keys are cached in memory with a 5-minute TTL.
 //! The authenticated DID becomes the peer's session identity.
-//! When `false` (the default), authentication is opportunistic — valid tokens
-//! are used for identity, but unauthenticated clients fall back to random UUIDs.
+//!
+//! When `auth_required` is `false` (the default), authentication is
+//! opportunistic — valid tokens are used for identity, but unauthenticated
+//! clients fall back to random UUIDs. Signature verification is skipped.
+//!
+//! # Hardening
+//!
+//! - **Connection limits** — [`RelayConfig::max_peers`] caps the number of
+//!   concurrent connections (default `512`). New connections are rejected with
+//!   HTTP 503 once the limit is reached.
+//! - **Message size cap** — Incoming WebSocket messages are limited to 64 KiB.
+//!   SDP offers/answers and ICE candidates are typically a few KiB at most.
+//! - **Control signal filtering** — Clients cannot forge `PeerJoined`/`PeerLeft`
+//!   control signals; only the relay may originate these.
 //!
 //! # Usage
 //!

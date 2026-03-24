@@ -73,9 +73,7 @@ pub async fn validate_atproto_jwt(
             tracing::debug!(did = %did, "JWT signature verified via DID document");
         }
         None => {
-            tracing::warn!(
-                "JWT signature verification skipped — no DID resolver configured"
-            );
+            tracing::warn!("JWT signature verification skipped — no DID resolver configured");
         }
     }
 
@@ -90,12 +88,8 @@ fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
     validation.algorithms = vec![Algorithm::ES256];
     validation.validate_aud = false;
 
-    let token_data = decode::<AtprotoClaims>(
-        token,
-        &DecodingKey::from_secret(&[]),
-        &validation,
-    )
-    .map_err(|e| format!("JWT decode failed: {e}"))?;
+    let token_data = decode::<AtprotoClaims>(token, &DecodingKey::from_secret(&[]), &validation)
+        .map_err(|e| format!("JWT decode failed: {e}"))?;
 
     Ok(token_data.claims)
 }
@@ -130,24 +124,21 @@ mod tests {
         let private_pem = secret
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
             .expect("PEM encode private key");
-        let encoding_key = EncodingKey::from_ec_pem(private_pem.as_bytes())
-            .expect("parse EC PEM");
+        let encoding_key = EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("parse EC PEM");
 
         let claims = Claims {
             iss: did.to_string(),
             exp: 9_999_999_999, // far future (Nov 2286)
         };
 
-        encode(&Header::new(Algorithm::ES256), &claims, &encoding_key)
-            .expect("sign JWT")
+        encode(&Header::new(Algorithm::ES256), &claims, &encoding_key).expect("sign JWT")
     }
 
     fn test_key_pair() -> p256::SecretKey {
         p256::SecretKey::from_slice(&[
-            0x9f, 0x86, 0xd0, 0x81, 0x88, 0x4c, 0x7d, 0x65,
-            0x9a, 0x2f, 0xea, 0xa0, 0xc5, 0x5a, 0xd0, 0x15,
-            0xa3, 0xbf, 0x4f, 0x1b, 0x2b, 0x0b, 0x82, 0x2c,
-            0xd1, 0x5d, 0x6c, 0x15, 0xb0, 0xf0, 0x0a, 0x08,
+            0x9f, 0x86, 0xd0, 0x81, 0x88, 0x4c, 0x7d, 0x65, 0x9a, 0x2f, 0xea, 0xa0, 0xc5, 0x5a,
+            0xd0, 0x15, 0xa3, 0xbf, 0x4f, 0x1b, 0x2b, 0x0b, 0x82, 0x2c, 0xd1, 0x5d, 0x6c, 0x15,
+            0xb0, 0xf0, 0x0a, 0x08,
         ])
         .expect("valid test key")
     }
@@ -179,7 +170,11 @@ mod tests {
         let decoding_key = decoding_key_from_p256(&secret.public_key());
 
         let result = verify_signature(&token, &decoding_key);
-        assert!(result.is_ok(), "verify_signature failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_signature failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -189,10 +184,9 @@ mod tests {
 
         // Use a different key for verification.
         let wrong_secret = p256::SecretKey::from_slice(&[
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
         ])
         .expect("valid key");
 
@@ -201,7 +195,9 @@ mod tests {
         let result = verify_signature(&token, &wrong_key);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("signature verification failed"),
+            result
+                .unwrap_err()
+                .contains("signature verification failed"),
             "should report signature failure"
         );
     }

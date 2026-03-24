@@ -182,10 +182,9 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
         .strip_prefix('z')
         .ok_or_else(|| format!("unsupported multibase prefix: {}", &multibase[..1]))?;
 
-    let bytes =
-        bs58::decode(encoded)
-            .into_vec()
-            .map_err(|e| format!("base58 decode failed: {e}"))?;
+    let bytes = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|e| format!("base58 decode failed: {e}"))?;
 
     if bytes.len() < 2 {
         return Err("multicodec key too short".to_string());
@@ -233,11 +232,11 @@ mod tests {
 
         // Use a fixed test key (first 32 bytes of SHA-256 of "test").
         let secret = p256::SecretKey::from_slice(&[
-            0x9f, 0x86, 0xd0, 0x81, 0x88, 0x4c, 0x7d, 0x65,
-            0x9a, 0x2f, 0xea, 0xa0, 0xc5, 0x5a, 0xd0, 0x15,
-            0xa3, 0xbf, 0x4f, 0x1b, 0x2b, 0x0b, 0x82, 0x2c,
-            0xd1, 0x5d, 0x6c, 0x15, 0xb0, 0xf0, 0x0a, 0x08,
-        ]).expect("valid test key");
+            0x9f, 0x86, 0xd0, 0x81, 0x88, 0x4c, 0x7d, 0x65, 0x9a, 0x2f, 0xea, 0xa0, 0xc5, 0x5a,
+            0xd0, 0x15, 0xa3, 0xbf, 0x4f, 0x1b, 0x2b, 0x0b, 0x82, 0x2c, 0xd1, 0x5d, 0x6c, 0x15,
+            0xb0, 0xf0, 0x0a, 0x08,
+        ])
+        .expect("valid test key");
         let public = secret.public_key();
         let point = public.to_encoded_point(true); // compressed
         let compressed = point.as_bytes();

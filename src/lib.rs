@@ -21,10 +21,10 @@
 //!    sent as an `Authorization: Bearer` header. On WASM targets, the token
 //!    is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the
 //!    browser `WebSocket` API does not support custom headers).
-//! 3. The relay ([`relay`] module) validates the JWT claims (structure and
-//!    expiry) and uses the authenticated DID as the peer's session identity.
-//!    Note: cryptographic signature verification is not yet implemented —
-//!    see [`relay::auth`](relay/auth) module docs for details.
+//! 3. The relay ([`relay`] module) validates the JWT claims and — when
+//!    `auth_required` is enabled — resolves the issuer's DID document to
+//!    cryptographically verify the ES256 signature against the `#atproto`
+//!    signing key. The authenticated DID becomes the peer's session identity.
 //! 4. Once signaling completes, data flows directly peer-to-peer over
 //!    WebRTC data channels.
 //!
@@ -53,8 +53,10 @@
 //!
 //! - `client` (default) — ATProto authentication, custom signaller for
 //!   authenticated relay connections.
-//! - `relay` — XRPC relay signaling server with optional JWT verification,
-//!   built on `axum`.
+//! - `native-tls` (default) — Enables TLS for both `reqwest` HTTPS and
+//!   `async-tungstenite` WebSocket (`wss://`) connections.
+//! - `relay` — Sovereign Broker relay server with DID-based JWT signature
+//!   verification, connection limits, and message size caps. Built on `axum`.
 
 pub mod error;
 pub mod events;
