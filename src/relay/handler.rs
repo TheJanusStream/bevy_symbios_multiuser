@@ -488,11 +488,36 @@ async fn handle_socket(
                 } else if let Err(mpsc::error::TrySendError::Full(_)) =
                     entry.value().tx.try_send(forwarded)
                 {
+                    // A full channel means the target peer's WebSocket write
+                    // side is stalled (e.g. mobile network pause, zombied
+                    // connection). Dropping signals silently would hard-fail
+                    // WebRTC negotiation (lost SDP answers are fatal), so
+                    // disconnect the zombie peer instead. Removing the entry
+                    // drops the sender, which ends their write task cleanly.
+                    let target_room = entry.value().room.clone();
+                    drop(entry);
                     tracing::warn!(
                         target = %target_id,
                         sender = %session_id,
-                        "relay channel full, dropping signal (backpressure)"
+                        "relay channel full, disconnecting stalled peer"
                     );
+                    state_write.peers.remove(&target_id);
+
+                    // Broadcast PeerLeft so remaining peers in the room
+                    // tear down their WebRTC connections to the zombie.
+                    let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state_write
+                        .peers
+                        .iter()
+                        .filter(|e| e.value().room == target_room)
+                        .map(|e| e.value().tx.clone())
+                        .collect();
+                    for sender in leave_senders {
+                        let envelope = SignalEnvelope {
+                            peer_id: target_id.clone(),
+                            signal: SignalPayload::PeerLeft(target_id.clone()),
+                        };
+                        let _ = sender.try_send(envelope);
+                    }
                 }
             } else {
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");

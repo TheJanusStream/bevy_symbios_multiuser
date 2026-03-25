@@ -89,6 +89,13 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
 /// and the signaller reads the latest value on each reconnect attempt,
 /// avoiding stale-JWT failures when short-lived access tokens expire
 /// between the initial connection and a later reconnect.
+///
+/// # Safety note on `std::sync::RwLock` in async code
+///
+/// This intentionally uses `std::sync::RwLock` rather than `tokio::sync::RwLock`
+/// because the lock is only held for a brief `.clone()` (never across `.await`
+/// points). Do **not** hold a guard from this lock across an `.await` — if you
+/// need longer-lived access, clone the inner value first and release the guard.
 pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
 
 /// A [`SignallerBuilder`] that injects an ATProto JWT into the WebSocket
