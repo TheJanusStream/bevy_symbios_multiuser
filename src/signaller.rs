@@ -24,6 +24,15 @@
 //! subprotocol trick: the client sends `["access_token", "<jwt>"]` as the
 //! requested subprotocols during the handshake. The relay extracts the token
 //! from the second element.
+//!
+//! # Token Refresh
+//!
+//! ATProto access tokens are short-lived. [`signaller_for_session`] clones the
+//! JWT once at construction, so reconnects after token expiry will fail. For
+//! long-lived applications, use [`signaller_with_token_source`] instead: it
+//! accepts a shared [`TokenSource`] that the application can update externally
+//! (e.g. after calling [`crate::auth::refresh_session`]), ensuring the
+//! signaller always uses the latest token on reconnect.
 
 use crate::protocol::{SignalEnvelope, SignalPayload};
 #[allow(unused_imports)] // SinkExt is used by .send() inside async_trait impls
@@ -74,13 +83,44 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
 
 // ── SignallerBuilder ─────────────────────────────────────────────────────────
 
+/// A shared, externally-refreshable token source.
+///
+/// The host application updates this (e.g. after an ATProto token refresh)
+/// and the signaller reads the latest value on each reconnect attempt,
+/// avoiding stale-JWT failures when short-lived access tokens expire
+/// between the initial connection and a later reconnect.
+pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
+
 /// A [`SignallerBuilder`] that injects an ATProto JWT into the WebSocket
 /// upgrade request's `Authorization` header.
+///
+/// Supports two token modes:
+/// - **Static**: a fixed JWT cloned at construction (via [`signaller_for_session`]).
+/// - **Refreshable**: a shared [`TokenSource`] that the application can update
+///   externally (via [`signaller_with_token_source`]). On each reconnect the
+///   builder reads the latest token, avoiding stale-JWT rejections.
 #[derive(Debug, Clone)]
 pub struct SymbiosSignallerBuilder {
-    /// The ATProto access JWT. When `Some`, the signaller sends
-    /// `Authorization: Bearer <token>` during the WebSocket handshake.
-    pub access_jwt: Option<String>,
+    /// Static JWT, used when no `token_source` is provided.
+    access_jwt: Option<String>,
+    /// Shared, externally-refreshable token. When present, takes priority
+    /// over `access_jwt` so reconnects use the latest refreshed token.
+    token_source: Option<TokenSource>,
+}
+
+impl SymbiosSignallerBuilder {
+    /// Return the current JWT, preferring the refreshable [`TokenSource`]
+    /// over the static `access_jwt`.
+    fn current_token(&self) -> Option<String> {
+        if let Some(source) = &self.token_source {
+            source
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            self.access_jwt.clone()
+        }
+    }
 }
 
 #[async_trait]
@@ -157,7 +197,8 @@ impl SymbiosSignallerBuilder {
         &self,
         room_url: &str,
     ) -> Result<WebSocketStream<ConnectStream>, SignalingError> {
-        let request = build_ws_request(room_url, self.access_jwt.as_deref())
+        let token = self.current_token();
+        let request = build_ws_request(room_url, token.as_deref())
             .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
         let (stream, _) = connect_async(request).await.map_err(SignalingError::from)?;
         Ok(stream)
@@ -186,8 +227,9 @@ impl SymbiosSignallerBuilder {
         // subprotocol trick: `["access_token", "<jwt>"]`. This avoids leaking
         // the token in URL query parameters (which are logged by proxies and
         // load balancers).
-        let protocols: Vec<&str> = match self.access_jwt.as_deref() {
-            Some(token) => vec!["access_token", token],
+        let token = self.current_token();
+        let protocols: Vec<&str> = match token.as_deref() {
+            Some(t) => vec!["access_token", t],
             None => vec![],
         };
 
@@ -440,9 +482,38 @@ impl SymbiosSignaller {
 
 /// Create an [`Arc`]-wrapped [`SymbiosSignallerBuilder`] ready for use with
 /// [`WebRtcSocketBuilder::signaller_builder`](matchbox_socket::WebRtcSocket).
+///
+/// The JWT is cloned once at construction. If the token expires before a
+/// reconnect, prefer [`signaller_with_token_source`] instead.
 pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
         access_jwt: Some(session.access_jwt.clone()),
+        token_source: None,
+    })
+}
+
+/// Create a [`SymbiosSignallerBuilder`] backed by a shared [`TokenSource`].
+///
+/// On each reconnect attempt, the builder reads the latest token from the
+/// source. The host application is responsible for updating the source when
+/// tokens are refreshed (e.g. via [`crate::auth::refresh_session`]).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::{Arc, RwLock};
+/// use bevy_symbios_multiuser::signaller::{signaller_with_token_source, TokenSource};
+///
+/// let token_source: TokenSource = Arc::new(RwLock::new(Some(session.access_jwt.clone())));
+/// let builder = signaller_with_token_source(token_source.clone());
+///
+/// // Later, after refreshing the session:
+/// *token_source.write().unwrap() = Some(new_session.access_jwt.clone());
+/// ```
+pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuilder> {
+    Arc::new(SymbiosSignallerBuilder {
+        access_jwt: None,
+        token_source: Some(source),
     })
 }
 
@@ -453,5 +524,8 @@ pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn S
 /// falling back to matchbox's default signaller which uses an incompatible
 /// JSON format.
 pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
-    Arc::new(SymbiosSignallerBuilder { access_jwt: None })
+    Arc::new(SymbiosSignallerBuilder {
+        access_jwt: None,
+        token_source: None,
+    })
 }

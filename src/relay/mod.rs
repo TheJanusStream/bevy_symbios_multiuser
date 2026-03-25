@@ -69,6 +69,18 @@
 //! - **Negative DID cache** — Failed DID resolutions are cached for 60 seconds,
 //!   preventing attackers from using the relay as a DDoS reflector by spamming
 //!   handshakes with the same DID pointing at a victim server.
+//! - **DID request coalescing** — The key cache uses [`moka::future::Cache`]
+//!   with `try_get_with`, deduplicating concurrent lookups for the same DID.
+//!   This prevents the relay from amplifying connection bursts into outbound
+//!   HTTP floods against DID hosting servers.
+//! - **Domain client cap** — Per-domain `reqwest::Client` instances (DNS-pinned
+//!   for SSRF protection) are capped at 100. Each client holds a connection
+//!   pool and background workers, so the low cap prevents resource exhaustion
+//!   from an attacker feeding many unique `did:web` domains.
+//! - **Server-side WebSocket pings** — The relay sends Ping frames every 30
+//!   seconds. Browsers cannot initiate WebSocket pings (the API only supports
+//!   *responding* to pings), so without server-side pings, idle WASM clients
+//!   would be reaped by the idle timeout.
 //! - **Backpressure logging** — When the per-peer relay channel (256 slots)
 //!   is full, dropped signals are logged instead of silently discarded.
 //!

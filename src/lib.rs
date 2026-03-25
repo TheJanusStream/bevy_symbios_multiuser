@@ -73,7 +73,8 @@
 //!   and `async-tungstenite` WebSocket (`wss://`) connections.
 //! - `relay` — Sovereign Broker relay server with DID-based JWT signature
 //!   verification, room-based peer isolation, atomic connection limits, SSRF
-//!   protection, and message size caps. Built on `axum`.
+//!   protection, message size caps, server-side pings (WASM keep-alive),
+//!   request coalescing, and negative DID caching. Built on `axum`.
 
 pub mod error;
 pub mod messages;

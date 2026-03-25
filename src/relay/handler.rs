@@ -47,6 +47,12 @@ const MAX_INVALID_MESSAGES: usize = 10;
 /// connection slots indefinitely.
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Interval between server-initiated WebSocket Ping frames.
+/// Browsers cannot initiate WebSocket pings (the API only supports *responding*
+/// to pings), so WASM clients rely on the server to send pings to keep the
+/// connection alive and prevent the [`WS_IDLE_TIMEOUT`] from firing.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
 /// slots by presenting DIDs that tarpit the HTTP fetch (e.g. a server that
@@ -343,15 +349,34 @@ async fn handle_socket(
     let session_id_write = session_id.clone();
     let state_write = state.clone();
 
-    // Forward messages from the relay channel to the WebSocket.
+    // Forward messages from the relay channel to the WebSocket, and
+    // periodically send Ping frames to keep the connection alive.
+    // WASM clients (browsers) cannot initiate WebSocket pings — they only
+    // *respond* to server pings — so without server-side pings, idle WASM
+    // connections would be reaped by WS_IDLE_TIMEOUT.
     let write_task = tokio::spawn(async move {
-        while let Some(envelope) = relay_rx.recv().await {
-            let json = match serde_json::to_string(&envelope) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                break;
+        let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+        // The first tick fires immediately; skip it so the first ping is
+        // sent after one full interval.
+        ping_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                envelope = relay_rx.recv() => {
+                    let Some(envelope) = envelope else { break };
+                    let json = match serde_json::to_string(&envelope) {
+                        Ok(j) => j,
+                        Err(_) => continue,
+                    };
+                    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });

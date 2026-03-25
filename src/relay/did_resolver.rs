@@ -21,12 +21,22 @@
 //!   the least-frequently/recently-used entries are evicted automatically,
 //!   preventing an attacker from filling the cache with garbage DIDs and
 //!   starving legitimate users of cached lookups.
+//! - **Request coalescing** — The key cache uses [`moka::future::Cache`] with
+//!   [`try_get_with`](moka::future::Cache::try_get_with), which deduplicates
+//!   concurrent lookups for the same DID. This prevents the relay from acting
+//!   as a DDoS amplifier when many connections present the same uncached DID
+//!   simultaneously.
+//! - **Domain client cap** — Per-domain `reqwest::Client` instances (used for
+//!   DNS-pinned SSRF protection) are capped at 100 entries. Each client holds
+//!   a connection pool and spawns background workers, so the lower cap prevents
+//!   resource exhaustion from an attacker feeding unique `did:web` domains.
 
 use jsonwebtoken::DecodingKey;
 use moka::sync::Cache;
 use p256::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use std::net::ToSocketAddrs;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Default cache TTL for resolved DID signing keys (5 minutes).
@@ -50,6 +60,13 @@ const MAX_DID_DOCUMENT_SIZE: usize = 256 * 1024;
 /// Maximum number of cached DID signing keys.
 const MAX_CACHE_ENTRIES: u64 = 10_000;
 
+/// Maximum number of cached per-domain `reqwest::Client` instances.
+/// Each client holds a connection pool and spawns background workers, so this
+/// must be much lower than [`MAX_CACHE_ENTRIES`] to prevent resource exhaustion
+/// (memory, file descriptors, tokio tasks) from an attacker systematically
+/// feeding unique `did:web` domains.
+const MAX_DOMAIN_CLIENTS: u64 = 100;
+
 /// Resolves ATProto DIDs to their signing public keys.
 ///
 /// Fetches DID documents over HTTPS, extracts the `#atproto` verification
@@ -59,7 +76,13 @@ const MAX_CACHE_ENTRIES: u64 = 10_000;
 #[derive(Clone)]
 pub struct DidResolver {
     client: reqwest::Client,
-    cache: Cache<String, DecodingKey>,
+    /// Async-aware key cache with built-in request coalescing.
+    /// [`moka::future::Cache::try_get_with`] deduplicates concurrent lookups
+    /// for the same DID — if 500 connections present the same uncached DID
+    /// simultaneously, only one outbound fetch is issued and all waiters
+    /// share the result. This prevents the relay from acting as a DDoS
+    /// amplifier against DID hosting servers.
+    cache: moka::future::Cache<String, DecodingKey>,
     /// Caches failed DID resolutions to prevent repeated outbound requests
     /// for the same bad DID (DDoS reflection protection).
     negative_cache: Cache<String, String>,
@@ -68,6 +91,8 @@ pub struct DidResolver {
     /// `ClientBuilder::resolve`, which is a builder-level setting requiring a
     /// separate client. Caching avoids the heavy cost of constructing a new
     /// client (connection pool + background workers) on every DID fetch.
+    /// Capped at [`MAX_DOMAIN_CLIENTS`] (100) — much lower than the key cache —
+    /// because each client holds a connection pool and spawns background tasks.
     domain_clients: Cache<String, reqwest::Client>,
     plc_directory: String,
 }
@@ -235,7 +260,7 @@ impl DidResolver {
             .build()
             .expect("failed to build reqwest client");
 
-        let cache = Cache::builder()
+        let cache = moka::future::Cache::builder()
             .max_capacity(MAX_CACHE_ENTRIES)
             .time_to_live(DEFAULT_CACHE_TTL)
             .build();
@@ -246,7 +271,7 @@ impl DidResolver {
             .build();
 
         let domain_clients = Cache::builder()
-            .max_capacity(MAX_CACHE_ENTRIES)
+            .max_capacity(MAX_DOMAIN_CLIENTS)
             .time_to_live(DEFAULT_CACHE_TTL)
             .build();
 
@@ -270,13 +295,12 @@ impl DidResolver {
     /// Resolve the signing [`DecodingKey`] for a DID.
     ///
     /// Returns a cached key if available and not expired, otherwise fetches
-    /// the DID document from the network. The moka cache handles TTL expiry
-    /// and W-TinyLFU eviction automatically.
+    /// the DID document from the network. Concurrent requests for the same
+    /// DID are coalesced via [`moka::future::Cache::try_get_with`] — only one
+    /// outbound fetch is issued and all waiters share the result.
+    ///
+    /// The moka cache handles TTL expiry and W-TinyLFU eviction automatically.
     pub async fn resolve_key(&self, did: &str) -> Result<DecodingKey, String> {
-        if let Some(key) = self.cache.get(did) {
-            return Ok(key);
-        }
-
         // Reject DIDs that recently failed resolution to prevent repeated
         // outbound requests (DDoS reflection / resource exhaustion).
         if let Some(cached_err) = self.negative_cache.get(did) {
@@ -285,22 +309,24 @@ impl DidResolver {
             ));
         }
 
-        let result = async {
-            let doc = self.fetch_did_document(did).await?;
-            extract_signing_key(&doc)
-        }
-        .await;
-
-        match result {
-            Ok(key) => {
-                self.cache.insert(did.to_string(), key.clone());
-                Ok(key)
-            }
-            Err(e) => {
-                self.negative_cache.insert(did.to_string(), e.clone());
-                Err(e)
-            }
-        }
+        // try_get_with coalesces concurrent lookups for the same key: if
+        // multiple tasks call this simultaneously for the same uncached DID,
+        // only one runs the async closure and the others await its result.
+        let negative_cache = self.negative_cache.clone();
+        let did_owned = did.to_string();
+        self.cache
+            .try_get_with(did.to_string(), async {
+                let doc = self.fetch_did_document(&did_owned).await.map_err(|e| {
+                    negative_cache.insert(did_owned.clone(), e.clone());
+                    e
+                })?;
+                extract_signing_key(&doc).map_err(|e| {
+                    negative_cache.insert(did_owned.clone(), e.clone());
+                    e
+                })
+            })
+            .await
+            .map_err(|e: Arc<String>| (*e).clone())
     }
 
     /// Fetch the DID document from the appropriate directory.
@@ -457,7 +483,7 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
         let prefix = multibase
             .chars()
             .next()
-            .map_or("(empty)", |_| &multibase[..1]);
+            .map_or_else(|| "(empty)".to_string(), |c| c.to_string());
         format!("unsupported multibase prefix: {prefix}")
     })?;
 
@@ -752,5 +778,29 @@ mod tests {
         };
 
         assert_err_contains(extract_signing_key(&doc), "too long");
+    }
+
+    #[test]
+    fn multibyte_multibase_prefix_does_not_panic() {
+        // A multi-byte UTF-8 character as the multibase prefix must not
+        // cause a panic from byte-level string slicing (issue #1).
+        let doc = DidDocument {
+            verification_method: Some(vec![VerificationMethod {
+                id: "did:plc:test#atproto".to_string(),
+                key_type: "Multikey".to_string(),
+                public_key_multibase: Some("\u{1F680}rest".to_string()), // 🚀
+            }]),
+        };
+
+        let result = extract_signing_key(&doc);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("should reject non-'z' prefix"),
+        };
+        assert!(
+            err.contains("unsupported multibase prefix"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains('\u{1F680}'), "error should include the actual prefix char");
     }
 }
