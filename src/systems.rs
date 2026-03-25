@@ -28,10 +28,7 @@ pub fn bincode_options() -> impl Options {
 
 /// Polls the matchbox socket for peer connection state changes and pushes
 /// them to the [`PeerStateQueue`] resource.
-pub fn poll_peers(
-    mut socket: ResMut<MatchboxSocket>,
-    mut peer_queue: ResMut<PeerStateQueue>,
-) {
+pub fn poll_peers(mut socket: ResMut<MatchboxSocket>, mut peer_queue: ResMut<PeerStateQueue>) {
     let Ok(changes) = socket.try_update_peers() else {
         return;
     };
@@ -51,10 +48,8 @@ pub fn poll_peers(
 
 /// Drains incoming data from all channels, deserializes from `bincode`,
 /// and pushes [`NetworkReceived<T>`] entries to the [`NetworkQueue<T>`] resource.
-pub fn receive_messages<T>(
-    mut socket: ResMut<MatchboxSocket>,
-    mut queue: ResMut<NetworkQueue<T>>,
-) where
+pub fn receive_messages<T>(mut socket: ResMut<MatchboxSocket>, mut queue: ResMut<NetworkQueue<T>>)
+where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
     for channel_kind in [ChannelKind::Reliable, ChannelKind::Unreliable] {

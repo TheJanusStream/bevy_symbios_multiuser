@@ -102,7 +102,12 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
 /// (via `reqwest::ClientBuilder::resolve`) to prevent TOCTOU DNS rebinding
 /// attacks where the domain resolves to a different (private) IP on the second
 /// lookup performed by reqwest.
-fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, String> {
+/// Resolve a domain asynchronously and validate the result.
+///
+/// Wraps the blocking `getaddrinfo` call in [`tokio::task::spawn_blocking`]
+/// so it cannot stall tokio worker threads (which would deadlock the relay
+/// if an attacker delays DNS responses across all workers).
+async fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, String> {
     // Add default HTTPS port if no port is present, so ToSocketAddrs works.
     // Bracketed IPv6 addresses like [2001:db8::1] contain colons but have no
     // port — detect them by the leading bracket rather than a naive colon check.
@@ -120,10 +125,18 @@ fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, Str
         format!("{domain}:443")
     };
 
-    let addrs: Vec<std::net::SocketAddr> = host_port
-        .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve domain '{domain}': {e}"))?
-        .collect();
+    // std::net::ToSocketAddrs delegates to the OS's blocking getaddrinfo.
+    // Running it directly on a tokio worker would block the entire thread;
+    // spawn_blocking moves it to a dedicated thread pool instead.
+    let domain_owned = domain.to_string();
+    let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+        host_port
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| format!("DNS resolution task panicked for '{domain_owned}': {e}"))?
+    .map_err(|e| format!("failed to resolve domain '{domain}': {e}"))?;
 
     if addrs.is_empty() {
         return Err(format!("domain '{domain}' resolved to no addresses"));
@@ -253,7 +266,9 @@ impl DidResolver {
         // Reject DIDs that recently failed resolution to prevent repeated
         // outbound requests (DDoS reflection / resource exhaustion).
         if let Some(cached_err) = self.negative_cache.get(did) {
-            return Err(format!("DID resolution recently failed (cached): {cached_err}"));
+            return Err(format!(
+                "DID resolution recently failed (cached): {cached_err}"
+            ));
         }
 
         let result = async {
@@ -293,7 +308,7 @@ impl DidResolver {
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
             let parts: Vec<&str> = raw.splitn(2, ':').collect();
             let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
-            let validated_addr = validate_and_resolve_domain(&domain)?;
+            let validated_addr = validate_and_resolve_domain(&domain).await?;
             let host_only = domain.split(':').next().unwrap_or(&domain);
             // Build a one-off client that pins DNS resolution to the validated IP.
             let pinned = reqwest::Client::builder()
@@ -626,9 +641,9 @@ mod tests {
 
     // ── SSRF protection tests ─────────────────────────────────────────
 
-    #[test]
-    fn ssrf_rejects_loopback() {
-        let result = validate_and_resolve_domain("localhost");
+    #[tokio::test]
+    async fn ssrf_rejects_loopback() {
+        let result = validate_and_resolve_domain("localhost").await;
         assert!(result.is_err(), "expected loopback to be rejected");
         assert!(
             result.unwrap_err().contains("SSRF protection"),
@@ -636,57 +651,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ssrf_rejects_127_0_0_1() {
-        let result = validate_and_resolve_domain("127.0.0.1");
+    #[tokio::test]
+    async fn ssrf_rejects_127_0_0_1() {
+        let result = validate_and_resolve_domain("127.0.0.1").await;
         assert!(result.is_err(), "expected 127.0.0.1 to be rejected");
     }
 
-    #[test]
-    fn ssrf_rejects_private_10_network() {
-        let result = validate_and_resolve_domain("10.0.0.1");
+    #[tokio::test]
+    async fn ssrf_rejects_private_10_network() {
+        let result = validate_and_resolve_domain("10.0.0.1").await;
         assert!(result.is_err(), "expected 10.x.x.x to be rejected");
     }
 
-    #[test]
-    fn ssrf_rejects_private_172_network() {
-        let result = validate_and_resolve_domain("172.16.0.1");
+    #[tokio::test]
+    async fn ssrf_rejects_private_172_network() {
+        let result = validate_and_resolve_domain("172.16.0.1").await;
         assert!(result.is_err(), "expected 172.16.x.x to be rejected");
     }
 
-    #[test]
-    fn ssrf_rejects_private_192_168_network() {
-        let result = validate_and_resolve_domain("192.168.1.1");
+    #[tokio::test]
+    async fn ssrf_rejects_private_192_168_network() {
+        let result = validate_and_resolve_domain("192.168.1.1").await;
         assert!(result.is_err(), "expected 192.168.x.x to be rejected");
     }
 
-    #[test]
-    fn ssrf_rejects_link_local() {
-        let result = validate_and_resolve_domain("169.254.1.1");
+    #[tokio::test]
+    async fn ssrf_rejects_link_local() {
+        let result = validate_and_resolve_domain("169.254.1.1").await;
         assert!(result.is_err(), "expected link-local to be rejected");
     }
 
-    #[test]
-    fn ssrf_rejects_loopback_with_port() {
-        let result = validate_and_resolve_domain("127.0.0.1:10250");
+    #[tokio::test]
+    async fn ssrf_rejects_loopback_with_port() {
+        let result = validate_and_resolve_domain("127.0.0.1:10250").await;
         assert!(result.is_err(), "expected 127.0.0.1:port to be rejected");
     }
 
-    #[test]
-    fn ssrf_rejects_this_network_0_0_0_1() {
-        let result = validate_and_resolve_domain("0.0.0.1");
-        assert!(result.is_err(), "expected 0.0.0.1 (this-network) to be rejected");
+    #[tokio::test]
+    async fn ssrf_rejects_this_network_0_0_0_1() {
+        let result = validate_and_resolve_domain("0.0.0.1").await;
+        assert!(
+            result.is_err(),
+            "expected 0.0.0.1 (this-network) to be rejected"
+        );
     }
 
-    #[test]
-    fn ssrf_rejects_multicast() {
-        let result = validate_and_resolve_domain("224.0.0.1");
-        assert!(result.is_err(), "expected multicast 224.0.0.1 to be rejected");
+    #[tokio::test]
+    async fn ssrf_rejects_multicast() {
+        let result = validate_and_resolve_domain("224.0.0.1").await;
+        assert!(
+            result.is_err(),
+            "expected multicast 224.0.0.1 to be rejected"
+        );
     }
 
-    #[test]
-    fn ssrf_rejects_broadcast() {
-        let result = validate_and_resolve_domain("255.255.255.255");
+    #[tokio::test]
+    async fn ssrf_rejects_broadcast() {
+        let result = validate_and_resolve_domain("255.255.255.255").await;
         assert!(result.is_err(), "expected broadcast to be rejected");
     }
 

@@ -26,8 +26,7 @@ pub struct Broadcast<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
 /// # Type Parameters
 /// * `T` - The domain-specific payload type. Must implement `Serialize + Deserialize`.
 #[derive(Debug, Clone)]
-pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'static>
-{
+pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
     /// The deserialized payload from the remote peer.
     pub payload: T,
     /// The identity of the peer that sent this message.
@@ -36,12 +35,21 @@ pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'stat
     pub channel: ChannelKind,
 }
 
-/// Unbounded queue for incoming network messages.
+/// Maximum number of messages buffered in a [`NetworkQueue`] before new
+/// arrivals are dropped. Prevents unbounded memory growth if a remote peer
+/// floods the WebRTC data channel faster than the application drains it.
+const MAX_NETWORK_QUEUE_LEN: usize = 4096;
+
+/// Bounded queue for incoming network messages.
 ///
 /// Unlike Bevy's double-buffered `Messages`, this resource is **not** cleared
 /// automatically each frame. This prevents silent message loss when the
 /// consumer runs in `FixedUpdate` at a lower tick rate than the render
 /// framerate. The host application must drain the queue manually.
+///
+/// The queue is capped at [`MAX_NETWORK_QUEUE_LEN`] entries. When full,
+/// new messages are dropped and a warning is logged, preventing an
+/// out-of-memory condition from a malicious flood.
 ///
 /// # Example
 ///
@@ -66,8 +74,14 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Default for Networ
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
-    /// Push a received message onto the queue.
+    /// Push a received message onto the queue, dropping it if at capacity.
     pub(crate) fn push(&mut self, msg: NetworkReceived<T>) {
+        if self.incoming.len() >= MAX_NETWORK_QUEUE_LEN {
+            bevy::log::warn!(
+                "NetworkQueue full ({MAX_NETWORK_QUEUE_LEN} messages), dropping incoming message"
+            );
+            return;
+        }
         self.incoming.push_back(msg);
     }
 
@@ -97,19 +111,25 @@ pub struct PeerStateChanged {
     pub state: PeerConnectionState,
 }
 
-/// Unbounded queue for peer state change events.
+/// Bounded queue for peer state change events.
 ///
 /// Like [`NetworkQueue`], this avoids the double-buffer clearing issue with
 /// Bevy `Messages` so that `FixedUpdate` consumers never miss a peer
-/// connect/disconnect event.
+/// connect/disconnect event. Capped at [`MAX_NETWORK_QUEUE_LEN`].
 #[derive(Resource, Debug, Default)]
 pub struct PeerStateQueue {
     events: VecDeque<PeerStateChanged>,
 }
 
 impl PeerStateQueue {
-    /// Push a peer state change onto the queue.
+    /// Push a peer state change onto the queue, dropping it if at capacity.
     pub(crate) fn push(&mut self, event: PeerStateChanged) {
+        if self.events.len() >= MAX_NETWORK_QUEUE_LEN {
+            bevy::log::warn!(
+                "PeerStateQueue full ({MAX_NETWORK_QUEUE_LEN} events), dropping incoming event"
+            );
+            return;
+        }
         self.events.push_back(event);
     }
 

@@ -231,13 +231,32 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    // If this session ID already exists (reconnect), notify peers in the OLD
-    // room that the old connection is gone before inserting the new one.
-    // We must read the old peer's room — not the new connection's room — to
-    // avoid sending PeerLeft to the wrong room when a user switches rooms.
-    if let Some(old_entry) = state.peers.get(&session_id) {
-        let old_room = old_entry.value().room.clone();
-        drop(old_entry); // Release DashMap read lock before iterating.
+    // Atomically replace any existing connection for this session ID.
+    // Using the `entry` API avoids a TOCTOU race where two concurrent
+    // reconnects could both see `None` from `get()` and both `insert()`,
+    // orphaning the first connection's write task.
+    let old_entry_info = {
+        use dashmap::mapref::entry::Entry;
+        let new_peer = PeerEntry {
+            tx: relay_tx,
+            conn_id,
+            room: room.clone(),
+        };
+        match state.peers.entry(session_id.clone()) {
+            Entry::Occupied(mut occ) => {
+                let old = occ.insert(new_peer);
+                Some((old.room, old.tx))
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(new_peer);
+                None
+            }
+        }
+    };
+
+    // If we replaced an old connection, notify peers in the OLD room and
+    // drop the old sender (which will cause its write task to terminate).
+    if let Some((old_room, _old_tx)) = old_entry_info {
         let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
             .peers
             .iter()
@@ -251,16 +270,9 @@ async fn handle_socket(
             };
             let _ = sender.try_send(envelope);
         }
+        // _old_tx is dropped here, closing the old connection's relay channel.
+        // Its write task will see `None` from `relay_rx.recv()` and exit.
     }
-
-    state.peers.insert(
-        session_id.clone(),
-        PeerEntry {
-            tx: relay_tx,
-            conn_id,
-            room: room.clone(),
-        },
-    );
 
     // Announce the assigned session ID to the connecting client.
     let welcome = serde_json::json!({ "type": "session_id", "id": session_id });
@@ -328,10 +340,13 @@ async fn handle_socket(
             let text = match msg {
                 Message::Text(t) => t.to_string(),
                 Message::Close(_) => break,
+                // Ping/Pong are legitimate keep-alive frames (axum/tungstenite
+                // handles pong replies automatically but still yields them).
+                // Do NOT count them toward invalid_count.
+                Message::Ping(_) | Message::Pong(_) => continue,
                 _ => {
-                    // Unexpected frame types (Binary, Ping, Pong) count as
-                    // invalid to prevent attackers from spinning the loop
-                    // with binary frames that bypass MAX_INVALID_MESSAGES.
+                    // Unexpected frame types (e.g. Binary) count as invalid
+                    // to prevent attackers from spinning the loop.
                     invalid_count += 1;
                     if invalid_count >= MAX_INVALID_MESSAGES {
                         tracing::warn!(

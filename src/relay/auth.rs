@@ -78,7 +78,21 @@ fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
     let mut validation = Validation::default();
     validation.insecure_disable_signature_validation();
     validation.validate_exp = true;
-    validation.algorithms = vec![Algorithm::ES256];
+    // Accept all algorithms during the unverified claim extraction phase.
+    // The actual algorithm is enforced in `verify_signature` (ES256).
+    // This avoids rejecting JWTs signed with future algorithms before we
+    // even attempt to fetch the DID document and verify the signature.
+    validation.algorithms = vec![
+        Algorithm::ES256,
+        Algorithm::ES384,
+        Algorithm::EdDSA,
+        Algorithm::RS256,
+        Algorithm::RS384,
+        Algorithm::RS512,
+        Algorithm::PS256,
+        Algorithm::PS384,
+        Algorithm::PS512,
+    ];
     validation.validate_aud = false;
 
     let token_data = decode::<AtprotoClaims>(token, &DecodingKey::from_secret(&[]), &validation)
@@ -149,7 +163,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_garbage_token() {
-        assert!(validate_atproto_jwt("not.a.jwt", &dummy_resolver()).await.is_err());
+        assert!(
+            validate_atproto_jwt("not.a.jwt", &dummy_resolver())
+                .await
+                .is_err()
+        );
     }
 
     /// Build a [`DecodingKey`] from a p256 public key using PEM encoding,
