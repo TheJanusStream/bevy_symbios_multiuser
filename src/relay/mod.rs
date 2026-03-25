@@ -136,19 +136,15 @@ pub struct RelayState {
 
 impl RelayState {
     fn new(auth_required: bool, max_peers: usize) -> Self {
-        // Enable DID resolution (and thus signature verification) whenever
-        // authentication is required.
-        let did_resolver = if auth_required {
-            Some(did_resolver::DidResolver::new())
-        } else {
-            None
-        };
-
+        // Always create the DID resolver so that opportunistic authentication
+        // works when `auth_required` is false: clients presenting a valid JWT
+        // get identified by their DID, while unauthenticated clients fall back
+        // to random UUIDs.
         Self {
             peers: Arc::new(DashMap::new()),
             auth_required,
             max_peers,
-            did_resolver,
+            did_resolver: Some(did_resolver::DidResolver::new()),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }

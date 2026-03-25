@@ -104,7 +104,17 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
 /// lookup performed by reqwest.
 fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, String> {
     // Add default HTTPS port if no port is present, so ToSocketAddrs works.
-    let host_port = if domain.contains(':') {
+    // Bracketed IPv6 addresses like [2001:db8::1] contain colons but have no
+    // port — detect them by the leading bracket rather than a naive colon check.
+    let host_port = if domain.starts_with('[') {
+        // Bracketed IPv6: [addr] or [addr]:port
+        if domain.contains("]:") {
+            domain.to_string()
+        } else {
+            format!("{domain}:443")
+        }
+    } else if domain.contains(':') {
+        // IPv4 or hostname with explicit port
         domain.to_string()
     } else {
         format!("{domain}:443")
@@ -142,26 +152,47 @@ fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, Str
     Ok(addrs[0])
 }
 
-/// Check if an IP address is in a private range (RFC 1918 / RFC 4193).
+/// Check if an IP address is in a private, reserved, or otherwise non-global range.
+///
+/// Covers RFC 1918, RFC 4193, carrier-grade NAT, link-local, "this" network
+/// (0.0.0.0/8 — routed to loopback on Linux), multicast, broadcast, and other
+/// IANA-reserved ranges that should never appear in a did:web domain.
 fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let octets = v4.octets();
+            // 0.0.0.0/8 — "This" network (RFC 1122). On Linux, 0.0.0.1–0.255.255.255
+            // are routed to the loopback interface, making them an SSRF vector.
+            octets[0] == 0
             // 10.0.0.0/8
-            octets[0] == 10
+            || octets[0] == 10
             // 172.16.0.0/12
             || (octets[0] == 172 && (16..=31).contains(&octets[1]))
             // 192.168.0.0/16
             || (octets[0] == 192 && octets[1] == 168)
-            // 100.64.0.0/10 (carrier-grade NAT)
+            // 100.64.0.0/10 (carrier-grade NAT, RFC 6598)
             || (octets[0] == 100 && (64..=127).contains(&octets[1]))
             // 169.254.0.0/16 (link-local, also caught by is_link_local)
             || (octets[0] == 169 && octets[1] == 254)
+            // 192.0.0.0/24 (IETF protocol assignments, RFC 6890)
+            || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+            // 192.0.2.0/24 (TEST-NET-1, RFC 5737)
+            || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+            // 198.18.0.0/15 (benchmarking, RFC 2544)
+            || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+            // 198.51.100.0/24 (TEST-NET-2, RFC 5737)
+            || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+            // 203.0.113.0/24 (TEST-NET-3, RFC 5737)
+            || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+            // 224.0.0.0/4 (multicast, RFC 5771)
+            || octets[0] >= 224
         }
         std::net::IpAddr::V6(v6) => {
             let segments = v6.segments();
             // fc00::/7 (unique local)
             (segments[0] & 0xfe00) == 0xfc00
+            // ff00::/8 (multicast)
+            || (segments[0] & 0xff00) == 0xff00
         }
     }
 }
@@ -340,6 +371,13 @@ struct VerificationMethod {
 
 // ── Key extraction ──────────────────────────────────────────────────────────
 
+/// Maximum length of the base58-encoded portion of `publicKeyMultibase`.
+/// A compressed P-256 key is 33 bytes + 2-byte multicodec prefix = 35 bytes,
+/// which encodes to ~48 base58 characters. We allow up to 128 to be generous.
+/// This cap prevents O(N²) CPU exhaustion from bs58-decoding a ~250 KiB string
+/// embedded in a malicious DID document.
+const MAX_MULTIBASE_ENCODED_LEN: usize = 128;
+
 /// Multicodec varint prefix for P-256 (secp256r1) public keys.
 const P256_MULTICODEC: [u8; 2] = [0x80, 0x24];
 
@@ -380,6 +418,14 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
             .map_or("(empty)", |_| &multibase[..1]);
         format!("unsupported multibase prefix: {prefix}")
     })?;
+
+    if encoded.len() > MAX_MULTIBASE_ENCODED_LEN {
+        return Err(format!(
+            "publicKeyMultibase too long ({} chars, max {MAX_MULTIBASE_ENCODED_LEN}); \
+             valid P-256 keys encode to ~48 characters",
+            encoded.len()
+        ));
+    }
 
     let bytes = bs58::decode(encoded)
         .into_vec()
@@ -624,5 +670,39 @@ mod tests {
     fn ssrf_rejects_loopback_with_port() {
         let result = validate_and_resolve_domain("127.0.0.1:10250");
         assert!(result.is_err(), "expected 127.0.0.1:port to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_this_network_0_0_0_1() {
+        let result = validate_and_resolve_domain("0.0.0.1");
+        assert!(result.is_err(), "expected 0.0.0.1 (this-network) to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_multicast() {
+        let result = validate_and_resolve_domain("224.0.0.1");
+        assert!(result.is_err(), "expected multicast 224.0.0.1 to be rejected");
+    }
+
+    #[test]
+    fn ssrf_rejects_broadcast() {
+        let result = validate_and_resolve_domain("255.255.255.255");
+        assert!(result.is_err(), "expected broadcast to be rejected");
+    }
+
+    // ── Key length limit tests ───────────────────────────────────────
+
+    #[test]
+    fn rejects_oversized_multibase_key() {
+        let long_key = format!("z{}", "1".repeat(MAX_MULTIBASE_ENCODED_LEN + 1));
+        let doc = DidDocument {
+            verification_method: Some(vec![VerificationMethod {
+                id: "did:plc:test#atproto".to_string(),
+                key_type: "Multikey".to_string(),
+                public_key_multibase: Some(long_key),
+            }]),
+        };
+
+        assert_err_contains(extract_signing_key(&doc), "too long");
     }
 }

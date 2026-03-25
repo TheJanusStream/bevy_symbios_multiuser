@@ -328,7 +328,20 @@ async fn handle_socket(
             let text = match msg {
                 Message::Text(t) => t.to_string(),
                 Message::Close(_) => break,
-                _ => continue,
+                _ => {
+                    // Unexpected frame types (Binary, Ping, Pong) count as
+                    // invalid to prevent attackers from spinning the loop
+                    // with binary frames that bypass MAX_INVALID_MESSAGES.
+                    invalid_count += 1;
+                    if invalid_count >= MAX_INVALID_MESSAGES {
+                        tracing::warn!(
+                            session = %session_id,
+                            "disconnecting peer after {MAX_INVALID_MESSAGES} consecutive invalid messages"
+                        );
+                        break;
+                    }
+                    continue;
+                }
             };
 
             let envelope: SignalEnvelope = match serde_json::from_str(&text) {
