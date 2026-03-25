@@ -18,9 +18,11 @@
 //! 3. `?token=<token>` query parameter (legacy WASM fallback).
 //!
 //! The relay resolves the issuer's DID document (via `plc.directory` for
-//! `did:plc`, or `/.well-known/did.json` for `did:web`), extracts the
-//! `#atproto` P-256 signing key, and cryptographically verifies the JWT's
-//! ES256 signature. Resolved keys are cached in memory with a 5-minute TTL.
+//! `did:plc`, or HTTPS for `did:web` — domain-only DIDs use
+//! `/.well-known/did.json`, path-based DIDs like `did:web:example.com:u:alice`
+//! use `/{path}/did.json`), extracts the `#atproto` P-256 signing key, and
+//! cryptographically verifies the JWT's ES256 signature. Resolved keys are
+//! cached in memory with a 5-minute TTL.
 //! The authenticated DID becomes the peer's session identity.
 //!
 //! When `auth_required` is `false` (the default), authentication is

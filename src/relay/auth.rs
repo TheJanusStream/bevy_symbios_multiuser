@@ -8,9 +8,10 @@
 //! # Signature Verification
 //!
 //! When a `DidResolver` is supplied, the relay resolves the issuer's DID
-//! document (via `plc.directory` for `did:plc`, or `/.well-known/did.json`
-//! for `did:web`), extracts the `#atproto` signing key, and verifies the
-//! JWT's ES256 signature. Resolved keys are cached in memory.
+//! document (via `plc.directory` for `did:plc`, or HTTPS for `did:web` —
+//! domain-only DIDs use `/.well-known/did.json`, path-based DIDs use
+//! `/{path}/did.json`), extracts the `#atproto` signing key, and verifies
+//! the JWT's ES256 signature. Resolved keys are cached in memory.
 //!
 //! Callers must ensure a resolver is available before calling
 //! [`validate_atproto_jwt`] — unverified JWTs are never trusted for identity.

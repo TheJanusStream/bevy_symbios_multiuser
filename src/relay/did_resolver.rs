@@ -1,8 +1,10 @@
 //! Resolves ATProto DID documents to extract signing public keys.
 //!
 //! Supports `did:plc` (via the PLC directory at `plc.directory`) and `did:web`
-//! (via `/.well-known/did.json`). Resolved keys are cached in memory with a
-//! configurable TTL to avoid redundant network requests.
+//! (via HTTPS — domain-only DIDs resolve to `/.well-known/did.json`, while
+//! path-based DIDs like `did:web:example.com:u:alice` resolve to
+//! `https://example.com/u/alice/did.json`). Resolved keys are cached in memory
+//! with a configurable TTL to avoid redundant network requests.
 //!
 //! # Security
 //!
