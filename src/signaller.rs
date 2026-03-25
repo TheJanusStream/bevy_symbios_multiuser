@@ -1,13 +1,16 @@
-//! Custom matchbox signaller that authenticates with the Symbios relay using
-//! an ATProto JWT.
+//! Custom matchbox signaller that speaks the Symbios relay's wire format and
+//! optionally authenticates with an ATProto JWT.
 //!
 //! Implements the [`SignallerBuilder`] and [`Signaller`] traits from
 //! `matchbox_socket`, bridging between the matchbox `PeerRequest`/`PeerEvent`
 //! protocol and the relay's [`SignalEnvelope`]/[`SignalPayload`] wire format.
 //!
+//! The plugin **always** uses this signaller (via [`signaller_for_session`] or
+//! [`signaller_anonymous`]) so that the relay receives the expected
+//! `SignalEnvelope` JSON, rather than matchbox's incompatible default format.
 //! When an [`AtprotoSession`](crate::auth::AtprotoSession) resource is present
-//! in the Bevy world, the plugin automatically uses this signaller instead of
-//! the default (unauthenticated) matchbox WebSocket signaller.
+//! in the Bevy world, the JWT is included in the WebSocket handshake; otherwise
+//! the signaller connects without authentication (anonymous mode).
 //!
 //! # Platform Support
 //!

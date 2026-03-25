@@ -55,6 +55,20 @@
 //!   private/loopback IPs and pins the resolved address to prevent DNS rebinding.
 //! - **DID document size limit** — Responses are streamed with an incremental
 //!   256 KiB cap, aborting before buffering oversized payloads.
+//! - **Idle timeout** — WebSocket connections that receive no messages for 120
+//!   seconds are disconnected, preventing Slowloris-style attacks that hold
+//!   connection slots indefinitely.
+//! - **Handshake timeout** — The authentication/identity extraction phase is
+//!   capped at 15 seconds, preventing connection slot exhaustion from DIDs that
+//!   tarpit the HTTP fetch.
+//! - **Self-targeting rejection** — SDP offers/answers addressed to the sender's
+//!   own session ID are dropped, preventing pointless self-negotiation loops.
+//! - **Invalid message disconnect** — Peers that send 10 consecutive invalid
+//!   messages (malformed JSON, binary frames) are disconnected, preventing log
+//!   exhaustion attacks.
+//! - **Negative DID cache** — Failed DID resolutions are cached for 60 seconds,
+//!   preventing attackers from using the relay as a DDoS reflector by spamming
+//!   handshakes with the same DID pointing at a victim server.
 //! - **Backpressure logging** — When the per-peer relay channel (256 slots)
 //!   is full, dropped signals are logged instead of silently discarded.
 //!

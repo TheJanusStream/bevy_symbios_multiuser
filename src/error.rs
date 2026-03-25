@@ -1,3 +1,10 @@
+//! Error types for the symbios multiuser plugin.
+//!
+//! [`SymbiosError`] is the unified error enum returned by client-side operations
+//! (authentication, serialization, signaling) and relay-side JWT validation.
+//! Feature-gated variants are only available when the corresponding feature
+//! (`client` or `relay`) is enabled.
+
 /// Errors that can occur in the symbios multiuser plugin.
 #[derive(Debug, thiserror::Error)]
 pub enum SymbiosError {
