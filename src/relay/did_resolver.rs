@@ -63,6 +63,12 @@ pub struct DidResolver {
     /// Caches failed DID resolutions to prevent repeated outbound requests
     /// for the same bad DID (DDoS reflection protection).
     negative_cache: Cache<String, String>,
+    /// Caches `reqwest::Client` instances keyed by did:web domain hostname.
+    /// Each client has DNS pinned to a validated (non-private) IP via
+    /// `ClientBuilder::resolve`, which is a builder-level setting requiring a
+    /// separate client. Caching avoids the heavy cost of constructing a new
+    /// client (connection pool + background workers) on every DID fetch.
+    domain_clients: Cache<String, reqwest::Client>,
     plc_directory: String,
 }
 
@@ -239,10 +245,16 @@ impl DidResolver {
             .time_to_live(NEGATIVE_CACHE_TTL)
             .build();
 
+        let domain_clients = Cache::builder()
+            .max_capacity(MAX_CACHE_ENTRIES)
+            .time_to_live(DEFAULT_CACHE_TTL)
+            .build();
+
         Self {
             client,
             cache,
             negative_cache,
+            domain_clients,
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
         }
     }
@@ -306,20 +318,33 @@ impl DidResolver {
         // SSRF protection: for did:web, resolve DNS once, validate IPs, and
         // pin the validated address so reqwest cannot re-resolve to a different
         // (potentially private) IP (prevents TOCTOU DNS rebinding attacks).
+        //
+        // Pinned clients are cached per domain to avoid the cost of
+        // constructing a new reqwest::Client (connection pool + background
+        // workers) on every cache-miss fetch. The domain_clients cache is
+        // bounded and TTL'd so an attacker spamming unique domains can only
+        // create a bounded number of clients before eviction kicks in.
         let pinned_client = if did.starts_with("did:web:") {
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
             let parts: Vec<&str> = raw.splitn(2, ':').collect();
             let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
             let validated_addr = validate_and_resolve_domain(&domain).await?;
-            let host_only = domain.split(':').next().unwrap_or(&domain);
-            // Build a one-off client that pins DNS resolution to the validated IP.
-            let pinned = reqwest::Client::builder()
-                .timeout(DID_FETCH_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve(host_only, validated_addr)
-                .build()
-                .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;
-            Some(pinned)
+            let host_only = domain.split(':').next().unwrap_or(&domain).to_string();
+
+            // Check the domain client cache first.
+            let client = if let Some(cached) = self.domain_clients.get(&host_only) {
+                cached
+            } else {
+                let pinned = reqwest::Client::builder()
+                    .timeout(DID_FETCH_TIMEOUT)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .resolve(&host_only, validated_addr)
+                    .build()
+                    .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;
+                self.domain_clients.insert(host_only, pinned.clone());
+                pinned
+            };
+            Some(client)
         } else {
             None
         };

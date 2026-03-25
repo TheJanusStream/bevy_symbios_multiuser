@@ -72,6 +72,7 @@ where
                         payload,
                         sender: peer,
                         channel: channel_kind,
+                        packet_size: packet.len(),
                     });
                 }
                 Err(err) => {

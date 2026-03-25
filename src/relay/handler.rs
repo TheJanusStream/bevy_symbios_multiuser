@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -39,6 +40,18 @@ const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 /// Number of consecutive invalid messages before disconnecting a peer.
 /// Prevents log exhaustion from attackers spamming malformed JSON.
 const MAX_INVALID_MESSAGES: usize = 10;
+
+/// Maximum time a WebSocket connection may be idle (no messages received)
+/// before the server disconnects it. Prevents Slowloris-style attacks where
+/// an attacker opens `max_peers` connections and sends nothing, holding
+/// connection slots indefinitely.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum time allowed for the authentication/identity extraction phase of
+/// the WebSocket handshake. Prevents attackers from exhausting connection
+/// slots by presenting DIDs that tarpit the HTTP fetch (e.g. a server that
+/// holds the connection open for the full 10s DID fetch timeout).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Optional query parameters on the WebSocket upgrade URL.
 ///
@@ -108,13 +121,24 @@ pub async fn ws_handler(
         None
     };
 
-    let identity = extract_identity(
-        &headers,
-        query.token.as_deref(),
-        state.auth_required,
-        state.did_resolver.as_ref(),
+    let identity = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        extract_identity(
+            &headers,
+            query.token.as_deref(),
+            state.auth_required,
+            state.did_resolver.as_ref(),
+        ),
     )
-    .await;
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!("identity extraction timed out, dropping connection");
+            // _conn_guard drops here, decrementing the counter.
+            return (StatusCode::GATEWAY_TIMEOUT, "Authentication timed out").into_response();
+        }
+    };
 
     // If the client used the Sec-WebSocket-Protocol subprotocol trick to pass
     // the JWT, we must echo "access_token" back or the browser will abort.
@@ -334,9 +358,24 @@ async fn handle_socket(
 
     // Read messages from the WebSocket and route them to the target peer.
     // If the write task dies (e.g. broken connection), stop reading too.
+    // Each read is wrapped in an idle timeout to reap Slowloris connections
+    // that hold a slot without sending any data.
     let read_task = async {
         let mut invalid_count: usize = 0;
-        while let Some(Ok(msg)) = ws_rx.next().await {
+        loop {
+            let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws_rx.next()).await {
+                Ok(Some(Ok(msg))) => msg,
+                Ok(Some(Err(_))) => break, // WebSocket error
+                Ok(None) => break,         // Stream ended
+                Err(_) => {
+                    tracing::info!(
+                        session = %session_id,
+                        timeout_secs = WS_IDLE_TIMEOUT.as_secs(),
+                        "disconnecting idle peer (no messages received within timeout)"
+                    );
+                    break;
+                }
+            };
             let text = match msg {
                 Message::Text(t) => t.to_string(),
                 Message::Close(_) => break,
@@ -398,6 +437,17 @@ async fn handle_socket(
 
             // Route to target peer, rewriting peer_id to the sender's ID.
             let target_id = envelope.peer_id.clone();
+
+            // Reject self-targeting: a peer sending an SDP offer to itself
+            // would force a pointless self-negotiation loop.
+            if target_id == session_id {
+                tracing::warn!(
+                    session = %session_id,
+                    "dropping self-targeted signal"
+                );
+                continue;
+            }
+
             let forwarded = SignalEnvelope {
                 peer_id: session_id.clone(),
                 signal: envelope.signal,

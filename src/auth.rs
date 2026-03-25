@@ -58,12 +58,21 @@ struct RefreshSessionResponse {
     refresh_jwt: String,
 }
 
-/// Validate that a PDS URL uses HTTPS to prevent credential leakage.
-fn validate_pds_url(url: &str) -> Result<(), SymbiosError> {
-    let trimmed = url.trim_end_matches('/');
-    if !trimmed.starts_with("https://") {
+/// Validate that a PDS URL is a well-formed HTTPS URL with a host.
+///
+/// Uses `url::Url::parse` to reject malformed inputs like bare `"https://"`
+/// (no host), relative paths, or non-HTTPS schemes.
+fn validate_pds_url(raw: &str) -> Result<(), SymbiosError> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| SymbiosError::AuthFailed(format!("invalid PDS URL '{raw}': {e}")))?;
+    if parsed.scheme() != "https" {
         return Err(SymbiosError::AuthFailed(format!(
-            "PDS URL must use HTTPS to protect credentials, got: {trimmed}"
+            "PDS URL must use HTTPS to protect credentials, got: {raw}"
+        )));
+    }
+    if parsed.host().is_none() {
+        return Err(SymbiosError::AuthFailed(format!(
+            "PDS URL has no host: {raw}"
         )));
     }
     Ok(())

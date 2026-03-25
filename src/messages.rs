@@ -33,12 +33,21 @@ pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'stat
     pub sender: PeerId,
     /// Which channel this message arrived on.
     pub channel: ChannelKind,
+    /// Size of the raw network packet in bytes (before deserialization).
+    /// Used by [`NetworkQueue`] to enforce its byte-size budget.
+    pub(crate) packet_size: usize,
 }
 
 /// Maximum number of messages buffered in a [`NetworkQueue`] before new
 /// arrivals are dropped. Prevents unbounded memory growth if a remote peer
 /// floods the WebRTC data channel faster than the application drains it.
 const MAX_NETWORK_QUEUE_LEN: usize = 4096;
+
+/// Maximum total estimated byte size of all messages in the queue (64 MiB).
+/// This complements the count-based [`MAX_NETWORK_QUEUE_LEN`] limit to prevent
+/// a scenario where an attacker sends a small number of maximum-sized (1 MiB)
+/// messages that individually pass the count check but collectively exhaust RAM.
+const MAX_NETWORK_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bounded queue for incoming network messages.
 ///
@@ -63,18 +72,25 @@ const MAX_NETWORK_QUEUE_LEN: usize = 4096;
 #[derive(Resource, Debug)]
 pub struct NetworkQueue<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
     incoming: VecDeque<NetworkReceived<T>>,
+    /// Running total of `packet_size` for all queued messages.
+    total_bytes: usize,
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Default for NetworkQueue<T> {
     fn default() -> Self {
         Self {
             incoming: VecDeque::new(),
+            total_bytes: 0,
         }
     }
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
     /// Push a received message onto the queue, dropping it if at capacity.
+    ///
+    /// Enforces both a count limit ([`MAX_NETWORK_QUEUE_LEN`]) and a byte-size
+    /// budget ([`MAX_NETWORK_QUEUE_BYTES`]) to prevent memory exhaustion from
+    /// a flood of large messages.
     pub(crate) fn push(&mut self, msg: NetworkReceived<T>) {
         if self.incoming.len() >= MAX_NETWORK_QUEUE_LEN {
             bevy::log::warn!(
@@ -82,12 +98,22 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
             );
             return;
         }
+        if self.total_bytes.saturating_add(msg.packet_size) > MAX_NETWORK_QUEUE_BYTES {
+            bevy::log::warn!(
+                total_bytes = self.total_bytes,
+                msg_bytes = msg.packet_size,
+                "NetworkQueue byte budget exceeded ({MAX_NETWORK_QUEUE_BYTES} bytes), dropping incoming message"
+            );
+            return;
+        }
+        self.total_bytes += msg.packet_size;
         self.incoming.push_back(msg);
     }
 
     /// Drain all queued messages. The caller owns the returned iterator and
     /// no messages are dropped until consumed.
     pub fn drain(&mut self) -> impl Iterator<Item = NetworkReceived<T>> + '_ {
+        self.total_bytes = 0;
         self.incoming.drain(..)
     }
 
