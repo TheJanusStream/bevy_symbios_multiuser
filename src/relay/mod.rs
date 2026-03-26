@@ -82,15 +82,18 @@
 //!   *responding* to pings), so without server-side pings, idle WASM clients
 //!   would be reaped by the idle timeout.
 //! - **Backpressure** — When the per-peer relay channel (256 slots)
-//!   is full, signals are dropped and logged. The target peer is *not*
-//!   disconnected, preventing a malicious sender from evicting victims by
-//!   flooding their queue.
+//!   is full, signals are dropped and logged. To prevent a single malicious
+//!   sender from evicting victims, individual drops do not disconnect the
+//!   target. However, if a target accumulates 50 consecutive backpressure
+//!   strikes across all senders, the relay disconnects it — the peer is
+//!   likely stalled (e.g. stopped reading its WebSocket) and is pinning
+//!   memory without contributing to the mesh.
 //! - **Handshake slot budget** — At most `max_peers / 4` connections may be
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
 //!   fetch with slow-responding servers.
 //! - **Per-domain DID fetch rate limiting** — Each `did:web` domain is limited
-//!   to 10 DID document fetches per 60 seconds, preventing attackers from
+//!   to 500 DID document fetches per 60 seconds, preventing attackers from
 //!   bypassing the per-DID negative cache with unique path segments to use
 //!   the relay as a DDoS amplifier.
 //!
