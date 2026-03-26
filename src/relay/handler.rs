@@ -18,13 +18,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// RAII guard that decrements the active connection counter on drop.
+/// RAII guard that decrements an atomic counter on drop.
 ///
-/// Ensures the counter is always decremented even if the `on_upgrade` callback
-/// is never executed (e.g. TCP drops during the HTTP upgrade handshake).
-struct ConnectionGuard(Arc<AtomicUsize>);
+/// Used for both the active connection counter and the handshake counter.
+/// Ensures the counter is always decremented even if the task panics or the
+/// `on_upgrade` callback is never executed.
+struct AtomicGuard(Arc<AtomicUsize>);
 
-impl Drop for ConnectionGuard {
+impl Drop for AtomicGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -122,7 +123,28 @@ pub async fn ws_handler(
         // RAII guard: if the on_upgrade callback is never executed (e.g. TCP
         // drops during the HTTP upgrade handshake), the guard's Drop impl
         // ensures the counter is still decremented.
-        Some(ConnectionGuard(Arc::clone(&state.active_connections)))
+        Some(AtomicGuard(Arc::clone(&state.active_connections)))
+    } else {
+        None
+    };
+
+    // Enforce a separate handshake slot limit so that tarpitted DID fetches
+    // (e.g. attacker-controlled did:web servers that hold connections open)
+    // cannot exhaust all connection slots. At most max_peers/4 connections
+    // may be in the handshake phase simultaneously.
+    let _handshake_guard = if state.max_handshakes > 0 {
+        let prev = state
+            .active_handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev >= state.max_handshakes {
+            state
+                .active_handshakes
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // _conn_guard drops here, decrementing the connection counter.
+            return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending handshakes")
+                .into_response();
+        }
+        Some(AtomicGuard(Arc::clone(&state.active_handshakes)))
     } else {
         None
     };
@@ -145,6 +167,11 @@ pub async fn ws_handler(
             return (StatusCode::GATEWAY_TIMEOUT, "Authentication timed out").into_response();
         }
     };
+
+    // Handshake phase is over — release the handshake slot so it can be
+    // reused by other incoming connections. The connection slot (_conn_guard)
+    // remains held for the lifetime of the WebSocket session.
+    drop(_handshake_guard);
 
     // If the client used the Sec-WebSocket-Protocol subprotocol trick to pass
     // the JWT, we must echo "access_token" back or the browser will abort.
@@ -251,7 +278,7 @@ async fn handle_socket(
     state: RelayState,
     identity: Option<auth::ValidatedIdentity>,
     room: String,
-    _conn_guard: Option<ConnectionGuard>,
+    _conn_guard: Option<AtomicGuard>,
 ) {
     let session_id = match identity {
         Some(ref id) => id.did.clone(),
@@ -488,36 +515,16 @@ async fn handle_socket(
                 } else if let Err(mpsc::error::TrySendError::Full(_)) =
                     entry.value().tx.try_send(forwarded)
                 {
-                    // A full channel means the target peer's WebSocket write
-                    // side is stalled (e.g. mobile network pause, zombied
-                    // connection). Dropping signals silently would hard-fail
-                    // WebRTC negotiation (lost SDP answers are fatal), so
-                    // disconnect the zombie peer instead. Removing the entry
-                    // drops the sender, which ends their write task cleanly.
-                    let target_room = entry.value().room.clone();
-                    drop(entry);
+                    // The target's channel is full — their write side may be
+                    // stalled (e.g. mobile network pause). We drop the message
+                    // rather than disconnecting the target, because a malicious
+                    // sender could otherwise trivially evict any peer by
+                    // flooding 257 messages to fill the target's queue.
                     tracing::warn!(
                         target = %target_id,
                         sender = %session_id,
-                        "relay channel full, disconnecting stalled peer"
+                        "relay channel full for target, dropping signal (backpressure)"
                     );
-                    state_write.peers.remove(&target_id);
-
-                    // Broadcast PeerLeft so remaining peers in the room
-                    // tear down their WebRTC connections to the zombie.
-                    let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state_write
-                        .peers
-                        .iter()
-                        .filter(|e| e.value().room == target_room)
-                        .map(|e| e.value().tx.clone())
-                        .collect();
-                    for sender in leave_senders {
-                        let envelope = SignalEnvelope {
-                            peer_id: target_id.clone(),
-                            signal: SignalPayload::PeerLeft(target_id.clone()),
-                        };
-                        let _ = sender.try_send(envelope);
-                    }
                 }
             } else {
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");

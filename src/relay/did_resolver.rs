@@ -37,6 +37,7 @@ use p256::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Default cache TTL for resolved DID signing keys (5 minutes).
@@ -67,6 +68,16 @@ const MAX_CACHE_ENTRIES: u64 = 10_000;
 /// feeding unique `did:web` domains.
 const MAX_DOMAIN_CLIENTS: u64 = 100;
 
+/// Maximum number of DID document fetches allowed per `did:web` domain within
+/// [`DOMAIN_RATE_LIMIT_WINDOW`]. Prevents attackers from using unique DID paths
+/// (e.g. `did:web:victim.com:u:random1`, `did:web:victim.com:u:random2`) to
+/// bypass the per-DID negative cache and coalescing, turning the relay into a
+/// DDoS amplifier against the target domain.
+const DOMAIN_FETCH_RATE_LIMIT: u64 = 10;
+
+/// Time window for the per-domain fetch rate limit.
+const DOMAIN_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
 /// Resolves ATProto DIDs to their signing public keys.
 ///
 /// Fetches DID documents over HTTPS, extracts the `#atproto` verification
@@ -86,7 +97,7 @@ pub struct DidResolver {
     /// Caches failed DID resolutions to prevent repeated outbound requests
     /// for the same bad DID (DDoS reflection protection).
     negative_cache: Cache<String, String>,
-    /// Caches `reqwest::Client` instances keyed by did:web domain hostname.
+    /// Caches `reqwest::Client` instances keyed by did:web domain (host:port).
     /// Each client has DNS pinned to a validated (non-private) IP via
     /// `ClientBuilder::resolve`, which is a builder-level setting requiring a
     /// separate client. Caching avoids the heavy cost of constructing a new
@@ -94,6 +105,11 @@ pub struct DidResolver {
     /// Capped at [`MAX_DOMAIN_CLIENTS`] (100) — much lower than the key cache —
     /// because each client holds a connection pool and spawns background tasks.
     domain_clients: Cache<String, reqwest::Client>,
+    /// Per-domain fetch counter for rate limiting. Tracks how many DID document
+    /// fetches have been issued for each `did:web` domain within the TTL window.
+    /// Prevents attackers from bypassing the per-DID negative cache by generating
+    /// unique DID paths (e.g. `did:web:victim.com:u:random1`) to flood a target.
+    domain_fetch_counts: Cache<String, Arc<AtomicU64>>,
     plc_directory: String,
 }
 
@@ -251,6 +267,29 @@ fn is_link_local(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Extract the hostname portion of a domain string for DNS pinning.
+///
+/// Handles three forms:
+/// - Plain hostname or IPv4: `example.com` / `example.com:8443` → `example.com`
+/// - Bracketed IPv6 with port: `[2001:db8::1]:8443` → `[2001:db8::1]`
+/// - Bracketed IPv6 without port: `[2001:db8::1]` → `[2001:db8::1]`
+fn extract_hostname(domain: &str) -> String {
+    if domain.starts_with('[') {
+        // Bracketed IPv6 — take everything up to and including `]`.
+        match domain.find(']') {
+            Some(idx) => domain[..=idx].to_string(),
+            None => domain.to_string(), // malformed, pass through
+        }
+    } else {
+        // IPv4 or hostname — take everything before the first colon (port).
+        domain
+            .split(':')
+            .next()
+            .unwrap_or(domain)
+            .to_string()
+    }
+}
+
 impl DidResolver {
     /// Create a new resolver with default settings.
     pub fn new() -> Self {
@@ -275,11 +314,17 @@ impl DidResolver {
             .time_to_live(DEFAULT_CACHE_TTL)
             .build();
 
+        let domain_fetch_counts = Cache::builder()
+            .max_capacity(MAX_DOMAIN_CLIENTS)
+            .time_to_live(DOMAIN_RATE_LIMIT_WINDOW)
+            .build();
+
         Self {
             client,
             cache,
             negative_cache,
             domain_clients,
+            domain_fetch_counts,
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
         }
     }
@@ -355,10 +400,34 @@ impl DidResolver {
             let parts: Vec<&str> = raw.splitn(2, ':').collect();
             let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
             let validated_addr = validate_and_resolve_domain(&domain).await?;
-            let host_only = domain.split(':').next().unwrap_or(&domain).to_string();
+
+            // Extract hostname for DNS pinning. Bracketed IPv6 literals like
+            // `[2001:db8::1]:8443` must be handled specially — a naive
+            // `split(':').next()` would yield `[2001` instead of the full
+            // bracket expression.
+            let host_only = extract_hostname(&domain);
+
+            // Use the full domain (host + port) as the cache key so that
+            // `did:web:example.com%3A80` and `did:web:example.com` don't
+            // share a pinned client (which would poison TLS on port 80).
+            let cache_key = domain.clone();
+
+            // Per-domain rate limiting: prevent attackers from generating
+            // unique DID paths to flood a target domain with HTTP requests.
+            let counter = self
+                .domain_fetch_counts
+                .get_with(cache_key.clone(), || Arc::new(AtomicU64::new(0)));
+            let prev = counter.fetch_add(1, Ordering::Relaxed);
+            if prev >= DOMAIN_FETCH_RATE_LIMIT {
+                return Err(format!(
+                    "rate limit exceeded for did:web domain '{domain}' \
+                     ({DOMAIN_FETCH_RATE_LIMIT} fetches per {} seconds)",
+                    DOMAIN_RATE_LIMIT_WINDOW.as_secs()
+                ));
+            }
 
             // Check the domain client cache first.
-            let client = if let Some(cached) = self.domain_clients.get(&host_only) {
+            let client = if let Some(cached) = self.domain_clients.get(&cache_key) {
                 cached
             } else {
                 let pinned = reqwest::Client::builder()
@@ -367,7 +436,7 @@ impl DidResolver {
                     .resolve(&host_only, validated_addr)
                     .build()
                     .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;
-                self.domain_clients.insert(host_only, pinned.clone());
+                self.domain_clients.insert(cache_key, pinned.clone());
                 pinned
             };
             Some(client)
