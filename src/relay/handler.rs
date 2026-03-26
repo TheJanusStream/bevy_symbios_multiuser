@@ -42,6 +42,13 @@ const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 /// Prevents log exhaustion from attackers spamming malformed JSON.
 const MAX_INVALID_MESSAGES: usize = 10;
 
+/// Number of consecutive backpressure hits (channel-full drops) on the same
+/// target before the relay disconnects that target. A peer whose outbound
+/// queue stays full across many routing attempts is likely stalled (e.g.
+/// stopped reading their WebSocket) and is pinning memory without
+/// contributing to the mesh.
+const MAX_BACKPRESSURE_STRIKES: usize = 50;
+
 /// Maximum time a WebSocket connection may be idle (no messages received)
 /// before the server disconnects it. Prevents Slowloris-style attacks where
 /// an attacker opens `max_peers` connections and sends nothing, holding
@@ -414,6 +421,12 @@ async fn handle_socket(
     // that hold a slot without sending any data.
     let read_task = async {
         let mut invalid_count: usize = 0;
+        // Per-target backpressure strike counters. When a target's channel is
+        // full across many consecutive routing attempts, the target is likely
+        // stalled and pinning memory. After MAX_BACKPRESSURE_STRIKES hits we
+        // disconnect the stalled target to reclaim resources.
+        let mut backpressure_strikes: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws_rx.next()).await {
                 Ok(Some(Ok(msg))) => msg,
@@ -515,16 +528,30 @@ async fn handle_socket(
                 } else if let Err(mpsc::error::TrySendError::Full(_)) =
                     entry.value().tx.try_send(forwarded)
                 {
-                    // The target's channel is full — their write side may be
-                    // stalled (e.g. mobile network pause). We drop the message
-                    // rather than disconnecting the target, because a malicious
-                    // sender could otherwise trivially evict any peer by
-                    // flooding 257 messages to fill the target's queue.
+                    let strikes = backpressure_strikes
+                        .entry(target_id.clone())
+                        .or_insert(0);
+                    *strikes += 1;
                     tracing::warn!(
                         target = %target_id,
                         sender = %session_id,
+                        strikes = *strikes,
                         "relay channel full for target, dropping signal (backpressure)"
                     );
+                    if *strikes >= MAX_BACKPRESSURE_STRIKES {
+                        tracing::warn!(
+                            target = %target_id,
+                            "disconnecting stalled peer after {MAX_BACKPRESSURE_STRIKES} \
+                             consecutive backpressure hits"
+                        );
+                        // Remove the stalled peer — this closes their relay
+                        // channel, causing their write task to exit cleanly.
+                        drop(entry);
+                        state_write.peers.remove(&target_id);
+                    }
+                } else {
+                    // Successful send — reset strike counter for this target.
+                    backpressure_strikes.remove(&target_id);
                 }
             } else {
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");

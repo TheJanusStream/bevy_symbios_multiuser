@@ -73,7 +73,7 @@ const MAX_DOMAIN_CLIENTS: u64 = 100;
 /// (e.g. `did:web:victim.com:u:random1`, `did:web:victim.com:u:random2`) to
 /// bypass the per-DID negative cache and coalescing, turning the relay into a
 /// DDoS amplifier against the target domain.
-const DOMAIN_FETCH_RATE_LIMIT: u64 = 10;
+const DOMAIN_FETCH_RATE_LIMIT: u64 = 500;
 
 /// Time window for the per-domain fetch rate limit.
 const DOMAIN_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -113,12 +113,69 @@ pub struct DidResolver {
     plc_directory: String,
 }
 
+/// Split a `did:web` method-specific identifier into (domain, optional_path).
+///
+/// Handles bracketed IPv6 addresses: if `raw` starts with `[`, the domain
+/// extends through the closing `]` (and an optional `%3A`-encoded port),
+/// and only a colon *after* that bracket group is treated as a path separator.
+fn split_did_web_domain_path(raw: &str) -> Result<(&str, Option<&str>), String> {
+    if raw.starts_with('[') {
+        // Bracketed IPv6: find the closing `]`.
+        let bracket_end = raw
+            .find(']')
+            .ok_or_else(|| "did:web contains opening '[' with no closing ']'".to_string())?;
+        // After `]` there may be a percent-encoded port (`%3A8443` or `%3a8443`)
+        // before the first path-separator colon.
+        let after_bracket = &raw[bracket_end + 1..];
+        // Skip an optional percent-encoded port (e.g. `%3A8443`).
+        let rest = if let Some(stripped) = after_bracket
+            .strip_prefix("%3A")
+            .or_else(|| after_bracket.strip_prefix("%3a"))
+        {
+            // Consume digits (the port number), stop at the next colon or end.
+            let port_end = stripped
+                .find(':')
+                .map(|i| bracket_end + 1 + 3 + i) // 3 = len("%3A")
+                .unwrap_or(raw.len());
+            let domain = &raw[..port_end];
+            let path = if port_end < raw.len() {
+                Some(&raw[port_end + 1..]) // skip the ':'
+            } else {
+                None
+            };
+            return Ok((domain, path));
+        } else if after_bracket.starts_with(':') {
+            // Colon immediately after `]` — path separator.
+            let domain = &raw[..bracket_end + 1];
+            let path = Some(&raw[bracket_end + 2..]); // skip `]:`
+            return Ok((domain, path));
+        } else {
+            // Nothing after `]`, or unexpected characters — domain is the whole thing.
+            &raw[bracket_end + 1..]
+        };
+        if rest.is_empty() {
+            Ok((&raw[..], None))
+        } else {
+            Err(format!(
+                "unexpected characters after IPv6 bracket in did:web: '{raw}'"
+            ))
+        }
+    } else {
+        // Non-bracketed: first colon is the path separator.
+        match raw.find(':') {
+            Some(i) => Ok((&raw[..i], Some(&raw[i + 1..]))),
+            None => Ok((raw, None)),
+        }
+    }
+}
+
 /// Build the URL for fetching a DID document.
 ///
 /// Follows the W3C DID specification:
 /// - `did:plc:*` → `{plc_directory}/{did}`
 /// - `did:web:example.com` → `https://example.com/.well-known/did.json`
 /// - `did:web:example.com:u:alice` → `https://example.com/u/alice/did.json`
+/// - `did:web:[2001:db8::1]` → `https://[2001:db8::1]/.well-known/did.json`
 ///
 /// Percent-encoded port separators (`%3A`) in the domain are decoded.
 fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
@@ -126,14 +183,13 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
         Ok(format!("{}/{did}", plc_directory.trim_end_matches('/')))
     } else if did.starts_with("did:web:") {
         let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
-        // Split into domain (first segment) and optional path segments.
+        let (domain_raw, path_raw) = split_did_web_domain_path(raw)?;
         // Percent-decode %3A back to : for port numbers (e.g. example.com%3A8443).
-        let parts: Vec<&str> = raw.splitn(2, ':').collect();
-        let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
+        let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
 
-        if parts.len() > 1 {
+        if let Some(path_segments) = path_raw {
             // Path-based: did:web:example.com:u:alice → example.com/u/alice/did.json
-            let path = parts[1].replace(':', "/");
+            let path = path_segments.replace(':', "/");
             Ok(format!("https://{domain}/{path}/did.json"))
         } else {
             // Domain-only: did:web:example.com → example.com/.well-known/did.json
@@ -397,8 +453,8 @@ impl DidResolver {
         // create a bounded number of clients before eviction kicks in.
         let pinned_client = if did.starts_with("did:web:") {
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
-            let parts: Vec<&str> = raw.splitn(2, ':').collect();
-            let domain = parts[0].replace("%3A", ":").replace("%3a", ":");
+            let (domain_raw, _) = split_did_web_domain_path(raw)?;
+            let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
             let validated_addr = validate_and_resolve_domain(&domain).await?;
 
             // Extract hostname for DNS pinning. Bracketed IPv6 literals like
@@ -759,6 +815,46 @@ mod tests {
             err.contains("unsupported DID method"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── IPv6 did:web tests ─────────────────────────────────────────────
+
+    #[test]
+    fn did_web_ipv6_domain_only() {
+        let url =
+            did_document_url("did:web:[2001:db8::1]", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://[2001:db8::1]/.well-known/did.json");
+    }
+
+    #[test]
+    fn did_web_ipv6_with_path() {
+        let url =
+            did_document_url("did:web:[2001:db8::1]:u:alice", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://[2001:db8::1]/u/alice/did.json");
+    }
+
+    #[test]
+    fn did_web_ipv6_with_port() {
+        let url =
+            did_document_url("did:web:[2001:db8::1]%3A8443", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://[2001:db8::1]:8443/.well-known/did.json");
+    }
+
+    #[test]
+    fn did_web_ipv6_with_port_and_path() {
+        let url = did_document_url(
+            "did:web:[2001:db8::1]%3A8443:u:bob",
+            DEFAULT_PLC_DIRECTORY,
+        )
+        .unwrap();
+        assert_eq!(url, "https://[2001:db8::1]:8443/u/bob/did.json");
+    }
+
+    #[test]
+    fn did_web_ipv6_unclosed_bracket_errors() {
+        let result = did_document_url("did:web:[2001:db8::1", DEFAULT_PLC_DIRECTORY);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no closing ']'"));
     }
 
     // ── SSRF protection tests ─────────────────────────────────────────
