@@ -74,6 +74,10 @@ pub struct NetworkQueue<T: Serialize + DeserializeOwned + Send + Sync + 'static>
     incoming: VecDeque<NetworkReceived<T>>,
     /// Running total of `packet_size` for all queued messages.
     total_bytes: usize,
+    /// Whether a "queue full" warning has already been logged since the last
+    /// drain. Prevents an attacker from causing frame drops via synchronous
+    /// log I/O by flooding messages that hit the capacity check.
+    warned_full: bool,
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Default for NetworkQueue<T> {
@@ -81,6 +85,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Default for Networ
         Self {
             incoming: VecDeque::new(),
             total_bytes: 0,
+            warned_full: false,
         }
     }
 }
@@ -93,17 +98,23 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
     /// a flood of large messages.
     pub(crate) fn push(&mut self, msg: NetworkReceived<T>) {
         if self.incoming.len() >= MAX_NETWORK_QUEUE_LEN {
-            bevy::log::warn!(
-                "NetworkQueue full ({MAX_NETWORK_QUEUE_LEN} messages), dropping incoming message"
-            );
+            if !self.warned_full {
+                bevy::log::warn!(
+                    "NetworkQueue full ({MAX_NETWORK_QUEUE_LEN} messages), dropping incoming messages"
+                );
+                self.warned_full = true;
+            }
             return;
         }
         if self.total_bytes.saturating_add(msg.packet_size) > MAX_NETWORK_QUEUE_BYTES {
-            bevy::log::warn!(
-                total_bytes = self.total_bytes,
-                msg_bytes = msg.packet_size,
-                "NetworkQueue byte budget exceeded ({MAX_NETWORK_QUEUE_BYTES} bytes), dropping incoming message"
-            );
+            if !self.warned_full {
+                bevy::log::warn!(
+                    total_bytes = self.total_bytes,
+                    msg_bytes = msg.packet_size,
+                    "NetworkQueue byte budget exceeded ({MAX_NETWORK_QUEUE_BYTES} bytes), dropping incoming messages"
+                );
+                self.warned_full = true;
+            }
             return;
         }
         self.total_bytes += msg.packet_size;
@@ -118,6 +129,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
     /// orphaned elements in the deque with `total_bytes == 0`).
     pub fn drain(&mut self) -> impl Iterator<Item = NetworkReceived<T>> {
         self.total_bytes = 0;
+        self.warned_full = false;
         std::mem::take(&mut self.incoming).into_iter()
     }
 

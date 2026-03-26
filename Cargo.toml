@@ -31,11 +31,14 @@ uuid = { version = "1", features = ["v4", "v5", "serde"], optional = true }
 
 # Relay server dependencies
 axum = { version = "0.8", features = ["ws"], optional = true }
+tower-http = { version = "0.6", features = ["timeout"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
 dashmap = { version = "6", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 p256 = { version = "0.13", features = ["pkcs8"], optional = true }
+k256 = { version = "0.13", features = ["pkcs8", "ecdsa"], optional = true }
 bs58 = { version = "0.5", optional = true }
+base64 = { version = "0.22", optional = true }
 moka = { version = "0.12", default-features = false, features = ["sync", "future"], optional = true }
 
 # Native-only signaller transport
@@ -50,7 +53,7 @@ ws_stream_wasm = { version = "0.7", optional = true }
 default = ["client", "tls"]
 client = ["dep:reqwest", "dep:async-tungstenite", "dep:ws_stream_wasm", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
 tls = ["reqwest/rustls-tls", "async-tungstenite/async-tls"]
-relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "dep:p256", "dep:bs58", "dep:moka"]
+relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "dep:p256", "dep:k256", "dep:bs58", "dep:base64", "dep:moka", "dep:tower-http"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -506,15 +506,25 @@ async fn handle_socket(
 
             // Reject control signals from clients — only the relay may
             // originate PeerJoined/PeerLeft to prevent mesh spoofing.
+            // Counts toward the invalid message limit to prevent attackers
+            // from generating unlimited server-side log output.
             if matches!(
                 envelope.signal,
                 SignalPayload::PeerJoined(_) | SignalPayload::PeerLeft(_)
             ) {
+                invalid_count += 1;
                 tracing::warn!(
                     session = %session_id,
-                    signal = ?envelope.signal,
+                    count = invalid_count,
                     "dropping forged control signal from client"
                 );
+                if invalid_count >= MAX_INVALID_MESSAGES {
+                    tracing::warn!(
+                        session = %session_id,
+                        "disconnecting peer after {MAX_INVALID_MESSAGES} invalid messages"
+                    );
+                    break;
+                }
                 continue;
             }
 
@@ -570,31 +580,44 @@ async fn handle_socket(
                         target = %target_id,
                         "dropping cross-room signal"
                     );
-                } else if let Err(mpsc::error::TrySendError::Full(_)) =
-                    entry.value().tx.try_send(forwarded)
-                {
-                    let strikes = backpressure_strikes.entry(target_id.clone()).or_insert(0);
-                    *strikes += 1;
-                    tracing::warn!(
-                        target = %target_id,
-                        sender = %session_id,
-                        strikes = *strikes,
-                        "relay channel full for target, dropping signal (backpressure)"
-                    );
-                    if *strikes >= MAX_BACKPRESSURE_STRIKES {
-                        tracing::warn!(
-                            target = %target_id,
-                            sender = %session_id,
-                            "giving up on target after {MAX_BACKPRESSURE_STRIKES} \
-                             consecutive backpressure hits (will drop future messages)"
-                        );
-                        // Don't remove the target — that would let a malicious
-                        // sender kick other peers. Stalled peers will be reaped
-                        // by WS_IDLE_TIMEOUT. We just stop trying from this sender.
-                    }
                 } else {
-                    // Successful send — reset strike counter for this target.
-                    backpressure_strikes.remove(&target_id);
+                    match entry.value().tx.try_send(forwarded) {
+                        Ok(()) => {
+                            // Successful send — reset strike counter for this target.
+                            backpressure_strikes.remove(&target_id);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            let strikes =
+                                backpressure_strikes.entry(target_id.clone()).or_insert(0);
+                            *strikes += 1;
+                            tracing::warn!(
+                                target = %target_id,
+                                sender = %session_id,
+                                strikes = *strikes,
+                                "relay channel full for target, dropping signal (backpressure)"
+                            );
+                            if *strikes >= MAX_BACKPRESSURE_STRIKES {
+                                tracing::warn!(
+                                    target = %target_id,
+                                    sender = %session_id,
+                                    "giving up on target after {MAX_BACKPRESSURE_STRIKES} \
+                                     consecutive backpressure hits (will drop future messages)"
+                                );
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // Target peer disconnected but hasn't been cleaned
+                            // up from the DashMap yet. Stop trying to deliver;
+                            // the stale entry will be removed when its connection
+                            // task finishes cleanup.
+                            tracing::debug!(
+                                target = %target_id,
+                                "target channel closed, skipping future deliveries"
+                            );
+                            backpressure_strikes
+                                .insert(target_id.clone(), MAX_BACKPRESSURE_STRIKES);
+                        }
+                    }
                 }
             } else {
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");

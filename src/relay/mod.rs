@@ -20,9 +20,9 @@
 //! The relay resolves the issuer's DID document (via `plc.directory` for
 //! `did:plc`, or HTTPS for `did:web` — domain-only DIDs use
 //! `/.well-known/did.json`, path-based DIDs like `did:web:example.com:u:alice`
-//! use `/{path}/did.json`), extracts the `#atproto` P-256 signing key, and
-//! cryptographically verifies the JWT's ES256 signature. Resolved keys are
-//! cached in memory with a 5-minute TTL.
+//! use `/{path}/did.json`), extracts the `#atproto` signing key (P-256/ES256
+//! or secp256k1/ES256K), and cryptographically verifies the JWT signature.
+//! Resolved keys are cached in memory with a 5-minute TTL.
 //! The authenticated DID becomes the peer's session identity.
 //!
 //! When `auth_required` is `false` (the default), authentication is
@@ -63,9 +63,9 @@
 //!   tarpit the HTTP fetch.
 //! - **Self-targeting rejection** — SDP offers/answers addressed to the sender's
 //!   own session ID are dropped, preventing pointless self-negotiation loops.
-//! - **Invalid message disconnect** — Peers that send 10 consecutive invalid
-//!   messages (malformed JSON, binary frames) are disconnected, preventing log
-//!   exhaustion attacks.
+//! - **Invalid message disconnect** — Peers that send 10 cumulative invalid
+//!   messages (malformed JSON, binary frames, forged control signals) are
+//!   disconnected, preventing log exhaustion attacks.
 //! - **Negative DID cache** — Failed DID resolutions are cached for 60 seconds,
 //!   preventing attackers from using the relay as a DDoS reflector by spamming
 //!   handshakes with the same DID pointing at a victim server.
@@ -84,11 +84,12 @@
 //! - **Backpressure** — When the per-peer relay channel (256 slots)
 //!   is full, signals are dropped and logged. Each sender tracks per-target
 //!   strike counters independently. If a sender accumulates 50 consecutive
-//!   backpressure strikes against the same target, the relay disconnects
-//!   that target — it is likely stalled (e.g. stopped reading its WebSocket)
-//!   and is pinning memory without contributing to the mesh. Successful sends
-//!   reset the strike counter, so live peers that are merely slow will not be
-//!   evicted.
+//!   backpressure strikes against the same target, the sender silently stops
+//!   delivering to that target for the remainder of the connection. Stalled
+//!   peers are reaped by the idle timeout rather than by sender-driven eviction,
+//!   preventing a malicious sender from kicking arbitrary targets by flooding
+//!   their channel. Successful sends reset the strike counter, so live peers
+//!   that are merely slow will not be affected.
 //! - **Handshake slot budget** — At most `max_peers / 4` connections may be
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
@@ -99,15 +100,15 @@
 //!   second (SDP offer, answer, a few ICE candidates per peer), so the limit
 //!   is generous for normal use while preventing flood attacks that could
 //!   trigger backpressure eviction of other peers.
-//! - **Per-domain DID fetch rate limiting** — Each `did:web` domain is limited
-//!   to 500 DID document fetches per 60 seconds, preventing attackers from
-//!   bypassing the per-DID negative cache with unique path segments to use
-//!   the relay as a DDoS amplifier.
-//! - **Global `did:web` fetch rate limiting** — Total `did:web` document fetches
-//!   across all domains are capped at 1000 per 60 seconds. This prevents
-//!   subdomain spraying attacks where an attacker creates thousands of unique
-//!   subdomains to bypass the per-domain rate limit and exhaust the Tokio
-//!   blocking thread pool with DNS resolution calls.
+//! - **Per-domain DID fetch concurrency limit** — Each `did:web` domain is
+//!   limited to 10 concurrent in-flight fetches. Slots are released as soon as
+//!   each fetch completes (via RAII guard), so attacker requests that fail
+//!   quickly cannot permanently exhaust the budget for legitimate users.
+//! - **Global `did:web` fetch concurrency limit** — Total concurrent `did:web`
+//!   fetches across all domains are capped at 50. This prevents subdomain
+//!   spraying attacks from exhausting the Tokio blocking thread pool with DNS
+//!   resolution calls. Like the per-domain limit, slots are freed on
+//!   completion, making the limit resistant to unauthenticated DoS.
 //!
 //! # Usage
 //!
@@ -229,9 +230,20 @@ pub async fn run_relay(config: RelayConfig) -> Result<(), Box<dyn std::error::Er
 
     // Accept WebSocket upgrades on any path so clients can use room-based
     // URLs (e.g. `/my_room`) as well as the canonical `/ws` endpoint.
+    //
+    // The tower-http TimeoutLayer wraps the entire HTTP service so that
+    // connections which have not completed the HTTP request (including header
+    // parsing and WebSocket upgrade) within 10 seconds are dropped. This
+    // mitigates Slowloris-style attacks where an attacker trickles HTTP
+    // headers slowly, holding TCP connections without ever reaching the
+    // WebSocket handler or its idle timeout logic.
     let app = axum::Router::new()
         .fallback(axum::routing::get(handler::ws_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            std::time::Duration::from_secs(10),
+        ));
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(

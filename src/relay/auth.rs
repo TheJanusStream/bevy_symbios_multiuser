@@ -16,7 +16,7 @@
 //! Callers must ensure a resolver is available before calling
 //! [`validate_atproto_jwt`] — unverified JWTs are never trusted for identity.
 
-use super::did_resolver::DidResolver;
+use super::did_resolver::{DidResolver, ResolvedKey};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 
@@ -67,8 +67,8 @@ pub async fn validate_atproto_jwt(
     }
 
     // Step 2–3: Verify the signature against the DID document key.
-    let key = resolver.resolve_key(did).await?;
-    verify_signature(token, &key)?;
+    let resolved = resolver.resolve_key(did).await?;
+    verify_signature(token, &resolved)?;
     tracing::debug!(did = %did, "JWT signature verified via DID document");
 
     Ok(ValidatedIdentity { did: did.clone() })
@@ -103,13 +103,64 @@ fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
 }
 
 /// Verify the JWT signature against a resolved public key.
-fn verify_signature(token: &str, key: &DecodingKey) -> Result<(), String> {
-    let mut validation = Validation::new(Algorithm::ES256);
-    validation.validate_exp = true;
-    validation.validate_aud = false;
+///
+/// P-256 keys are verified via `jsonwebtoken`'s built-in ES256 support.
+/// K-256 (secp256k1) keys are verified manually since `jsonwebtoken` does
+/// not support ES256K: the JWT signing input is hashed with SHA-256 and
+/// the ECDSA signature is verified using `k256::ecdsa`.
+fn verify_signature(token: &str, resolved: &ResolvedKey) -> Result<(), String> {
+    match resolved {
+        ResolvedKey::P256(key) => {
+            let mut validation = Validation::new(Algorithm::ES256);
+            validation.validate_exp = true;
+            validation.validate_aud = false;
+            decode::<AtprotoClaims>(token, key, &validation)
+                .map_err(|e| format!("JWT signature verification failed: {e}"))?;
+            Ok(())
+        }
+        ResolvedKey::K256(public_key) => verify_es256k(token, public_key),
+    }
+}
 
-    decode::<AtprotoClaims>(token, key, &validation)
-        .map_err(|e| format!("JWT signature verification failed: {e}"))?;
+/// Manually verify an ES256K JWT signature using the `k256` crate.
+///
+/// ES256K uses ECDSA with SHA-256 over the secp256k1 curve. The JWT's
+/// signing input (`header.payload`) is hashed and the base64url-decoded
+/// signature (r || s, 64 bytes) is verified against the public key.
+fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String> {
+    use k256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+    // Split into header.payload and signature
+    let parts: Vec<&str> = token.rsplitn(2, '.').collect();
+    if parts.len() != 2 {
+        return Err("malformed JWT: expected header.payload.signature".to_string());
+    }
+    let sig_b64 = parts[0];
+    let signing_input = parts[1]; // "header.payload"
+
+    // Decode the signature (base64url, no padding)
+    use base64::Engine;
+    let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|e| format!("JWT signature base64 decode failed: {e}"))?;
+
+    let signature =
+        Signature::from_slice(&sig_bytes).map_err(|e| format!("invalid ES256K signature: {e}"))?;
+
+    let verifying_key = VerifyingKey::from(public_key);
+    verifying_key
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|e| format!("ES256K signature verification failed: {e}"))?;
+
+    // Also validate expiry by decoding claims (without sig check)
+    let claims = decode_claims(token)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system time error: {e}"))?
+        .as_secs();
+    if claims.exp < now {
+        return Err("JWT has expired".to_string());
+    }
 
     Ok(())
 }
@@ -187,7 +238,7 @@ mod tests {
         let token = sign_test_jwt("did:plc:testuser", &secret);
         let decoding_key = decoding_key_from_p256(&secret.public_key());
 
-        let result = verify_signature(&token, &decoding_key);
+        let result = verify_signature(&token, &ResolvedKey::P256(decoding_key));
         assert!(
             result.is_ok(),
             "verify_signature failed: {:?}",
@@ -210,7 +261,7 @@ mod tests {
 
         let wrong_key = decoding_key_from_p256(&wrong_secret.public_key());
 
-        let result = verify_signature(&token, &wrong_key);
+        let result = verify_signature(&token, &ResolvedKey::P256(wrong_key));
         assert!(result.is_err());
         assert!(
             result

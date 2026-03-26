@@ -48,10 +48,17 @@ pub fn poll_peers(mut socket: ResMut<MatchboxSocket>, mut peer_queue: ResMut<Pee
 
 /// Drains incoming data from all channels, deserializes from `bincode`,
 /// and pushes [`NetworkReceived<T>`] entries to the [`NetworkQueue<T>`] resource.
+/// Maximum number of deserialization failures logged at `warn` level per
+/// invocation of [`receive_messages`]. After this many warnings, further
+/// failures are logged at `trace` to prevent an attacker from causing frame
+/// drops via synchronous log I/O on the game thread.
+const MAX_DESER_WARNS_PER_FRAME: usize = 3;
+
 pub fn receive_messages<T>(mut socket: ResMut<MatchboxSocket>, mut queue: ResMut<NetworkQueue<T>>)
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
+    let mut deser_warn_count: usize = 0;
     for channel_kind in [ChannelKind::Reliable, ChannelKind::Unreliable] {
         let channel_idx = channel_kind.index();
         let channel = match socket.get_channel_mut(channel_idx) {
@@ -76,11 +83,20 @@ where
                     });
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        sender = %peer,
-                        error = %err,
-                        "failed to deserialize incoming message"
-                    );
+                    deser_warn_count += 1;
+                    if deser_warn_count <= MAX_DESER_WARNS_PER_FRAME {
+                        tracing::warn!(
+                            sender = %peer,
+                            error = %err,
+                            "failed to deserialize incoming message"
+                        );
+                    } else {
+                        tracing::trace!(
+                            sender = %peer,
+                            error = %err,
+                            "failed to deserialize incoming message (suppressed)"
+                        );
+                    }
                 }
             }
         }

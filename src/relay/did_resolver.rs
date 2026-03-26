@@ -68,22 +68,36 @@ const MAX_CACHE_ENTRIES: u64 = 10_000;
 /// feeding unique `did:web` domains.
 const MAX_DOMAIN_CLIENTS: u64 = 100;
 
-/// Maximum number of DID document fetches allowed per `did:web` domain within
-/// [`DOMAIN_RATE_LIMIT_WINDOW`]. Prevents attackers from using unique DID paths
+/// Maximum number of concurrent in-flight DID document fetches for a single
+/// `did:web` domain. Prevents attackers from using unique DID paths
 /// (e.g. `did:web:victim.com:u:random1`, `did:web:victim.com:u:random2`) to
 /// bypass the per-DID negative cache and coalescing, turning the relay into a
-/// DDoS amplifier against the target domain.
-const DOMAIN_FETCH_RATE_LIMIT: u64 = 500;
+/// DDoS amplifier against the target domain. Unlike a cumulative rate limit,
+/// a concurrency limit naturally frees slots as requests complete (or fail),
+/// so attacker traffic cannot permanently exhaust the budget for legitimate users.
+const DOMAIN_FETCH_CONCURRENCY_LIMIT: u64 = 10;
 
-/// Time window for the per-domain fetch rate limit.
-const DOMAIN_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// Maximum number of concurrent in-flight `did:web` document fetches across
+/// ALL domains. Prevents subdomain spraying attacks where an attacker creates
+/// thousands of unique subdomains (e.g. `did:web:1.evil.com`,
+/// `did:web:2.evil.com`) to exhaust the Tokio blocking thread pool with
+/// `getaddrinfo` calls. Slots are released as soon as each fetch completes
+/// (success or failure), so transient attacker traffic cannot lock out
+/// legitimate users.
+const GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT: u64 = 50;
 
-/// Maximum total `did:web` document fetches across ALL domains within
-/// [`DOMAIN_RATE_LIMIT_WINDOW`]. Prevents subdomain spraying attacks where an
-/// attacker creates thousands of unique subdomains (e.g. `did:web:1.evil.com`,
-/// `did:web:2.evil.com`) to bypass the per-domain rate limit and exhaust the
-/// Tokio blocking thread pool with `getaddrinfo` calls.
-const GLOBAL_DIDWEB_FETCH_RATE_LIMIT: u64 = 1000;
+/// A resolved signing key with its verification strategy.
+///
+/// P-256 keys use `jsonwebtoken`'s built-in ES256 verification.
+/// K-256 (secp256k1) keys use manual ECDSA verification via the `k256` crate,
+/// since `jsonwebtoken` does not support ES256K.
+#[derive(Clone)]
+pub enum ResolvedKey {
+    /// P-256 (ES256) — verified via `jsonwebtoken`.
+    P256(DecodingKey),
+    /// secp256k1 (ES256K) — verified manually via `k256::ecdsa`.
+    K256(k256::PublicKey),
+}
 
 /// Resolves ATProto DIDs to their signing public keys.
 ///
@@ -100,7 +114,7 @@ pub struct DidResolver {
     /// simultaneously, only one outbound fetch is issued and all waiters
     /// share the result. This prevents the relay from acting as a DDoS
     /// amplifier against DID hosting servers.
-    cache: moka::future::Cache<String, DecodingKey>,
+    cache: moka::future::Cache<String, ResolvedKey>,
     /// Caches failed DID resolutions to prevent repeated outbound requests
     /// for the same bad DID (DDoS reflection protection).
     negative_cache: Cache<String, String>,
@@ -112,15 +126,18 @@ pub struct DidResolver {
     /// Capped at [`MAX_DOMAIN_CLIENTS`] (100) — much lower than the key cache —
     /// because each client holds a connection pool and spawns background tasks.
     domain_clients: Cache<String, reqwest::Client>,
-    /// Per-domain fetch counter for rate limiting. Tracks how many DID document
-    /// fetches have been issued for each `did:web` domain within the TTL window.
-    /// Prevents attackers from bypassing the per-DID negative cache by generating
-    /// unique DID paths (e.g. `did:web:victim.com:u:random1`) to flood a target.
+    /// Per-domain in-flight fetch counter. Tracks how many DID document fetches
+    /// are currently in progress for each `did:web` domain. The counter is
+    /// incremented before and decremented after each fetch (via RAII guard),
+    /// so it reflects concurrent load rather than cumulative requests. This
+    /// prevents attackers from permanently exhausting a domain's budget with
+    /// fake requests that fail quickly.
     domain_fetch_counts: Cache<String, Arc<AtomicU64>>,
-    /// Global `did:web` fetch counter across all domains. Works alongside the
-    /// per-domain counter to cap total outbound DNS + HTTP activity, preventing
-    /// subdomain spraying from exhausting the blocking thread pool.
-    global_didweb_fetch_count: Cache<(), Arc<AtomicU64>>,
+    /// Global in-flight `did:web` fetch counter across all domains. Incremented
+    /// before and decremented after each fetch (via RAII guard). Works alongside
+    /// the per-domain counter to cap concurrent outbound DNS + HTTP activity,
+    /// preventing subdomain spraying from exhausting the blocking thread pool.
+    global_didweb_fetch_count: Arc<AtomicU64>,
     plc_directory: String,
 }
 
@@ -379,13 +396,10 @@ impl DidResolver {
 
         let domain_fetch_counts = Cache::builder()
             .max_capacity(MAX_DOMAIN_CLIENTS)
-            .time_to_live(DOMAIN_RATE_LIMIT_WINDOW)
+            .time_to_live(DEFAULT_CACHE_TTL)
             .build();
 
-        let global_didweb_fetch_count = Cache::builder()
-            .max_capacity(1)
-            .time_to_live(DOMAIN_RATE_LIMIT_WINDOW)
-            .build();
+        let global_didweb_fetch_count = Arc::new(AtomicU64::new(0));
 
         Self {
             client,
@@ -406,7 +420,7 @@ impl DidResolver {
         resolver
     }
 
-    /// Resolve the signing [`DecodingKey`] for a DID.
+    /// Resolve the signing key and algorithm for a DID.
     ///
     /// Returns a cached key if available and not expired, otherwise fetches
     /// the DID document from the network. Concurrent requests for the same
@@ -414,7 +428,7 @@ impl DidResolver {
     /// outbound fetch is issued and all waiters share the result.
     ///
     /// The moka cache handles TTL expiry and W-TinyLFU eviction automatically.
-    pub async fn resolve_key(&self, did: &str) -> Result<DecodingKey, String> {
+    pub async fn resolve_key(&self, did: &str) -> Result<ResolvedKey, String> {
         // Reject DIDs that recently failed resolution to prevent repeated
         // outbound requests (DDoS reflection / resource exhaustion).
         if let Some(cached_err) = self.negative_cache.get(did) {
@@ -464,19 +478,28 @@ impl DidResolver {
         // workers) on every cache-miss fetch. The domain_clients cache is
         // bounded and TTL'd so an attacker spamming unique domains can only
         // create a bounded number of clients before eviction kicks in.
+        // RAII guard that decrements an AtomicU64 on drop, ensuring concurrency
+        // counters are always released even on early returns or panics.
+        struct ConcurrencyGuard(Arc<AtomicU64>);
+        impl Drop for ConcurrencyGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
         let pinned_client = if did.starts_with("did:web:") {
-            // Global did:web rate limit: cap total outbound DNS + HTTP activity
-            // across ALL domains. Prevents subdomain spraying attacks from
-            // exhausting the Tokio blocking thread pool with getaddrinfo calls.
-            let global_counter = self
+            // Global concurrency limit: cap concurrent outbound DNS + HTTP
+            // activity across ALL did:web domains. Slots are released as soon
+            // as each fetch completes, so attacker traffic that fails quickly
+            // cannot permanently exhaust the budget for legitimate users.
+            let global_prev = self
                 .global_didweb_fetch_count
-                .get_with((), || Arc::new(AtomicU64::new(0)));
-            let global_prev = global_counter.fetch_add(1, Ordering::Relaxed);
-            if global_prev >= GLOBAL_DIDWEB_FETCH_RATE_LIMIT {
+                .fetch_add(1, Ordering::Relaxed);
+            let _global_guard = ConcurrencyGuard(Arc::clone(&self.global_didweb_fetch_count));
+            if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
                 return Err(format!(
-                    "global did:web rate limit exceeded \
-                     ({GLOBAL_DIDWEB_FETCH_RATE_LIMIT} fetches per {} seconds)",
-                    DOMAIN_RATE_LIMIT_WINDOW.as_secs()
+                    "global did:web concurrency limit exceeded \
+                     ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
                 ));
             }
 
@@ -496,17 +519,18 @@ impl DidResolver {
             // share a pinned client (which would poison TLS on port 80).
             let cache_key = domain.clone();
 
-            // Per-domain rate limiting: prevent attackers from generating
-            // unique DID paths to flood a target domain with HTTP requests.
+            // Per-domain concurrency limit: prevent attackers from generating
+            // unique DID paths to flood a target domain with concurrent HTTP
+            // requests. Slots are released on fetch completion (via RAII guard).
             let counter = self
                 .domain_fetch_counts
                 .get_with(cache_key.clone(), || Arc::new(AtomicU64::new(0)));
-            let prev = counter.fetch_add(1, Ordering::Relaxed);
-            if prev >= DOMAIN_FETCH_RATE_LIMIT {
+            let domain_prev = counter.fetch_add(1, Ordering::Relaxed);
+            let _domain_guard = ConcurrencyGuard(counter);
+            if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
                 return Err(format!(
-                    "rate limit exceeded for did:web domain '{domain}' \
-                     ({DOMAIN_FETCH_RATE_LIMIT} fetches per {} seconds)",
-                    DOMAIN_RATE_LIMIT_WINDOW.as_secs()
+                    "concurrency limit exceeded for did:web domain '{domain}' \
+                     ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
                 ));
             }
 
@@ -606,8 +630,11 @@ const P256_MULTICODEC: [u8; 2] = [0x80, 0x24];
 const K256_MULTICODEC: [u8; 2] = [0xe7, 0x01];
 
 /// Extract the `#atproto` signing key from a DID document and convert it
-/// to a [`DecodingKey`] suitable for `jsonwebtoken` ES256 verification.
-fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
+/// to a [`ResolvedKey`] suitable for `jsonwebtoken` verification.
+///
+/// Supports both P-256 (ES256) and secp256k1 (ES256K) keys, as the ATProto
+/// specification permits either curve for `did:plc` identities.
+fn extract_signing_key(doc: &DidDocument) -> Result<ResolvedKey, String> {
     let methods = doc
         .verification_method
         .as_ref()
@@ -661,11 +688,7 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
     if prefix == P256_MULTICODEC {
         decode_p256_key(key_bytes)
     } else if prefix == K256_MULTICODEC {
-        Err(
-            "secp256k1 (K-256) signing keys are not yet supported for JWT verification; \
-             only P-256 (ES256) keys are handled"
-                .to_string(),
-        )
+        decode_k256_key(key_bytes)
     } else {
         Err(format!(
             "unknown multicodec prefix: [{:#04x}, {:#04x}]",
@@ -674,8 +697,8 @@ fn extract_signing_key(doc: &DidDocument) -> Result<DecodingKey, String> {
     }
 }
 
-/// Decode a compressed P-256 public key into a [`DecodingKey`].
-fn decode_p256_key(compressed: &[u8]) -> Result<DecodingKey, String> {
+/// Decode a compressed P-256 public key into a [`ResolvedKey`] for ES256.
+fn decode_p256_key(compressed: &[u8]) -> Result<ResolvedKey, String> {
     let public_key = p256::PublicKey::from_sec1_bytes(compressed)
         .map_err(|e| format!("invalid P-256 public key: {e}"))?;
 
@@ -683,8 +706,18 @@ fn decode_p256_key(compressed: &[u8]) -> Result<DecodingKey, String> {
         .to_public_key_pem(LineEnding::LF)
         .map_err(|e| format!("P-256 PEM encoding failed: {e}"))?;
 
-    DecodingKey::from_ec_pem(pem.as_bytes())
-        .map_err(|e| format!("failed to create DecodingKey from P-256 PEM: {e}"))
+    let key = DecodingKey::from_ec_pem(pem.as_bytes())
+        .map_err(|e| format!("failed to create DecodingKey from P-256 PEM: {e}"))?;
+
+    Ok(ResolvedKey::P256(key))
+}
+
+/// Decode a compressed secp256k1 public key into a [`ResolvedKey`] for ES256K.
+fn decode_k256_key(compressed: &[u8]) -> Result<ResolvedKey, String> {
+    let public_key = k256::PublicKey::from_sec1_bytes(compressed)
+        .map_err(|e| format!("invalid secp256k1 public key: {e}"))?;
+
+    Ok(ResolvedKey::K256(public_key))
 }
 
 #[cfg(test)]
@@ -716,7 +749,30 @@ mod tests {
         format!("z{encoded}")
     }
 
-    fn assert_err_contains(result: Result<DecodingKey, String>, needle: &str) {
+    /// A known K-256 (secp256k1) compressed public key, wrapped in multicodec
+    /// + multibase for round-trip testing.
+    fn make_test_k256_multibase_key() -> String {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let secret = k256::SecretKey::from_slice(&[
+            0x9f, 0x86, 0xd0, 0x81, 0x88, 0x4c, 0x7d, 0x65, 0x9a, 0x2f, 0xea, 0xa0, 0xc5, 0x5a,
+            0xd0, 0x15, 0xa3, 0xbf, 0x4f, 0x1b, 0x2b, 0x0b, 0x82, 0x2c, 0xd1, 0x5d, 0x6c, 0x15,
+            0xb0, 0xf0, 0x0a, 0x08,
+        ])
+        .expect("valid test key");
+        let public = secret.public_key();
+        let point = public.to_encoded_point(true);
+        let compressed = point.as_bytes();
+
+        let mut prefixed = Vec::with_capacity(2 + compressed.len());
+        prefixed.extend_from_slice(&K256_MULTICODEC);
+        prefixed.extend_from_slice(compressed);
+        let encoded = bs58::encode(&prefixed).into_string();
+
+        format!("z{encoded}")
+    }
+
+    fn assert_err_contains(result: Result<ResolvedKey, String>, needle: &str) {
         match result {
             Err(e) => assert!(e.contains(needle), "unexpected error: {e}"),
             Ok(_) => panic!("expected error containing '{needle}', got Ok"),
@@ -737,6 +793,7 @@ mod tests {
 
         let result = extract_signing_key(&doc);
         assert!(result.is_ok(), "failed to extract key: {:?}", result.err());
+        assert!(matches!(result.unwrap(), ResolvedKey::P256(_)));
     }
 
     #[test]
@@ -753,22 +810,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_k256_key_with_clear_message() {
-        // Build a fake K-256 multibase key (wrong codec for our verifier).
-        let mut prefixed = Vec::new();
-        prefixed.extend_from_slice(&K256_MULTICODEC);
-        prefixed.extend_from_slice(&[0x02; 33]); // fake compressed point
-        let encoded = format!("z{}", bs58::encode(&prefixed).into_string());
+    fn extracts_k256_key_from_did_document() {
+        let multibase_key = make_test_k256_multibase_key();
 
         let doc = DidDocument {
             verification_method: Some(vec![VerificationMethod {
                 id: "did:plc:test#atproto".to_string(),
                 key_type: "Multikey".to_string(),
-                public_key_multibase: Some(encoded),
+                public_key_multibase: Some(multibase_key),
             }]),
         };
 
-        assert_err_contains(extract_signing_key(&doc), "secp256k1");
+        let result = extract_signing_key(&doc);
+        assert!(
+            result.is_ok(),
+            "failed to extract K-256 key: {:?}",
+            result.err()
+        );
+        assert!(matches!(result.unwrap(), ResolvedKey::K256(_)));
     }
 
     #[test]
