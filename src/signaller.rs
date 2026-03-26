@@ -142,10 +142,7 @@ impl SymbiosSignallerBuilder {
     /// over the static `access_jwt`.
     fn current_token(&self) -> Option<String> {
         if let Some(source) = &self.token_source {
-            source
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
+            source.read().unwrap_or_else(|e| e.into_inner()).clone()
         } else {
             self.access_jwt.clone()
         }

@@ -155,7 +155,10 @@ pub async fn ws_handler(
                 .active_handshakes
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             // _conn_guard drops here, decrementing the connection counter.
-            return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending handshakes")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many pending handshakes",
+            )
                 .into_response();
         }
         Some(AtomicGuard(Arc::clone(&state.active_handshakes)))
@@ -555,9 +558,7 @@ async fn handle_socket(
                 } else if let Err(mpsc::error::TrySendError::Full(_)) =
                     entry.value().tx.try_send(forwarded)
                 {
-                    let strikes = backpressure_strikes
-                        .entry(target_id.clone())
-                        .or_insert(0);
+                    let strikes = backpressure_strikes.entry(target_id.clone()).or_insert(0);
                     *strikes += 1;
                     tracing::warn!(
                         target = %target_id,

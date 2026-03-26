@@ -349,11 +349,7 @@ fn extract_hostname(domain: &str) -> String {
         }
     } else {
         // IPv4 or hostname — take everything before the first colon (port).
-        domain
-            .split(':')
-            .next()
-            .unwrap_or(domain)
-            .to_string()
+        domain.split(':').next().unwrap_or(domain).to_string()
     }
 }
 
@@ -853,32 +849,26 @@ mod tests {
 
     #[test]
     fn did_web_ipv6_domain_only() {
-        let url =
-            did_document_url("did:web:[2001:db8::1]", DEFAULT_PLC_DIRECTORY).unwrap();
+        let url = did_document_url("did:web:[2001:db8::1]", DEFAULT_PLC_DIRECTORY).unwrap();
         assert_eq!(url, "https://[2001:db8::1]/.well-known/did.json");
     }
 
     #[test]
     fn did_web_ipv6_with_path() {
-        let url =
-            did_document_url("did:web:[2001:db8::1]:u:alice", DEFAULT_PLC_DIRECTORY).unwrap();
+        let url = did_document_url("did:web:[2001:db8::1]:u:alice", DEFAULT_PLC_DIRECTORY).unwrap();
         assert_eq!(url, "https://[2001:db8::1]/u/alice/did.json");
     }
 
     #[test]
     fn did_web_ipv6_with_port() {
-        let url =
-            did_document_url("did:web:[2001:db8::1]%3A8443", DEFAULT_PLC_DIRECTORY).unwrap();
+        let url = did_document_url("did:web:[2001:db8::1]%3A8443", DEFAULT_PLC_DIRECTORY).unwrap();
         assert_eq!(url, "https://[2001:db8::1]:8443/.well-known/did.json");
     }
 
     #[test]
     fn did_web_ipv6_with_port_and_path() {
-        let url = did_document_url(
-            "did:web:[2001:db8::1]%3A8443:u:bob",
-            DEFAULT_PLC_DIRECTORY,
-        )
-        .unwrap();
+        let url =
+            did_document_url("did:web:[2001:db8::1]%3A8443:u:bob", DEFAULT_PLC_DIRECTORY).unwrap();
         assert_eq!(url, "https://[2001:db8::1]:8443/u/bob/did.json");
     }
 
@@ -998,6 +988,9 @@ mod tests {
             err.contains("unsupported multibase prefix"),
             "unexpected error: {err}"
         );
-        assert!(err.contains('\u{1F680}'), "error should include the actual prefix char");
+        assert!(
+            err.contains('\u{1F680}'),
+            "error should include the actual prefix char"
+        );
     }
 }
