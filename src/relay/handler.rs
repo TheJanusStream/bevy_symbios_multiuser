@@ -38,15 +38,16 @@ const RELAY_CHANNEL_CAPACITY: usize = 256;
 /// SDP offers/answers and ICE candidates are typically a few KiB at most.
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Number of consecutive invalid messages before disconnecting a peer.
-/// Prevents log exhaustion from attackers spamming malformed JSON.
+/// Total number of invalid messages (cumulative, not consecutive) before
+/// disconnecting a peer. Not reset on valid messages to prevent attackers
+/// from alternating valid/invalid messages to avoid the limit.
 const MAX_INVALID_MESSAGES: usize = 10;
 
 /// Number of consecutive backpressure hits (channel-full drops) on the same
-/// target before the relay disconnects that target. A peer whose outbound
-/// queue stays full across many routing attempts is likely stalled (e.g.
-/// stopped reading their WebSocket) and is pinning memory without
-/// contributing to the mesh.
+/// target before the sender stops attempting delivery to that target for
+/// the remainder of this connection. Truly stalled peers are reaped by
+/// WS_IDLE_TIMEOUT rather than by sender-driven eviction, which would allow
+/// a malicious sender to kick arbitrary targets by flooding their channel.
 const MAX_BACKPRESSURE_STRIKES: usize = 50;
 
 /// Maximum time a WebSocket connection may be idle (no messages received)
@@ -61,12 +62,16 @@ const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// connection alive and prevent the [`WS_IDLE_TIMEOUT`] from firing.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Maximum number of routed messages a single peer may send per second.
-/// Prevents a single attacker from flooding a target's channel fast enough to
-/// trigger backpressure eviction (which requires only 256 + 50 = 306 messages).
-/// Legitimate WebRTC signalling produces at most a handful of messages per
-/// second (SDP offer, answer, a few ICE candidates per peer).
-const MAX_MESSAGES_PER_SECOND: u32 = 60;
+/// Maximum burst of messages a peer may send before being throttled.
+/// Must accommodate WebRTC mesh initialization: joining a room with N peers
+/// generates N SDP offers + ~3-10 ICE candidates each, all within milliseconds.
+/// A burst of 500 allows joining rooms of ~40 peers without throttling.
+const RATE_BURST_CAPACITY: u32 = 500;
+
+/// Steady-state token refill rate (tokens per second). After the initial burst
+/// is spent, peers are limited to this rate. Legitimate signalling rarely
+/// exceeds a few messages per second outside the initial mesh setup.
+const RATE_REFILL_PER_SECOND: u32 = 20;
 
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
@@ -432,16 +437,17 @@ async fn handle_socket(
     let read_task = async {
         let mut invalid_count: usize = 0;
         // Per-target backpressure strike counters. When a target's channel is
-        // full across many consecutive routing attempts, the target is likely
-        // stalled and pinning memory. After MAX_BACKPRESSURE_STRIKES hits we
-        // disconnect the stalled target to reclaim resources.
+        // full across many consecutive routing attempts, we stop trying to
+        // deliver to that target from this sender. Stalled peers are reaped
+        // by WS_IDLE_TIMEOUT instead of sender-driven eviction, preventing
+        // a malicious sender from kicking arbitrary targets.
         let mut backpressure_strikes: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        // Per-sender rate limiter: simple token bucket that refills each second.
-        // Prevents a single peer from spraying enough messages to trigger
-        // backpressure eviction of a target (which only requires 306 messages).
-        let mut rate_tokens: u32 = MAX_MESSAGES_PER_SECOND;
-        let mut rate_window_start = tokio::time::Instant::now();
+        // Per-sender token-bucket rate limiter with high burst capacity.
+        // The burst allows WebRTC mesh initialization (N offers + N*K ICE
+        // candidates) while the low refill rate caps sustained throughput.
+        let mut rate_tokens: u32 = RATE_BURST_CAPACITY;
+        let mut rate_last_refill = tokio::time::Instant::now();
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws_rx.next()).await {
                 Ok(Some(Ok(msg))) => msg,
@@ -470,7 +476,7 @@ async fn handle_socket(
                     if invalid_count >= MAX_INVALID_MESSAGES {
                         tracing::warn!(
                             session = %session_id,
-                            "disconnecting peer after {MAX_INVALID_MESSAGES} consecutive invalid messages"
+                            "disconnecting peer after {MAX_INVALID_MESSAGES} invalid messages"
                         );
                         break;
                     }
@@ -479,10 +485,7 @@ async fn handle_socket(
             };
 
             let envelope: SignalEnvelope = match serde_json::from_str(&text) {
-                Ok(e) => {
-                    invalid_count = 0;
-                    e
-                }
+                Ok(e) => e,
                 Err(err) => {
                     invalid_count += 1;
                     tracing::warn!(
@@ -493,7 +496,7 @@ async fn handle_socket(
                     if invalid_count >= MAX_INVALID_MESSAGES {
                         tracing::warn!(
                             session = %session_id,
-                            "disconnecting peer after {MAX_INVALID_MESSAGES} consecutive invalid messages"
+                            "disconnecting peer after {MAX_INVALID_MESSAGES} invalid messages"
                         );
                         break;
                     }
@@ -515,16 +518,20 @@ async fn handle_socket(
                 continue;
             }
 
-            // Per-sender rate limiting: refill tokens each second window.
+            // Per-sender token-bucket rate limiting: refill proportionally
+            // to elapsed time, capped at RATE_BURST_CAPACITY.
             let now = tokio::time::Instant::now();
-            if now.duration_since(rate_window_start) >= Duration::from_secs(1) {
-                rate_tokens = MAX_MESSAGES_PER_SECOND;
-                rate_window_start = now;
+            let elapsed = now.duration_since(rate_last_refill);
+            if elapsed >= Duration::from_millis(50) {
+                let refill = (elapsed.as_millis() as u32 * RATE_REFILL_PER_SECOND / 1000).max(1);
+                rate_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
+                rate_last_refill = now;
             }
             if rate_tokens == 0 {
                 tracing::warn!(
                     session = %session_id,
-                    "disconnecting peer: exceeded {MAX_MESSAGES_PER_SECOND} messages/second"
+                    "disconnecting peer: rate limit exhausted (burst {RATE_BURST_CAPACITY}, \
+                     refill {RATE_REFILL_PER_SECOND}/s)"
                 );
                 break;
             }
@@ -548,6 +555,14 @@ async fn handle_socket(
                 signal: envelope.signal,
             };
 
+            // Skip targets we've already given up on (backpressure maxed).
+            if backpressure_strikes
+                .get(&target_id)
+                .is_some_and(|s| *s >= MAX_BACKPRESSURE_STRIKES)
+            {
+                continue;
+            }
+
             if let Some(entry) = state_write.peers.get(&target_id) {
                 if entry.value().room != room {
                     tracing::warn!(
@@ -569,13 +584,13 @@ async fn handle_socket(
                     if *strikes >= MAX_BACKPRESSURE_STRIKES {
                         tracing::warn!(
                             target = %target_id,
-                            "disconnecting stalled peer after {MAX_BACKPRESSURE_STRIKES} \
-                             consecutive backpressure hits"
+                            sender = %session_id,
+                            "giving up on target after {MAX_BACKPRESSURE_STRIKES} \
+                             consecutive backpressure hits (will drop future messages)"
                         );
-                        // Remove the stalled peer — this closes their relay
-                        // channel, causing their write task to exit cleanly.
-                        drop(entry);
-                        state_write.peers.remove(&target_id);
+                        // Don't remove the target — that would let a malicious
+                        // sender kick other peers. Stalled peers will be reaped
+                        // by WS_IDLE_TIMEOUT. We just stop trying from this sender.
                     }
                 } else {
                     // Successful send — reset strike counter for this target.
