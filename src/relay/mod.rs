@@ -82,20 +82,32 @@
 //!   *responding* to pings), so without server-side pings, idle WASM clients
 //!   would be reaped by the idle timeout.
 //! - **Backpressure** — When the per-peer relay channel (256 slots)
-//!   is full, signals are dropped and logged. To prevent a single malicious
-//!   sender from evicting victims, individual drops do not disconnect the
-//!   target. However, if a target accumulates 50 consecutive backpressure
-//!   strikes across all senders, the relay disconnects it — the peer is
-//!   likely stalled (e.g. stopped reading its WebSocket) and is pinning
-//!   memory without contributing to the mesh.
+//!   is full, signals are dropped and logged. Each sender tracks per-target
+//!   strike counters independently. If a sender accumulates 50 consecutive
+//!   backpressure strikes against the same target, the relay disconnects
+//!   that target — it is likely stalled (e.g. stopped reading its WebSocket)
+//!   and is pinning memory without contributing to the mesh. Successful sends
+//!   reset the strike counter, so live peers that are merely slow will not be
+//!   evicted.
 //! - **Handshake slot budget** — At most `max_peers / 4` connections may be
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
 //!   fetch with slow-responding servers.
+//! - **Per-sender rate limiting** — Each peer is limited to 60 routed messages
+//!   per second. Peers that exceed this rate are immediately disconnected.
+//!   Legitimate WebRTC signaling produces at most a handful of messages per
+//!   second (SDP offer, answer, a few ICE candidates per peer), so the limit
+//!   is generous for normal use while preventing flood attacks that could
+//!   trigger backpressure eviction of other peers.
 //! - **Per-domain DID fetch rate limiting** — Each `did:web` domain is limited
 //!   to 500 DID document fetches per 60 seconds, preventing attackers from
 //!   bypassing the per-DID negative cache with unique path segments to use
 //!   the relay as a DDoS amplifier.
+//! - **Global `did:web` fetch rate limiting** — Total `did:web` document fetches
+//!   across all domains are capped at 1000 per 60 seconds. This prevents
+//!   subdomain spraying attacks where an attacker creates thousands of unique
+//!   subdomains to bypass the per-domain rate limit and exhaust the Tokio
+//!   blocking thread pool with DNS resolution calls.
 //!
 //! # Usage
 //!
