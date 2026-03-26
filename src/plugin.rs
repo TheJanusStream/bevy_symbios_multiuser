@@ -83,6 +83,7 @@ fn open_socket(
     mut commands: Commands,
     config: Res<SymbiosMultiuserConfig>,
     #[cfg(feature = "client")] session: Option<Res<AtprotoSession>>,
+    #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
 ) {
     let mut builder = WebRtcSocketBuilder::new(&config.room_url)
         .add_channel(ChannelConfig::reliable())
@@ -93,14 +94,18 @@ fn open_socket(
     }
 
     // Always use the Symbios signaller so the relay receives SignalEnvelope
-    // payloads. When an authenticated ATProto session is available, the JWT
-    // is included in the WebSocket handshake; otherwise, the signaller
-    // connects without authentication (anonymous mode).
+    // payloads. Prefer a shared TokenSource (supports token refresh on
+    // reconnect) over a static session clone. Fall back to anonymous mode
+    // when neither is available.
     #[cfg(feature = "client")]
     {
-        let signaller = match session {
-            Some(s) => crate::signaller::signaller_for_session(&s),
-            None => crate::signaller::signaller_anonymous(),
+        let signaller = if let Some(ts) = token_source {
+            crate::signaller::signaller_with_token_source(ts.0.clone())
+        } else {
+            match session {
+                Some(s) => crate::signaller::signaller_for_session(&s),
+                None => crate::signaller::signaller_anonymous(),
+            }
         };
         builder = builder.signaller_builder(signaller);
     }

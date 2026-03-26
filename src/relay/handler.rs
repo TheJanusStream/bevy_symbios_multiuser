@@ -61,6 +61,13 @@ const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// connection alive and prevent the [`WS_IDLE_TIMEOUT`] from firing.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Maximum number of routed messages a single peer may send per second.
+/// Prevents a single attacker from flooding a target's channel fast enough to
+/// trigger backpressure eviction (which requires only 256 + 50 = 306 messages).
+/// Legitimate WebRTC signalling produces at most a handful of messages per
+/// second (SDP offer, answer, a few ICE candidates per peer).
+const MAX_MESSAGES_PER_SECOND: u32 = 60;
+
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
 /// slots by presenting DIDs that tarpit the HTTP fetch (e.g. a server that
@@ -427,6 +434,11 @@ async fn handle_socket(
         // disconnect the stalled target to reclaim resources.
         let mut backpressure_strikes: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Per-sender rate limiter: simple token bucket that refills each second.
+        // Prevents a single peer from spraying enough messages to trigger
+        // backpressure eviction of a target (which only requires 306 messages).
+        let mut rate_tokens: u32 = MAX_MESSAGES_PER_SECOND;
+        let mut rate_window_start = tokio::time::Instant::now();
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws_rx.next()).await {
                 Ok(Some(Ok(msg))) => msg,
@@ -499,6 +511,21 @@ async fn handle_socket(
                 );
                 continue;
             }
+
+            // Per-sender rate limiting: refill tokens each second window.
+            let now = tokio::time::Instant::now();
+            if now.duration_since(rate_window_start) >= Duration::from_secs(1) {
+                rate_tokens = MAX_MESSAGES_PER_SECOND;
+                rate_window_start = now;
+            }
+            if rate_tokens == 0 {
+                tracing::warn!(
+                    session = %session_id,
+                    "disconnecting peer: exceeded {MAX_MESSAGES_PER_SECOND} messages/second"
+                );
+                break;
+            }
+            rate_tokens -= 1;
 
             // Route to target peer, rewriting peer_id to the sender's ID.
             let target_id = envelope.peer_id.clone();

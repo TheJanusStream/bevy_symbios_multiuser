@@ -110,11 +110,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
         self.incoming.push_back(msg);
     }
 
-    /// Drain all queued messages. The caller owns the returned iterator and
-    /// no messages are dropped until consumed.
-    pub fn drain(&mut self) -> impl Iterator<Item = NetworkReceived<T>> + '_ {
+    /// Drain all queued messages. The caller owns the returned iterator.
+    ///
+    /// Uses [`std::mem::take`] to move the entire deque out, so the
+    /// `total_bytes` invariant holds even if the iterator is leaked via
+    /// `std::mem::forget` (unlike `VecDeque::drain`, which would leave
+    /// orphaned elements in the deque with `total_bytes == 0`).
+    pub fn drain(&mut self) -> impl Iterator<Item = NetworkReceived<T>> {
         self.total_bytes = 0;
-        self.incoming.drain(..)
+        std::mem::take(&mut self.incoming).into_iter()
     }
 
     /// Returns `true` if there are no queued messages.

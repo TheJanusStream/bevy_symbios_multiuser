@@ -78,6 +78,13 @@ const DOMAIN_FETCH_RATE_LIMIT: u64 = 500;
 /// Time window for the per-domain fetch rate limit.
 const DOMAIN_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
+/// Maximum total `did:web` document fetches across ALL domains within
+/// [`DOMAIN_RATE_LIMIT_WINDOW`]. Prevents subdomain spraying attacks where an
+/// attacker creates thousands of unique subdomains (e.g. `did:web:1.evil.com`,
+/// `did:web:2.evil.com`) to bypass the per-domain rate limit and exhaust the
+/// Tokio blocking thread pool with `getaddrinfo` calls.
+const GLOBAL_DIDWEB_FETCH_RATE_LIMIT: u64 = 1000;
+
 /// Resolves ATProto DIDs to their signing public keys.
 ///
 /// Fetches DID documents over HTTPS, extracts the `#atproto` verification
@@ -110,6 +117,10 @@ pub struct DidResolver {
     /// Prevents attackers from bypassing the per-DID negative cache by generating
     /// unique DID paths (e.g. `did:web:victim.com:u:random1`) to flood a target.
     domain_fetch_counts: Cache<String, Arc<AtomicU64>>,
+    /// Global `did:web` fetch counter across all domains. Works alongside the
+    /// per-domain counter to cap total outbound DNS + HTTP activity, preventing
+    /// subdomain spraying from exhausting the blocking thread pool.
+    global_didweb_fetch_count: Cache<(), Arc<AtomicU64>>,
     plc_directory: String,
 }
 
@@ -375,12 +386,18 @@ impl DidResolver {
             .time_to_live(DOMAIN_RATE_LIMIT_WINDOW)
             .build();
 
+        let global_didweb_fetch_count = Cache::builder()
+            .max_capacity(1)
+            .time_to_live(DOMAIN_RATE_LIMIT_WINDOW)
+            .build();
+
         Self {
             client,
             cache,
             negative_cache,
             domain_clients,
             domain_fetch_counts,
+            global_didweb_fetch_count,
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
         }
     }
@@ -452,6 +469,21 @@ impl DidResolver {
         // bounded and TTL'd so an attacker spamming unique domains can only
         // create a bounded number of clients before eviction kicks in.
         let pinned_client = if did.starts_with("did:web:") {
+            // Global did:web rate limit: cap total outbound DNS + HTTP activity
+            // across ALL domains. Prevents subdomain spraying attacks from
+            // exhausting the Tokio blocking thread pool with getaddrinfo calls.
+            let global_counter = self
+                .global_didweb_fetch_count
+                .get_with((), || Arc::new(AtomicU64::new(0)));
+            let global_prev = global_counter.fetch_add(1, Ordering::Relaxed);
+            if global_prev >= GLOBAL_DIDWEB_FETCH_RATE_LIMIT {
+                return Err(format!(
+                    "global did:web rate limit exceeded \
+                     ({GLOBAL_DIDWEB_FETCH_RATE_LIMIT} fetches per {} seconds)",
+                    DOMAIN_RATE_LIMIT_WINDOW.as_secs()
+                ));
+            }
+
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
             let (domain_raw, _) = split_did_web_domain_path(raw)?;
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");

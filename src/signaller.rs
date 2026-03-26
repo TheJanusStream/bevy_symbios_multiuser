@@ -83,6 +83,28 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
 
 // ── SignallerBuilder ─────────────────────────────────────────────────────────
 
+/// Bevy [`Resource`](bevy::prelude::Resource) wrapper around a [`TokenSource`].
+///
+/// Insert this resource into the Bevy world to enable automatic token refresh
+/// when using [`SymbiosMultiuserPlugin`](crate::plugin::SymbiosMultiuserPlugin).
+/// The plugin prefers this over a static [`AtprotoSession`](crate::auth::AtprotoSession)
+/// clone, so reconnects after token expiry use the latest refreshed JWT.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::{Arc, RwLock};
+/// use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
+///
+/// let source: TokenSource = Arc::new(RwLock::new(Some(session.access_jwt.clone())));
+/// app.insert_resource(TokenSourceRes(source.clone()));
+///
+/// // Later, after refreshing:
+/// *source.write().unwrap() = Some(new_jwt);
+/// ```
+#[derive(bevy::prelude::Resource, Clone)]
+pub struct TokenSourceRes(pub TokenSource);
+
 /// A shared, externally-refreshable token source.
 ///
 /// The host application updates this (e.g. after an ATProto token refresh)
