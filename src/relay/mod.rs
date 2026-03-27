@@ -129,6 +129,7 @@
 //!         bind_addr: "0.0.0.0:3536".to_string(),
 //!         auth_required: false,
 //!         max_peers: 512,
+//!         service_did: None,
 //!     };
 //!     run_relay(config).await.expect("relay crashed");
 //! }
@@ -158,6 +159,10 @@ pub struct RelayConfig {
     /// rejected with HTTP 503 once this limit is reached. `0` means unlimited.
     /// Defaults to `512`.
     pub max_peers: usize,
+    /// The relay's own service DID (e.g. `did:web:relay.example.com`). When set,
+    /// JWT `aud` claims are validated against this value to prevent cross-service
+    /// token replay attacks. When `None`, audience validation is skipped.
+    pub service_did: Option<String>,
 }
 
 /// A connected peer's sender handle paired with a unique connection ID.
@@ -190,6 +195,9 @@ pub struct RelayState {
     /// DID document resolver for JWT signature verification.
     /// `None` disables cryptographic signature checks.
     pub did_resolver: Option<did_resolver::DidResolver>,
+    /// The relay's own service DID for JWT audience validation.
+    /// When set, tokens whose `aud` claim does not match are rejected.
+    pub service_did: Option<String>,
     /// Atomic counter tracking active + in-handshake connections.
     /// Prevents TOCTOU bypasses where concurrent handshakes all pass the
     /// `max_peers` check before any of them insert into `peers`.
@@ -204,7 +212,7 @@ pub struct RelayState {
 }
 
 impl RelayState {
-    fn new(auth_required: bool, max_peers: usize) -> Self {
+    fn new(auth_required: bool, max_peers: usize, service_did: Option<String>) -> Self {
         // Always create the DID resolver so that opportunistic authentication
         // works when `auth_required` is false: clients presenting a valid JWT
         // get identified by their DID, while unauthenticated clients fall back
@@ -222,6 +230,7 @@ impl RelayState {
             auth_required,
             max_peers,
             did_resolver: Some(did_resolver::DidResolver::new()),
+            service_did,
             active_connections: Arc::new(AtomicUsize::new(0)),
             active_handshakes: Arc::new(AtomicUsize::new(0)),
             max_handshakes,
@@ -234,7 +243,7 @@ impl RelayState {
 /// Binds to the configured address and serves WebSocket connections.
 /// This function runs until the server is shut down.
 pub async fn run_relay(config: RelayConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let state = RelayState::new(config.auth_required, config.max_peers);
+    let state = RelayState::new(config.auth_required, config.max_peers, config.service_did);
 
     // Accept WebSocket upgrades on any path so clients can use room-based
     // URLs (e.g. `/my_room`) as well as the canonical `/ws` endpoint.

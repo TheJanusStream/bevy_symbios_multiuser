@@ -182,6 +182,7 @@ pub async fn ws_handler(
             query.token.as_deref(),
             state.auth_required,
             state.did_resolver.as_ref(),
+            state.service_did.as_deref(),
         ),
     )
     .await
@@ -243,6 +244,7 @@ async fn extract_identity(
     query_token: Option<&str>,
     auth_required: bool,
     resolver: Option<&DidResolver>,
+    service_did: Option<&str>,
 ) -> Result<Option<auth::ValidatedIdentity>, (StatusCode, &'static str)> {
     // 1. Try the Authorization header first (native clients).
     let header_token = headers
@@ -286,7 +288,7 @@ async fn extract_identity(
         return Ok(None);
     };
 
-    match auth::validate_atproto_jwt(token, &resolver).await {
+    match auth::validate_atproto_jwt(token, &resolver, service_did).await {
         Ok(identity) => Ok(Some(identity)),
         Err(e) => {
             tracing::warn!(error = %e, "JWT validation failed");
@@ -537,7 +539,12 @@ async fn handle_socket(
             let now = tokio::time::Instant::now();
             let elapsed = now.duration_since(rate_last_refill);
             if elapsed >= Duration::from_millis(50) {
-                let refill = (elapsed.as_millis() as u32 * RATE_REFILL_PER_SECOND / 1000).max(1);
+                // Cap elapsed milliseconds to avoid u32 overflow on long-idle
+                // connections (Ping/Pong keep-alive resets WS_IDLE_TIMEOUT but
+                // not the rate limiter clock). The cap is high enough that the
+                // refill always saturates RATE_BURST_CAPACITY.
+                let elapsed_ms = (elapsed.as_millis() as u64).min(u32::MAX as u64) as u32;
+                let refill = (elapsed_ms.saturating_mul(RATE_REFILL_PER_SECOND) / 1000).max(1);
                 rate_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
                 // Advance the timer proportionally to the tokens actually
                 // minted, not to `now`. This preserves remainder time so

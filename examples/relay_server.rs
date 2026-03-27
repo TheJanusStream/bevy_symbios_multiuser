@@ -19,6 +19,7 @@ fn main() {
                 bind_addr: "0.0.0.0:3536".to_string(),
                 auth_required: false,
                 max_peers: 512,
+                service_did: None,
             };
 
             println!("Starting relay server on {}", config.bind_addr);

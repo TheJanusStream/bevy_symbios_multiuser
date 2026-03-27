@@ -487,6 +487,13 @@ impl DidResolver {
             }
         }
 
+        // Concurrency guards must live across the entire HTTP fetch, not just
+        // the setup block. Declaring them here ensures they are dropped only
+        // when `fetch_did_document` returns, keeping the concurrency counters
+        // accurate for the duration of the network call.
+        let mut _global_guard: Option<ConcurrencyGuard> = None;
+        let mut _domain_guard: Option<ConcurrencyGuard> = None;
+
         let pinned_client = if did.starts_with("did:web:") {
             // Global concurrency limit: cap concurrent outbound DNS + HTTP
             // activity across ALL did:web domains. Slots are released as soon
@@ -495,7 +502,7 @@ impl DidResolver {
             let global_prev = self
                 .global_didweb_fetch_count
                 .fetch_add(1, Ordering::Relaxed);
-            let _global_guard = ConcurrencyGuard(Arc::clone(&self.global_didweb_fetch_count));
+            _global_guard = Some(ConcurrencyGuard(Arc::clone(&self.global_didweb_fetch_count)));
             if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
                 return Err(format!(
                     "global did:web concurrency limit exceeded \
@@ -526,7 +533,7 @@ impl DidResolver {
                 .domain_fetch_counts
                 .get_with(cache_key.clone(), || Arc::new(AtomicU64::new(0)));
             let domain_prev = counter.fetch_add(1, Ordering::Relaxed);
-            let _domain_guard = ConcurrencyGuard(counter);
+            _domain_guard = Some(ConcurrencyGuard(counter));
             if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
                 return Err(format!(
                     "concurrency limit exceeded for did:web domain '{domain}' \

@@ -30,6 +30,8 @@ pub struct AtprotoClaims {
     pub iss: String,
     /// Token expiration time (Unix timestamp).
     pub exp: u64,
+    /// The intended audience (service DID). Optional — older tokens may omit it.
+    pub aud: Option<String>,
 }
 
 /// A successfully validated peer identity.
@@ -59,6 +61,7 @@ pub struct ValidatedIdentity {
 pub async fn validate_atproto_jwt(
     token: &str,
     resolver: &DidResolver,
+    expected_aud: Option<&str>,
 ) -> Result<ValidatedIdentity, String> {
     // Step 1: Decode without signature verification to read claims.
     let claims = decode_claims(token)?;
@@ -66,6 +69,25 @@ pub async fn validate_atproto_jwt(
 
     if !did.starts_with("did:") {
         return Err(format!("invalid DID in JWT issuer: {did}"));
+    }
+
+    // Validate audience claim when the relay has a service DID configured.
+    // Prevents cross-service token replay: a JWT issued for Game A cannot
+    // be used to authenticate against Game B's relay.
+    if let Some(expected) = expected_aud {
+        match &claims.aud {
+            Some(aud) if aud == expected => {}
+            Some(aud) => {
+                return Err(format!(
+                    "JWT audience mismatch: token is for '{aud}', expected '{expected}'"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "JWT missing aud claim, expected '{expected}'"
+                ));
+            }
+        }
     }
 
     // Step 2–3: Verify the signature against the DID document key.
@@ -139,6 +161,31 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
     let sig_b64 = parts[0];
     let signing_input = parts[1]; // "header.payload"
 
+    // Verify the JWT header declares ES256K. Without this check, a token
+    // with a mismatched `alg` header (e.g. "HS256") would still pass ECDSA
+    // verification, violating RFC 7515 §4.1.1 best practices.
+    let header_b64 = signing_input
+        .split('.')
+        .next()
+        .ok_or("malformed JWT: missing header")?;
+    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(header_b64))
+        .map_err(|e| format!("JWT header base64 decode failed: {e}"))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| format!("JWT header parse failed: {e}"))?;
+    match header.get("alg").and_then(|v| v.as_str()) {
+        Some("ES256K") => {}
+        Some(other) => {
+            return Err(format!(
+                "JWT alg mismatch: token header says '{other}', but key requires ES256K"
+            ));
+        }
+        None => {
+            return Err("JWT header missing 'alg' field".to_string());
+        }
+    }
+
     // Decode the signature (base64url, no padding)
     use base64::Engine;
     let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -211,13 +258,13 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_empty_token() {
-        assert!(validate_atproto_jwt("", &dummy_resolver()).await.is_err());
+        assert!(validate_atproto_jwt("", &dummy_resolver(), None).await.is_err());
     }
 
     #[tokio::test]
     async fn rejects_garbage_token() {
         assert!(
-            validate_atproto_jwt("not.a.jwt", &dummy_resolver())
+            validate_atproto_jwt("not.a.jwt", &dummy_resolver(), None)
                 .await
                 .is_err()
         );
@@ -280,7 +327,7 @@ mod tests {
         let token = sign_test_jwt("did:plc:testuser", &secret);
         let resolver = DidResolver::with_plc_directory("http://127.0.0.1:1".to_string());
 
-        let result = validate_atproto_jwt(&token, &resolver).await;
+        let result = validate_atproto_jwt(&token, &resolver, None).await;
         assert!(result.is_err(), "should reject when key resolution fails");
     }
 }
