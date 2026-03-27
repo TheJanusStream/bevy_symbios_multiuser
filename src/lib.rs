@@ -73,9 +73,12 @@
 //! - `tls` (default) — Enables TLS (via `rustls`) for both `reqwest` HTTPS
 //!   and `async-tungstenite` WebSocket (`wss://`) connections.
 //! - `relay` — Sovereign Broker relay server with DID-based JWT signature
-//!   verification, room-based peer isolation, atomic connection limits, SSRF
-//!   protection, message size caps, server-side pings (WASM keep-alive),
-//!   request coalescing, and negative DID caching. Built on `axum`.
+//!   verification (ES256 + ES256K), room-based peer isolation, atomic
+//!   connection limits, SSRF-hardened DID resolution, message size caps,
+//!   idle/handshake timeouts, HTTP-level Slowloris protection, server-side
+//!   pings (WASM keep-alive), per-sender token-bucket rate limiting,
+//!   per-domain and global `did:web` fetch concurrency limiting, request
+//!   coalescing, and negative DID caching. Built on `axum`.
 
 pub mod error;
 pub mod messages;

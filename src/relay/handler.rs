@@ -43,11 +43,15 @@ const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 /// from alternating valid/invalid messages to avoid the limit.
 const MAX_INVALID_MESSAGES: usize = 10;
 
-/// Number of consecutive backpressure hits (channel-full drops) on the same
+/// Number of consecutive channel-full (`TrySendError::Full`) drops on the same
 /// target before the sender stops attempting delivery to that target for
-/// the remainder of this connection. Truly stalled peers are reaped by
-/// WS_IDLE_TIMEOUT rather than by sender-driven eviction, which would allow
-/// a malicious sender to kick arbitrary targets by flooding their channel.
+/// the remainder of this connection. Only channel-full errors accumulate
+/// strikes; closed channels (disconnected peers) are skipped per-message
+/// without accumulating strikes, so reconnected peers can immediately
+/// receive signals again. Truly stalled peers are reaped by
+/// [`WS_IDLE_TIMEOUT`] rather than by sender-driven eviction, which would
+/// allow a malicious sender to kick arbitrary targets by flooding their
+/// channel.
 const MAX_BACKPRESSURE_STRIKES: usize = 50;
 
 /// Maximum time a WebSocket connection may be idle (no messages received)
@@ -535,7 +539,12 @@ async fn handle_socket(
             if elapsed >= Duration::from_millis(50) {
                 let refill = (elapsed.as_millis() as u32 * RATE_REFILL_PER_SECOND / 1000).max(1);
                 rate_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
-                rate_last_refill = now;
+                // Advance the timer proportionally to the tokens actually
+                // minted, not to `now`. This preserves remainder time so
+                // sub-token fractional intervals accumulate correctly instead
+                // of being silently destroyed.
+                rate_last_refill +=
+                    Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
             }
             if rate_tokens == 0 {
                 tracing::warn!(
@@ -607,15 +616,16 @@ async fn handle_socket(
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // Target peer disconnected but hasn't been cleaned
-                            // up from the DashMap yet. Stop trying to deliver;
-                            // the stale entry will be removed when its connection
-                            // task finishes cleanup.
+                            // up from the DashMap yet. Skip this message but do
+                            // NOT permanently ban the target — if they reconnect,
+                            // they'll get a fresh channel in the DashMap and we
+                            // need to be able to deliver to it. The stale entry
+                            // will be removed when its connection task finishes
+                            // cleanup.
                             tracing::debug!(
                                 target = %target_id,
-                                "target channel closed, skipping future deliveries"
+                                "target channel closed, dropping this message"
                             );
-                            backpressure_strikes
-                                .insert(target_id.clone(), MAX_BACKPRESSURE_STRIKES);
                         }
                     }
                 }
@@ -626,12 +636,18 @@ async fn handle_socket(
     };
 
     // Either task finishing causes the other to be cleaned up.
+    // Explicitly abort the write task when the read task ends (and vice
+    // versa via channel closure) to avoid relying on implicit drop
+    // propagation, which would silently leak the write task if any code
+    // path accidentally held onto a Sender clone.
+    let mut write_task = write_task;
     tokio::select! {
-        _ = write_task => {
+        _ = &mut write_task => {
             tracing::debug!(session = %session_id_write, "write task ended, stopping read");
         }
         _ = read_task => {
-            tracing::debug!(session = %session_id_write, "read task ended");
+            tracing::debug!(session = %session_id_write, "read task ended, aborting write task");
+            write_task.abort();
         }
     }
 

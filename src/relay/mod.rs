@@ -40,6 +40,11 @@
 //!
 //! # Hardening
 //!
+//! - **HTTP request timeout** — A `tower-http` `TimeoutLayer` drops any HTTP
+//!   connection that has not completed the request (including header parsing and
+//!   WebSocket upgrade) within 10 seconds, mitigating Slowloris-style attacks
+//!   that trickle headers slowly to hold TCP connections without ever reaching
+//!   the WebSocket handler.
 //! - **Connection limits** — [`RelayConfig::max_peers`] caps the number of
 //!   concurrent connections (default `512`). The limit is enforced via an atomic
 //!   counter that reserves a slot *before* async identity extraction, preventing
@@ -84,12 +89,15 @@
 //! - **Backpressure** — When the per-peer relay channel (256 slots)
 //!   is full, signals are dropped and logged. Each sender tracks per-target
 //!   strike counters independently. If a sender accumulates 50 consecutive
-//!   backpressure strikes against the same target, the sender silently stops
+//!   channel-full strikes against the same target, the sender silently stops
 //!   delivering to that target for the remainder of the connection. Stalled
 //!   peers are reaped by the idle timeout rather than by sender-driven eviction,
 //!   preventing a malicious sender from kicking arbitrary targets by flooding
 //!   their channel. Successful sends reset the strike counter, so live peers
-//!   that are merely slow will not be affected.
+//!   that are merely slow will not be affected. Closed channels (peer
+//!   disconnected but not yet cleaned up) are skipped per-message without
+//!   accumulating strikes, so a peer that reconnects can immediately receive
+//!   signals again.
 //! - **Handshake slot budget** — At most `max_peers / 4` connections may be
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID

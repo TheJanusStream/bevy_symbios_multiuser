@@ -11,13 +11,15 @@
 //! document (via `plc.directory` for `did:plc`, or HTTPS for `did:web` —
 //! domain-only DIDs use `/.well-known/did.json`, path-based DIDs use
 //! `/{path}/did.json`), extracts the `#atproto` signing key, and verifies
-//! the JWT's ES256 signature. Resolved keys are cached in memory.
+//! the JWT signature (ES256 for P-256 keys, ES256K for secp256k1 keys).
+//! Resolved keys are cached in memory.
 //!
 //! Callers must ensure a resolver is available before calling
 //! [`validate_atproto_jwt`] — unverified JWTs are never trusted for identity.
 
 use super::did_resolver::{DidResolver, ResolvedKey};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use base64::Engine;
+use jsonwebtoken::{Algorithm, Validation, decode};
 use serde::Deserialize;
 
 /// Claims extracted from an ATProto access JWT.
@@ -75,31 +77,30 @@ pub async fn validate_atproto_jwt(
 }
 
 /// Decode JWT claims without verifying the signature.
+///
+/// Manually splits and base64url-decodes the JWT rather than using
+/// `jsonwebtoken::decode`, because `jsonwebtoken`'s `Algorithm` enum does
+/// not include `ES256K`. If we relied on `jsonwebtoken` to parse the header,
+/// any JWT with `"alg": "ES256K"` would fail deserialization before we could
+/// reach our manual `k256` verification path.
 fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
-    let mut validation = Validation::default();
-    validation.insecure_disable_signature_validation();
-    validation.validate_exp = true;
-    // Accept all algorithms during the unverified claim extraction phase.
-    // The actual algorithm is enforced in `verify_signature` (ES256).
-    // This avoids rejecting JWTs signed with future algorithms before we
-    // even attempt to fetch the DID document and verify the signature.
-    validation.algorithms = vec![
-        Algorithm::ES256,
-        Algorithm::ES384,
-        Algorithm::EdDSA,
-        Algorithm::RS256,
-        Algorithm::RS384,
-        Algorithm::RS512,
-        Algorithm::PS256,
-        Algorithm::PS384,
-        Algorithm::PS512,
-    ];
-    validation.validate_aud = false;
+    let mut parts = token.splitn(3, '.');
+    let _header_b64 = parts.next().ok_or("malformed JWT: missing header")?;
+    let payload_b64 = parts.next().ok_or("malformed JWT: missing payload")?;
+    let _sig = parts.next().ok_or("malformed JWT: missing signature")?;
 
-    let token_data = decode::<AtprotoClaims>(token, &DecodingKey::from_secret(&[]), &validation)
-        .map_err(|e| format!("JWT decode failed: {e}"))?;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .or_else(|_| {
+            // Some encoders emit standard base64 with padding — try that too.
+            base64::engine::general_purpose::URL_SAFE.decode(payload_b64)
+        })
+        .map_err(|e| format!("JWT payload base64 decode failed: {e}"))?;
 
-    Ok(token_data.claims)
+    let claims: AtprotoClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("JWT claims parse failed: {e}"))?;
+
+    Ok(claims)
 }
 
 /// Verify the JWT signature against a resolved public key.
@@ -168,7 +169,7 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{EncodingKey, Header, encode};
+    use jsonwebtoken::{DecodingKey, EncodingKey, Header, encode};
     use p256::pkcs8::EncodePrivateKey;
     use serde::Serialize;
 

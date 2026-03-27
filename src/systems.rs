@@ -150,8 +150,13 @@ pub fn transmit_messages<T>(
             }
         };
 
-        for &peer in &peers {
-            channel.send(packet.clone(), peer);
+        // Send to all peers, avoiding one unnecessary clone by sending the
+        // original packet to the last peer.
+        if let Some((&last, rest)) = peers.split_last() {
+            for &peer in rest {
+                channel.send(packet.clone(), peer);
+            }
+            channel.send(packet, last);
         }
     }
 }

@@ -5,12 +5,15 @@
 //! `matchbox_socket`, bridging between the matchbox `PeerRequest`/`PeerEvent`
 //! protocol and the relay's [`SignalEnvelope`]/[`SignalPayload`] wire format.
 //!
-//! The plugin **always** uses this signaller (via [`signaller_for_session`] or
+//! The plugin **always** uses this signaller (via
+//! [`signaller_with_token_source`], [`signaller_for_session`], or
 //! [`signaller_anonymous`]) so that the relay receives the expected
 //! `SignalEnvelope` JSON, rather than matchbox's incompatible default format.
-//! When an [`AtprotoSession`](crate::auth::AtprotoSession) resource is present
-//! in the Bevy world, the JWT is included in the WebSocket handshake; otherwise
-//! the signaller connects without authentication (anonymous mode).
+//! When a [`TokenSourceRes`] resource is present, the signaller uses the shared
+//! token source for automatic refresh on reconnect. Otherwise, if an
+//! [`AtprotoSession`](crate::auth::AtprotoSession) resource is present, the JWT
+//! is cloned once and included in the WebSocket handshake. If neither is
+//! available, the signaller connects without authentication (anonymous mode).
 //!
 //! # Platform Support
 //!
