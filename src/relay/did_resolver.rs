@@ -314,9 +314,7 @@ async fn validate_and_resolve_domain(
             .map_err(|e| format!("failed to resolve domain '{domain_owned}': {e}"))?;
 
         if addrs.is_empty() {
-            return Err(format!(
-                "domain '{domain_owned}' resolved to no addresses"
-            ));
+            return Err(format!("domain '{domain_owned}' resolved to no addresses"));
         }
 
         for addr in &addrs {
@@ -331,11 +329,7 @@ async fn validate_and_resolve_domain(
                     .unwrap_or(std::net::IpAddr::V6(v6)),
                 v4 => v4,
             };
-            if ip.is_loopback()
-                || ip.is_unspecified()
-                || is_private_ip(&ip)
-                || is_link_local(&ip)
-            {
+            if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) || is_link_local(&ip) {
                 return Err(format!(
                     "did:web domain '{domain_owned}' resolves to private/loopback address {ip}, \
                      request blocked (SSRF protection)"
@@ -552,13 +546,12 @@ impl DidResolver {
             // DNS resolution + concurrency guard acquisition happen inside
             // spawn_blocking. Guards are returned so they outlive the blocking
             // task and cover the subsequent HTTP fetch.
-            let (validated_addr, global_guard, domain_guard) =
-                validate_and_resolve_domain(
-                    &domain,
-                    Arc::clone(&self.global_didweb_fetch_count),
-                    domain_counter,
-                )
-                .await?;
+            let (validated_addr, global_guard, domain_guard) = validate_and_resolve_domain(
+                &domain,
+                Arc::clone(&self.global_didweb_fetch_count),
+                domain_counter,
+            )
+            .await?;
             _global_guard = Some(global_guard);
             _domain_guard = Some(domain_guard);
 

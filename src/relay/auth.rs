@@ -83,9 +83,7 @@ pub async fn validate_atproto_jwt(
                 ));
             }
             None => {
-                return Err(format!(
-                    "JWT missing aud claim, expected '{expected}'"
-                ));
+                return Err(format!("JWT missing aud claim, expected '{expected}'"));
             }
         }
     }
@@ -258,7 +256,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_empty_token() {
-        assert!(validate_atproto_jwt("", &dummy_resolver(), None).await.is_err());
+        assert!(
+            validate_atproto_jwt("", &dummy_resolver(), None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
