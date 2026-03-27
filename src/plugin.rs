@@ -26,12 +26,18 @@ pub struct SymbiosMultiuserConfig<T> {
     pub _marker: PhantomData<T>,
 }
 
-/// Marker component inserted by [`open_socket`] to prevent re-opening the
-/// connection every frame. Generic over `T` so each plugin instance tracks
-/// its own socket independently.
+/// Marker resource inserted by [`open_socket`] to prevent re-opening the
+/// connection every frame. Stores the room URL so that changes to
+/// [`SymbiosMultiuserConfig`] (or its removal) can be detected and the
+/// socket torn down, allowing room changes without restarting the app.
+///
+/// Generic over `T` so each plugin instance tracks its own socket independently.
 #[cfg(feature = "client")]
 #[derive(Resource)]
-struct SocketOpened<T>(PhantomData<T>);
+struct SocketOpened<T> {
+    room_url: String,
+    _marker: PhantomData<T>,
+}
 
 /// A generic multiplayer plugin that transports domain messages of type `T`
 /// over WebRTC data channels.
@@ -121,9 +127,13 @@ where
                 Update,
                 (
                     open_socket::<T>,
-                    systems::poll_peers::<T>,
-                    systems::receive_messages::<T>,
-                    systems::transmit_messages::<T>,
+                    (
+                        systems::poll_peers::<T>,
+                        systems::receive_messages::<T>,
+                        systems::transmit_messages::<T>,
+                    )
+                        .chain()
+                        .run_if(resource_exists::<MatchboxSocket>),
                 )
                     .chain(),
             );
@@ -139,10 +149,30 @@ fn open_socket<T: Send + Sync + 'static>(
     mut commands: Commands,
     config: Option<Res<SymbiosMultiuserConfig<T>>>,
     opened: Option<Res<SocketOpened<T>>>,
+    socket: Option<Res<MatchboxSocket>>,
     #[cfg(feature = "client")] session: Option<Res<AtprotoSession>>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
 ) {
-    if opened.is_some() {
+    // Teardown: if the socket was opened but the config was removed or the
+    // room URL changed, close the existing socket so a new one can be opened.
+    // This prevents the "soft-locked room" problem where the SocketOpened
+    // marker blocks reconnection after a config change.
+    if let Some(ref marker) = opened {
+        let needs_teardown = match config.as_ref() {
+            None => true,
+            Some(cfg) => cfg.room_url != marker.room_url,
+        };
+        if needs_teardown {
+            tracing::info!("tearing down socket (config removed or room changed)");
+            commands.remove_resource::<SocketOpened<T>>();
+            if socket.is_some() {
+                commands.remove_resource::<MatchboxSocket>();
+            }
+            // Return early — the new socket (if any) will be opened next frame
+            // after the deferred commands are applied.
+            return;
+        }
+        // Config exists and URL matches — socket already open, nothing to do.
         return;
     }
     let Some(config) = config else {
@@ -175,5 +205,8 @@ fn open_socket<T: Send + Sync + 'static>(
     }
 
     commands.open_socket(builder);
-    commands.insert_resource(SocketOpened::<T>(PhantomData));
+    commands.insert_resource(SocketOpened::<T> {
+        room_url: config.room_url.clone(),
+        _marker: PhantomData,
+    });
 }

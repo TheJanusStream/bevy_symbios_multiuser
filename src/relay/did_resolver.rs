@@ -228,19 +228,42 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
     }
 }
 
+/// RAII guard that decrements an [`AtomicU64`] on drop, ensuring concurrency
+/// counters are always released even on early returns or panics.
+///
+/// Defined at module scope so it can be created inside [`tokio::task::spawn_blocking`]
+/// closures and returned to async callers. This is critical: if the guard were
+/// created in async code, dropping the async future (e.g. client TCP disconnect)
+/// would free the concurrency slot while the blocking DNS thread continues,
+/// allowing an attacker to bypass limits and exhaust the blocking pool.
+struct ConcurrencyGuard(Arc<AtomicU64>);
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Resolve a domain's DNS records, reject private/loopback IPs (SSRF protection),
-/// and return the first safe [`std::net::SocketAddr`].
+/// and return the first safe [`std::net::SocketAddr`] along with RAII concurrency
+/// guards.
 ///
 /// The caller **must** pin the returned address when issuing the HTTP request
 /// (via `reqwest::ClientBuilder::resolve`) to prevent TOCTOU DNS rebinding
 /// attacks where the domain resolves to a different (private) IP on the second
 /// lookup performed by reqwest.
-/// Resolve a domain asynchronously and validate the result.
 ///
-/// Wraps the blocking `getaddrinfo` call in [`tokio::task::spawn_blocking`]
-/// so it cannot stall tokio worker threads (which would deadlock the relay
-/// if an attacker delays DNS responses across all workers).
-async fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAddr, String> {
+/// Concurrency guards are acquired **inside** the [`tokio::task::spawn_blocking`]
+/// closure so that if the async caller is dropped (e.g. client disconnects),
+/// the slot is not freed until the OS thread finishes `getaddrinfo`. Without
+/// this, an attacker could repeatedly connect/disconnect to queue un-cancellable
+/// blocking tasks while the concurrency counter stays at zero, exhausting the
+/// Tokio blocking thread pool (512 threads by default).
+async fn validate_and_resolve_domain(
+    domain: &str,
+    global_counter: Arc<AtomicU64>,
+    domain_counter: Arc<AtomicU64>,
+) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), String> {
     // Add default HTTPS port if no port is present, so ToSocketAddrs works.
     // Bracketed IPv6 addresses like [2001:db8::1] contain colons but have no
     // port — detect them by the leading bracket rather than a naive colon check.
@@ -258,44 +281,71 @@ async fn validate_and_resolve_domain(domain: &str) -> Result<std::net::SocketAdd
         format!("{domain}:443")
     };
 
-    // std::net::ToSocketAddrs delegates to the OS's blocking getaddrinfo.
-    // Running it directly on a tokio worker would block the entire thread;
-    // spawn_blocking moves it to a dedicated thread pool instead.
+    // Everything below runs inside spawn_blocking: guard acquisition, DNS
+    // resolution, and IP validation. This ensures the concurrency guards
+    // are held by the OS thread and not freed if the async caller is dropped.
     let domain_owned = domain.to_string();
-    let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
-        host_port
-            .to_socket_addrs()
-            .map(|iter| iter.collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| format!("DNS resolution task panicked for '{domain_owned}': {e}"))?
-    .map_err(|e| format!("failed to resolve domain '{domain}': {e}"))?;
-
-    if addrs.is_empty() {
-        return Err(format!("domain '{domain}' resolved to no addresses"));
-    }
-
-    for addr in &addrs {
-        // Unmap IPv4-mapped IPv6 (::ffff:a.b.c.d) back to IPv4 before safety
-        // checks. Without this, an attacker can bypass loopback/private checks
-        // by resolving to e.g. ::ffff:127.0.0.1 (std's is_loopback() returns
-        // false for the V6 mapped form).
-        let ip = match addr.ip() {
-            std::net::IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(std::net::IpAddr::V4)
-                .unwrap_or(std::net::IpAddr::V6(v6)),
-            v4 => v4,
-        };
-        if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) || is_link_local(&ip) {
+    tokio::task::spawn_blocking(move || {
+        // Acquire the global concurrency guard on the blocking thread.
+        let global_prev = global_counter.fetch_add(1, Ordering::Relaxed);
+        let global_guard = ConcurrencyGuard(global_counter);
+        if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
             return Err(format!(
-                "did:web domain '{domain}' resolves to private/loopback address {ip}, \
-                 request blocked (SSRF protection)"
+                "global did:web concurrency limit exceeded \
+                 ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
             ));
         }
-    }
 
-    Ok(addrs[0])
+        // Acquire the per-domain concurrency guard on the blocking thread.
+        let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
+        let domain_guard = ConcurrencyGuard(domain_counter);
+        if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
+            return Err(format!(
+                "concurrency limit exceeded for did:web domain '{domain_owned}' \
+                 ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
+            ));
+        }
+
+        // std::net::ToSocketAddrs delegates to the OS's blocking getaddrinfo.
+        let addrs: Vec<std::net::SocketAddr> = host_port
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+            .map_err(|e| format!("failed to resolve domain '{domain_owned}': {e}"))?;
+
+        if addrs.is_empty() {
+            return Err(format!(
+                "domain '{domain_owned}' resolved to no addresses"
+            ));
+        }
+
+        for addr in &addrs {
+            // Unmap IPv4-mapped IPv6 (::ffff:a.b.c.d) back to IPv4 before safety
+            // checks. Without this, an attacker can bypass loopback/private checks
+            // by resolving to e.g. ::ffff:127.0.0.1 (std's is_loopback() returns
+            // false for the V6 mapped form).
+            let ip = match addr.ip() {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::V6(v6)),
+                v4 => v4,
+            };
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || is_private_ip(&ip)
+                || is_link_local(&ip)
+            {
+                return Err(format!(
+                    "did:web domain '{domain_owned}' resolves to private/loopback address {ip}, \
+                     request blocked (SSRF protection)"
+                ));
+            }
+        }
+
+        Ok((addrs[0], global_guard, domain_guard))
+    })
+    .await
+    .map_err(|e| format!("DNS resolution task panicked: {e}"))?
 }
 
 /// Check if an IP address is in a private, reserved, or otherwise non-global range.
@@ -478,42 +528,38 @@ impl DidResolver {
         // workers) on every cache-miss fetch. The domain_clients cache is
         // bounded and TTL'd so an attacker spamming unique domains can only
         // create a bounded number of clients before eviction kicks in.
-        // RAII guard that decrements an AtomicU64 on drop, ensuring concurrency
-        // counters are always released even on early returns or panics.
-        struct ConcurrencyGuard(Arc<AtomicU64>);
-        impl Drop for ConcurrencyGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
 
         // Concurrency guards must live across the entire HTTP fetch, not just
-        // the setup block. Declaring them here ensures they are dropped only
-        // when `fetch_did_document` returns, keeping the concurrency counters
-        // accurate for the duration of the network call.
+        // the DNS resolution. They are acquired inside `spawn_blocking` (by
+        // `validate_and_resolve_domain`) and returned here so they remain held
+        // for the duration of the network call. This prevents a cancelled
+        // caller from freeing the slot while the blocking thread still runs.
         let mut _global_guard: Option<ConcurrencyGuard> = None;
         let mut _domain_guard: Option<ConcurrencyGuard> = None;
 
         let pinned_client = if did.starts_with("did:web:") {
-            // Global concurrency limit: cap concurrent outbound DNS + HTTP
-            // activity across ALL did:web domains. Slots are released as soon
-            // as each fetch completes, so attacker traffic that fails quickly
-            // cannot permanently exhaust the budget for legitimate users.
-            let global_prev = self
-                .global_didweb_fetch_count
-                .fetch_add(1, Ordering::Relaxed);
-            _global_guard = Some(ConcurrencyGuard(Arc::clone(&self.global_didweb_fetch_count)));
-            if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
-                return Err(format!(
-                    "global did:web concurrency limit exceeded \
-                     ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
-                ));
-            }
-
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
             let (domain_raw, _) = split_did_web_domain_path(raw)?;
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
-            let validated_addr = validate_and_resolve_domain(&domain).await?;
+
+            // Obtain the per-domain counter before entering the blocking
+            // closure. The moka cache call is cheap and sync-safe.
+            let domain_counter = self
+                .domain_fetch_counts
+                .get_with(domain.clone(), || Arc::new(AtomicU64::new(0)));
+
+            // DNS resolution + concurrency guard acquisition happen inside
+            // spawn_blocking. Guards are returned so they outlive the blocking
+            // task and cover the subsequent HTTP fetch.
+            let (validated_addr, global_guard, domain_guard) =
+                validate_and_resolve_domain(
+                    &domain,
+                    Arc::clone(&self.global_didweb_fetch_count),
+                    domain_counter,
+                )
+                .await?;
+            _global_guard = Some(global_guard);
+            _domain_guard = Some(domain_guard);
 
             // Extract hostname for DNS pinning. Bracketed IPv6 literals like
             // `[2001:db8::1]:8443` must be handled specially — a naive
@@ -525,21 +571,6 @@ impl DidResolver {
             // `did:web:example.com%3A80` and `did:web:example.com` don't
             // share a pinned client (which would poison TLS on port 80).
             let cache_key = domain.clone();
-
-            // Per-domain concurrency limit: prevent attackers from generating
-            // unique DID paths to flood a target domain with concurrent HTTP
-            // requests. Slots are released on fetch completion (via RAII guard).
-            let counter = self
-                .domain_fetch_counts
-                .get_with(cache_key.clone(), || Arc::new(AtomicU64::new(0)));
-            let domain_prev = counter.fetch_add(1, Ordering::Relaxed);
-            _domain_guard = Some(ConcurrencyGuard(counter));
-            if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
-                return Err(format!(
-                    "concurrency limit exceeded for did:web domain '{domain}' \
-                     ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
-                ));
-            }
 
             // Check the domain client cache first.
             let client = if let Some(cached) = self.domain_clients.get(&cache_key) {

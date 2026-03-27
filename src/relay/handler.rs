@@ -77,6 +77,15 @@ const RATE_BURST_CAPACITY: u32 = 500;
 /// exceeds a few messages per second outside the initial mesh setup.
 const RATE_REFILL_PER_SECOND: u32 = 20;
 
+/// Maximum messages a single sender may route to a single target within one
+/// rate-refill window before further messages to that target are dropped.
+/// Prevents one sender from filling a target's relay channel
+/// ([`RELAY_CHANNEL_CAPACITY`] = 256) with garbage, which would cause
+/// legitimate signalling messages from other peers to be silently dropped.
+/// Set to 64: generous for legitimate mesh setup (~1 SDP + ~10 ICE per target)
+/// but well below the channel capacity, leaving room for other senders.
+const PER_TARGET_BURST_LIMIT: u32 = 64;
+
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
 /// slots by presenting DIDs that tarpit the HTTP fetch (e.g. a server that
@@ -449,6 +458,12 @@ async fn handle_socket(
         // a malicious sender from kicking arbitrary targets.
         let mut backpressure_strikes: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Per-target message counters within the current rate-refill window.
+        // Prevents a single sender from filling one target's relay channel
+        // with garbage, which would cause legitimate signals from other senders
+        // to be silently dropped (WebRTC negotiation sabotage).
+        let mut per_target_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         // Per-sender token-bucket rate limiter with high burst capacity.
         // The burst allows WebRTC mesh initialization (N offers + N*K ICE
         // candidates) while the low refill rate caps sustained throughput.
@@ -555,6 +570,9 @@ async fn handle_socket(
                 // minted to preserve sub-token remainder accumulation.
                 if new_tokens == RATE_BURST_CAPACITY {
                     rate_last_refill = now;
+                    // Reset per-target counters when the bucket refills to
+                    // capacity, giving legitimate peers a fresh budget.
+                    per_target_counts.clear();
                 } else {
                     rate_last_refill +=
                         Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
@@ -582,6 +600,21 @@ async fn handle_socket(
                 );
                 continue;
             }
+
+            // Per-target burst limit: prevent one sender from monopolising a
+            // target's relay channel, which would starve legitimate signals
+            // from other peers (WebRTC negotiation sabotage).
+            let target_count = per_target_counts.entry(target_id.clone()).or_insert(0);
+            if *target_count >= PER_TARGET_BURST_LIMIT {
+                tracing::debug!(
+                    session = %session_id,
+                    target = %target_id,
+                    limit = PER_TARGET_BURST_LIMIT,
+                    "per-target burst limit reached, dropping signal"
+                );
+                continue;
+            }
+            *target_count += 1;
 
             let forwarded = SignalEnvelope {
                 peer_id: session_id.clone(),

@@ -75,3 +75,29 @@ fn broadcast_message_unreliable_channel() {
     };
     assert_eq!(msg.channel, ChannelKind::Unreliable);
 }
+
+/// Verify that running the game loop does not panic when no MatchboxSocket
+/// exists yet. Before the run_if guard was added, the chained systems would
+/// panic on the first frame because Commands are deferred.
+#[test]
+fn update_does_not_panic_without_socket() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.add_plugins(SymbiosMultiuserPlugin::<TestMsg>::new(
+        "wss://example.invalid/test_room",
+    ));
+    // This would panic before the fix because poll_peers / receive_messages /
+    // transmit_messages require ResMut<MatchboxSocket> which doesn't exist
+    // until apply_deferred runs after open_socket's Commands are flushed.
+    app.update();
+}
+
+/// Deferred plugin (no config) must also survive the game loop.
+#[test]
+fn update_does_not_panic_deferred() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.add_plugins(SymbiosMultiuserPlugin::<TestMsg>::deferred());
+    app.update();
+    app.update();
+}

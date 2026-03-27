@@ -123,6 +123,27 @@ pub fn transmit_messages<T>(
     }
 
     for event in broadcasts.read() {
+        // For unreliable messages, check the serialized size before allocating
+        // the full buffer. This avoids serializing (and immediately discarding)
+        // arbitrarily large payloads that exceed the MTU limit.
+        if event.channel == ChannelKind::Unreliable {
+            match bincode_options().serialized_size(&event.payload) {
+                Ok(size) if size as usize > MAX_UNRELIABLE_MESSAGE_SIZE => {
+                    tracing::warn!(
+                        size = size,
+                        max = MAX_UNRELIABLE_MESSAGE_SIZE,
+                        "dropping oversized unreliable message (exceeds WebRTC MTU safe limit)"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute broadcast message size");
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         let bytes = match bincode_options().serialize(&event.payload) {
             Ok(b) => b,
             Err(err) => {
@@ -132,15 +153,6 @@ pub fn transmit_messages<T>(
         };
         let packet: Box<[u8]> = bytes.into_boxed_slice();
         let channel_idx = event.channel.index();
-
-        if event.channel == ChannelKind::Unreliable && packet.len() > MAX_UNRELIABLE_MESSAGE_SIZE {
-            tracing::warn!(
-                size = packet.len(),
-                max = MAX_UNRELIABLE_MESSAGE_SIZE,
-                "dropping oversized unreliable message (exceeds WebRTC MTU safe limit)"
-            );
-            continue;
-        }
 
         let channel = match socket.get_channel_mut(channel_idx) {
             Ok(ch) => ch,
