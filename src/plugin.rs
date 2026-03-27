@@ -29,6 +29,7 @@ pub struct SymbiosMultiuserConfig<T> {
 /// Marker component inserted by [`open_socket`] to prevent re-opening the
 /// connection every frame. Generic over `T` so each plugin instance tracks
 /// its own socket independently.
+#[cfg(feature = "client")]
 #[derive(Resource)]
 struct SocketOpened<T>(PhantomData<T>);
 
@@ -95,6 +96,19 @@ impl<T> SymbiosMultiuserPlugin<T> {
     }
 }
 
+/// The `Plugin` impl is intentionally gated on the `client` feature.
+///
+/// Without `client`, the Symbios signaller is absent and the plugin would
+/// silently fall back to Matchbox's default signaller, which is wire-incompatible
+/// with the Symbios relay's `SignalEnvelope` format. Omitting the impl makes the
+/// crate fail to compile with a clear diagnostic:
+///
+/// ```text
+/// error[E0277]: `SymbiosMultiuserPlugin<T>` does not implement `Plugin`
+/// ```
+///
+/// Enable the `client` feature (included in `default`) to resolve this.
+#[cfg(feature = "client")]
 impl<T> Plugin for SymbiosMultiuserPlugin<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
@@ -120,6 +134,7 @@ where
     }
 }
 
+#[cfg(feature = "client")]
 fn open_socket<T: Send + Sync + 'static>(
     mut commands: Commands,
     config: Option<Res<SymbiosMultiuserConfig<T>>>,

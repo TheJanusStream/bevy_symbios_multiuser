@@ -165,6 +165,11 @@ pub struct PeerStateChanged {
 #[derive(Resource, Debug)]
 pub struct PeerStateQueue<T: Send + Sync + 'static> {
     events: VecDeque<PeerStateChanged>,
+    /// Whether a "queue full" warning has already been logged since the last
+    /// drain. Mirrors [`NetworkQueue::warned_full`] to prevent an attacker
+    /// rapidly toggling connection states from causing a synchronous log-I/O
+    /// flood on the game thread.
+    warned_full: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -172,6 +177,7 @@ impl<T: Send + Sync + 'static> Default for PeerStateQueue<T> {
     fn default() -> Self {
         Self {
             events: VecDeque::new(),
+            warned_full: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -181,9 +187,12 @@ impl<T: Send + Sync + 'static> PeerStateQueue<T> {
     /// Push a peer state change onto the queue, dropping it if at capacity.
     pub(crate) fn push(&mut self, event: PeerStateChanged) {
         if self.events.len() >= MAX_NETWORK_QUEUE_LEN {
-            bevy::log::warn!(
-                "PeerStateQueue full ({MAX_NETWORK_QUEUE_LEN} events), dropping incoming event"
-            );
+            if !self.warned_full {
+                bevy::log::warn!(
+                    "PeerStateQueue full ({MAX_NETWORK_QUEUE_LEN} events), dropping incoming event"
+                );
+                self.warned_full = true;
+            }
             return;
         }
         self.events.push_back(event);
@@ -191,6 +200,7 @@ impl<T: Send + Sync + 'static> PeerStateQueue<T> {
 
     /// Drain all queued events.
     pub fn drain(&mut self) -> impl Iterator<Item = PeerStateChanged> + '_ {
+        self.warned_full = false;
         self.events.drain(..)
     }
 

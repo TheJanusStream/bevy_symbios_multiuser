@@ -22,7 +22,10 @@ pub struct AtprotoCredentials {
 /// An authenticated ATProto session containing tokens and identity.
 ///
 /// Inserted as a Bevy [`Resource`] after successful authentication.
-#[derive(Resource, Debug, Clone)]
+/// Derives `Serialize`/`Deserialize` so host applications can persist and
+/// resume sessions (e.g. save to disk and restore via `refresh_jwt`) without
+/// manual mapping boilerplate.
+#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct AtprotoSession {
     /// The user's Decentralized Identifier.
     pub did: String,

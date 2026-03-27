@@ -545,13 +545,20 @@ async fn handle_socket(
                 // refill always saturates RATE_BURST_CAPACITY.
                 let elapsed_ms = (elapsed.as_millis() as u64).min(u32::MAX as u64) as u32;
                 let refill = (elapsed_ms.saturating_mul(RATE_REFILL_PER_SECOND) / 1000).max(1);
-                rate_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
-                // Advance the timer proportionally to the tokens actually
-                // minted, not to `now`. This preserves remainder time so
-                // sub-token fractional intervals accumulate correctly instead
-                // of being silently destroyed.
-                rate_last_refill +=
-                    Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
+                let new_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
+                rate_tokens = new_tokens;
+                // When the bucket fills to capacity, reset the clock to `now`
+                // so that saturating_mul overflow on very long-idle connections
+                // (e.g. ping-kept-alive for 49+ days) cannot cause the timer
+                // to fall behind and grant successive free max bursts. When
+                // the bucket is not full, advance proportionally to tokens
+                // minted to preserve sub-token remainder accumulation.
+                if new_tokens == RATE_BURST_CAPACITY {
+                    rate_last_refill = now;
+                } else {
+                    rate_last_refill +=
+                        Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
+                }
             }
             if rate_tokens == 0 {
                 tracing::warn!(
