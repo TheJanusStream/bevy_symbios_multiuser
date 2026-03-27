@@ -206,6 +206,29 @@ fn split_did_web_domain_path(raw: &str) -> Result<(&str, Option<&str>), String> 
 /// - `did:web:[2001:db8::1]` → `https://[2001:db8::1]/.well-known/did.json`
 ///
 /// Percent-encoded port separators (`%3A`) in the domain are decoded.
+/// Normalize a DID string for cache keying. For `did:web` DIDs, the domain
+/// portion is lowercased because DNS is case-insensitive — `did:web:Example.com`
+/// and `did:web:example.com` refer to the same host. Path segments and
+/// `did:plc` identifiers are left unchanged (PLC identifiers are already
+/// case-sensitive hex).
+fn normalize_did(did: &str) -> String {
+    if let Some(rest) = did.strip_prefix("did:web:") {
+        // The domain is everything up to the first ':' after the method prefix
+        // (colons separate path segments in did:web). Lowercase only the domain.
+        if let Some(colon_pos) = rest.find(':') {
+            format!(
+                "did:web:{}{}",
+                rest[..colon_pos].to_ascii_lowercase(),
+                &rest[colon_pos..]
+            )
+        } else {
+            format!("did:web:{}", rest.to_ascii_lowercase())
+        }
+    } else {
+        did.to_string()
+    }
+}
+
 fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
     if did.starts_with("did:plc:") {
         Ok(format!("{}/{did}", plc_directory.trim_end_matches('/')))
@@ -474,6 +497,13 @@ impl DidResolver {
     ///
     /// The moka cache handles TTL expiry and W-TinyLFU eviction automatically.
     pub async fn resolve_key(&self, did: &str) -> Result<ResolvedKey, String> {
+        // Normalize the DID for cache keying. DNS is case-insensitive, so
+        // did:web:Example.com and did:web:example.com should share a cache
+        // entry. Lowercase the domain portion of did:web DIDs to prevent
+        // case-permutation cache bypass attacks.
+        let normalized = normalize_did(did);
+        let did = normalized.as_str();
+
         // Reject DIDs that recently failed resolution to prevent repeated
         // outbound requests (DDoS reflection / resource exhaustion).
         if let Some(cached_err) = self.negative_cache.get(did) {

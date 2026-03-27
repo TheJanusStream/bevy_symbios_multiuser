@@ -78,13 +78,33 @@ const RATE_BURST_CAPACITY: u32 = 500;
 const RATE_REFILL_PER_SECOND: u32 = 20;
 
 /// Maximum messages a single sender may route to a single target within one
-/// rate-refill window before further messages to that target are dropped.
+/// per-target window before further messages to that target are dropped.
 /// Prevents one sender from filling a target's relay channel
 /// ([`RELAY_CHANNEL_CAPACITY`] = 256) with garbage, which would cause
 /// legitimate signalling messages from other peers to be silently dropped.
 /// Set to 64: generous for legitimate mesh setup (~1 SDP + ~10 ICE per target)
 /// but well below the channel capacity, leaving room for other senders.
 const PER_TARGET_BURST_LIMIT: u32 = 64;
+
+/// Interval at which per-target message counters are reset. Decoupled from
+/// the token-bucket refill to prevent an attacker from keeping the bucket
+/// below capacity (preventing the clear) while inserting unbounded unique
+/// target keys.
+const PER_TARGET_WINDOW: Duration = Duration::from_secs(1);
+
+/// Maximum number of unique targets a single sender may address within one
+/// [`PER_TARGET_WINDOW`]. Legitimate peers target at most the number of
+/// peers in their room; an attacker forging random target IDs would quickly
+/// exceed this cap. Set to 256 to comfortably cover large rooms while
+/// bounding the memory footprint of the per-target map.
+const MAX_UNIQUE_TARGETS: usize = 256;
+
+/// Maximum allowed length (in bytes) for the `peer_id` field in a
+/// [`SignalEnvelope`]. DIDs and UUIDs are well under 256 bytes; anything
+/// larger is either malformed or an attempt to bloat per-target maps and
+/// log output. Checked after deserialization to reject oversized fields
+/// that fit within [`MAX_WS_MESSAGE_SIZE`] but are still abusive.
+const MAX_PEER_ID_LENGTH: usize = 512;
 
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
@@ -458,12 +478,17 @@ async fn handle_socket(
         // a malicious sender from kicking arbitrary targets.
         let mut backpressure_strikes: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        // Per-target message counters within the current rate-refill window.
+        // Per-target message counters within the current per-target window.
         // Prevents a single sender from filling one target's relay channel
         // with garbage, which would cause legitimate signals from other senders
         // to be silently dropped (WebRTC negotiation sabotage).
+        // Cleared on a fixed timer (PER_TARGET_WINDOW) rather than tied to
+        // the token bucket refill, preventing an attacker from keeping the
+        // bucket below capacity to avoid the clear while inserting unbounded
+        // unique target keys.
         let mut per_target_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        let mut per_target_last_reset = tokio::time::Instant::now();
         // Per-sender token-bucket rate limiter with high burst capacity.
         // The burst allows WebRTC mesh initialization (N offers + N*K ICE
         // candidates) while the low refill rate caps sustained throughput.
@@ -525,6 +550,27 @@ async fn handle_socket(
                 }
             };
 
+            // Reject oversized peer_id fields. DIDs and UUIDs are well
+            // under 512 bytes; larger values bloat per-target maps, log
+            // output, and tracing allocations.
+            if envelope.peer_id.len() > MAX_PEER_ID_LENGTH {
+                invalid_count += 1;
+                tracing::warn!(
+                    session = %session_id,
+                    peer_id_len = envelope.peer_id.len(),
+                    count = invalid_count,
+                    "dropping signal with oversized peer_id (max {MAX_PEER_ID_LENGTH} bytes)"
+                );
+                if invalid_count >= MAX_INVALID_MESSAGES {
+                    tracing::warn!(
+                        session = %session_id,
+                        "disconnecting peer after {MAX_INVALID_MESSAGES} invalid messages"
+                    );
+                    break;
+                }
+                continue;
+            }
+
             // Reject control signals from clients — only the relay may
             // originate PeerJoined/PeerLeft to prevent mesh spoofing.
             // Counts toward the invalid message limit to prevent attackers
@@ -570,13 +616,19 @@ async fn handle_socket(
                 // minted to preserve sub-token remainder accumulation.
                 if new_tokens == RATE_BURST_CAPACITY {
                     rate_last_refill = now;
-                    // Reset per-target counters when the bucket refills to
-                    // capacity, giving legitimate peers a fresh budget.
-                    per_target_counts.clear();
                 } else {
                     rate_last_refill +=
                         Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
                 }
+            }
+
+            // Per-target window reset: clear counters on a fixed timer,
+            // decoupled from the token bucket. This prevents an attacker
+            // from suppressing the clear by keeping the bucket below capacity
+            // while inserting unbounded unique target keys.
+            if now.duration_since(per_target_last_reset) >= PER_TARGET_WINDOW {
+                per_target_counts.clear();
+                per_target_last_reset = now;
             }
             if rate_tokens == 0 {
                 tracing::warn!(
@@ -599,6 +651,21 @@ async fn handle_socket(
                     "dropping self-targeted signal"
                 );
                 continue;
+            }
+
+            // Unique target cap: reject senders addressing an absurd number
+            // of distinct targets within one window. Legitimate peers target
+            // at most the number of peers in their room; an attacker forging
+            // random target IDs to bloat the map will hit this cap.
+            if !per_target_counts.contains_key(&target_id)
+                && per_target_counts.len() >= MAX_UNIQUE_TARGETS
+            {
+                tracing::warn!(
+                    session = %session_id,
+                    unique_targets = per_target_counts.len(),
+                    "disconnecting peer: exceeded unique target cap ({MAX_UNIQUE_TARGETS})"
+                );
+                break;
             }
 
             // Per-target burst limit: prevent one sender from monopolising a
@@ -677,6 +744,10 @@ async fn handle_socket(
                     }
                 }
             } else {
+                // Target disconnected — remove any orphaned backpressure
+                // strike entry so it doesn't accumulate permanently over
+                // long-lived connections that interact with many transient peers.
+                backpressure_strikes.remove(&target_id);
                 tracing::debug!(target = %target_id, "target peer not found, dropping signal");
             }
         }
