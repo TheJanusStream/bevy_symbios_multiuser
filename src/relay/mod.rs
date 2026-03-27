@@ -125,6 +125,20 @@
 //!   spraying attacks from exhausting the Tokio blocking thread pool with DNS
 //!   resolution calls. Like the per-domain limit, slots are freed on
 //!   completion, making the limit resistant to unauthenticated DoS.
+//! - **Peer ID length validation** — The `peer_id` field in incoming
+//!   [`SignalEnvelope`] messages is capped at 512 bytes after deserialization.
+//!   DIDs and UUIDs are well under this limit; oversized values are rejected
+//!   as invalid messages to prevent per-target map bloat and log-output
+//!   amplification.
+//! - **Unique target cap** — Each sender may address at most 256 unique targets
+//!   within a single per-target rate window. Legitimate peers target at most
+//!   the number of peers in their room; an attacker forging random target IDs
+//!   to bloat the per-target counter map is disconnected when the cap is
+//!   exceeded.
+//! - **JWT audience validation** — When [`RelayConfig::service_did`] is set,
+//!   the relay validates the JWT `aud` claim against the configured value.
+//!   This prevents cross-service token replay attacks where a JWT issued for
+//!   one relay is presented to a different relay.
 //!
 //! # Usage
 //!

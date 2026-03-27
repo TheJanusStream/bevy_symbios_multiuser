@@ -78,8 +78,9 @@
 //!   idle/handshake timeouts, HTTP-level Slowloris protection, server-side
 //!   pings (WASM keep-alive), per-sender token-bucket rate limiting,
 //!   per-target burst limiting, per-domain and global `did:web` fetch
-//!   concurrency limiting, request coalescing, and negative DID caching.
-//!   Built on `axum`.
+//!   concurrency limiting, request coalescing, negative DID caching, peer ID
+//!   length validation, unique target cap, and JWT audience validation
+//!   (`service_did`). Built on `axum`.
 
 pub mod error;
 pub mod messages;
