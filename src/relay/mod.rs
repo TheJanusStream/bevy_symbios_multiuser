@@ -102,6 +102,14 @@
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
 //!   fetch with slow-responding servers.
+//! - **Per-target burst limiting** — Each sender may route at most 64 messages
+//!   to the same target within a single rate-refill window. This prevents one
+//!   sender from filling a target's relay channel (256 slots) with garbage,
+//!   which would cause legitimate signalling messages from other peers to be
+//!   silently dropped (WebRTC negotiation sabotage). The limit is generous for
+//!   legitimate mesh setup (~1 SDP + ~10 ICE per target) but well below the
+//!   channel capacity, leaving room for other senders. Counters reset when the
+//!   per-sender token bucket refills to capacity.
 //! - **Per-sender rate limiting** — Each peer is rate-limited via a token bucket
 //!   with a burst capacity of 500 messages and a steady-state refill of 20
 //!   tokens per second. The high burst accommodates WebRTC mesh initialization

@@ -77,8 +77,9 @@
 //!   connection limits, SSRF-hardened DID resolution, message size caps,
 //!   idle/handshake timeouts, HTTP-level Slowloris protection, server-side
 //!   pings (WASM keep-alive), per-sender token-bucket rate limiting,
-//!   per-domain and global `did:web` fetch concurrency limiting, request
-//!   coalescing, and negative DID caching. Built on `axum`.
+//!   per-target burst limiting, per-domain and global `did:web` fetch
+//!   concurrency limiting, request coalescing, and negative DID caching.
+//!   Built on `axum`.
 
 pub mod error;
 pub mod messages;
