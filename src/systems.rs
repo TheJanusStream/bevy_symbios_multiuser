@@ -28,7 +28,10 @@ pub fn bincode_options() -> impl Options {
 
 /// Polls the matchbox socket for peer connection state changes and pushes
 /// them to the [`PeerStateQueue`] resource.
-pub fn poll_peers(mut socket: ResMut<MatchboxSocket>, mut peer_queue: ResMut<PeerStateQueue>) {
+pub fn poll_peers<T: Send + Sync + 'static>(
+    mut socket: ResMut<MatchboxSocket>,
+    mut peer_queue: ResMut<PeerStateQueue<T>>,
+) {
     let Ok(changes) = socket.try_update_peers() else {
         return;
     };

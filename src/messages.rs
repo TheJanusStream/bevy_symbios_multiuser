@@ -158,12 +158,26 @@ pub struct PeerStateChanged {
 /// Like [`NetworkQueue`], this avoids the double-buffer clearing issue with
 /// Bevy `Messages` so that `FixedUpdate` consumers never miss a peer
 /// connect/disconnect event. Capped at [`MAX_NETWORK_QUEUE_LEN`].
-#[derive(Resource, Debug, Default)]
-pub struct PeerStateQueue {
+///
+/// The type parameter `T` ties this queue to a specific
+/// [`SymbiosMultiuserPlugin<T>`](crate::plugin::SymbiosMultiuserPlugin)
+/// instance, so multiple plugins can coexist without sharing peer events.
+#[derive(Resource, Debug)]
+pub struct PeerStateQueue<T: Send + Sync + 'static> {
     events: VecDeque<PeerStateChanged>,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl PeerStateQueue {
+impl<T: Send + Sync + 'static> Default for PeerStateQueue<T> {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> PeerStateQueue<T> {
     /// Push a peer state change onto the queue, dropping it if at capacity.
     pub(crate) fn push(&mut self, event: PeerStateChanged) {
         if self.events.len() >= MAX_NETWORK_QUEUE_LEN {

@@ -10,14 +10,27 @@ use std::marker::PhantomData;
 use crate::auth::AtprotoSession;
 
 /// Configuration for the symbios multiuser plugin.
+///
+/// The type parameter `T` ties this config to a specific
+/// [`SymbiosMultiuserPlugin<T>`] instance, so multiple plugins with different
+/// payload types can coexist in the same Bevy app without overwriting each
+/// other's configuration or resources.
 #[derive(Resource, Debug, Clone)]
-pub struct SymbiosMultiuserConfig {
+pub struct SymbiosMultiuserConfig<T> {
     /// WebSocket URL for the signaling server room.
     /// Example: `"wss://matchbox.example.com/my_room"`
     pub room_url: String,
     /// Optional ICE server configuration for NAT traversal.
     pub ice_servers: Option<RtcIceServerConfig>,
+    #[doc(hidden)]
+    pub _marker: PhantomData<T>,
 }
+
+/// Marker component inserted by [`open_socket`] to prevent re-opening the
+/// connection every frame. Generic over `T` so each plugin instance tracks
+/// its own socket independently.
+#[derive(Resource)]
+struct SocketOpened<T>(PhantomData<T>);
 
 /// A generic multiplayer plugin that transports domain messages of type `T`
 /// over WebRTC data channels.
@@ -28,30 +41,55 @@ pub struct SymbiosMultiuserConfig {
 ///
 /// The plugin exposes a Bevy [`Message`] type [`Broadcast<T>`] for outbound
 /// traffic and a [`NetworkQueue<T>`] resource for inbound traffic. Peer
-/// connection state changes are delivered via [`PeerStateQueue`]. The host
+/// connection state changes are delivered via [`PeerStateQueue<T>`]. The host
 /// application interacts with these to send and receive domain-specific
 /// messages without touching the network layer directly.
+///
+/// The socket connection is **not** opened at startup. Instead, the plugin
+/// watches for the insertion of [`SymbiosMultiuserConfig<T>`] and opens the
+/// socket on the first frame after the config resource appears. This lets
+/// developers insert the config after login/menu screens rather than being
+/// forced to connect immediately at app launch.
 pub struct SymbiosMultiuserPlugin<T> {
-    config: SymbiosMultiuserConfig,
+    config: Option<SymbiosMultiuserConfig<T>>,
     _marker: PhantomData<T>,
 }
 
 impl<T> SymbiosMultiuserPlugin<T> {
     /// Create a new plugin that connects to the given signaling server room URL.
+    ///
+    /// The config is inserted immediately, so the socket opens on the first
+    /// frame. For deferred connection, use [`Self::deferred`] and insert
+    /// [`SymbiosMultiuserConfig<T>`] yourself when ready.
     pub fn new(room_url: impl Into<String>) -> Self {
         Self {
-            config: SymbiosMultiuserConfig {
+            config: Some(SymbiosMultiuserConfig {
                 room_url: room_url.into(),
                 ice_servers: None,
-            },
+                _marker: PhantomData,
+            }),
             _marker: PhantomData,
         }
     }
 
     /// Create a new plugin with full configuration control.
-    pub fn with_config(config: SymbiosMultiuserConfig) -> Self {
+    ///
+    /// The config is inserted immediately. For deferred connection, use
+    /// [`Self::deferred`].
+    pub fn with_config(config: SymbiosMultiuserConfig<T>) -> Self {
         Self {
-            config,
+            config: Some(config),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Create a plugin that registers systems but does **not** insert a config.
+    ///
+    /// The socket will not open until the application inserts a
+    /// [`SymbiosMultiuserConfig<T>`] resource (e.g. after a login screen).
+    pub fn deferred() -> Self {
+        Self {
+            config: None,
             _marker: PhantomData,
         }
     }
@@ -62,29 +100,40 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
     fn build(&self, app: &mut App) {
-        app.insert_resource(self.config.clone())
-            .init_resource::<NetworkQueue<T>>()
-            .init_resource::<PeerStateQueue>()
+        app.init_resource::<NetworkQueue<T>>()
+            .init_resource::<PeerStateQueue<T>>()
             .add_message::<Broadcast<T>>()
-            .add_systems(Startup, open_socket)
             .add_systems(
                 Update,
                 (
-                    systems::poll_peers,
+                    open_socket::<T>,
+                    systems::poll_peers::<T>,
                     systems::receive_messages::<T>,
                     systems::transmit_messages::<T>,
                 )
                     .chain(),
             );
+
+        if let Some(ref config) = self.config {
+            app.insert_resource(config.clone());
+        }
     }
 }
 
-fn open_socket(
+fn open_socket<T: Send + Sync + 'static>(
     mut commands: Commands,
-    config: Res<SymbiosMultiuserConfig>,
+    config: Option<Res<SymbiosMultiuserConfig<T>>>,
+    opened: Option<Res<SocketOpened<T>>>,
     #[cfg(feature = "client")] session: Option<Res<AtprotoSession>>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
 ) {
+    if opened.is_some() {
+        return;
+    }
+    let Some(config) = config else {
+        return;
+    };
+
     let mut builder = WebRtcSocketBuilder::new(&config.room_url)
         .add_channel(ChannelConfig::reliable())
         .add_channel(ChannelConfig::unreliable());
@@ -111,4 +160,5 @@ fn open_socket(
     }
 
     commands.open_socket(builder);
+    commands.insert_resource(SocketOpened::<T>(PhantomData));
 }
