@@ -94,12 +94,12 @@
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
 //!   fetch with slow-responding servers.
-//! - **Per-sender rate limiting** — Each peer is limited to 60 routed messages
-//!   per second. Peers that exceed this rate are immediately disconnected.
-//!   Legitimate WebRTC signaling produces at most a handful of messages per
-//!   second (SDP offer, answer, a few ICE candidates per peer), so the limit
-//!   is generous for normal use while preventing flood attacks that could
-//!   trigger backpressure eviction of other peers.
+//! - **Per-sender rate limiting** — Each peer is rate-limited via a token bucket
+//!   with a burst capacity of 500 messages and a steady-state refill of 20
+//!   tokens per second. The high burst accommodates WebRTC mesh initialization
+//!   (joining a room with N peers generates N SDP offers + multiple ICE
+//!   candidates each), while the low refill rate caps sustained throughput.
+//!   Peers that exhaust their tokens are immediately disconnected.
 //! - **Per-domain DID fetch concurrency limit** — Each `did:web` domain is
 //!   limited to 10 concurrent in-flight fetches. Slots are released as soon as
 //!   each fetch completes (via RAII guard), so attacker requests that fail

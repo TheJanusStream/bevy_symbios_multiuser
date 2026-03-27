@@ -19,7 +19,9 @@ fn plugin_registers_messages_and_resources() {
     ));
 
     // The config resource should be inserted.
-    let config = app.world().get_resource::<SymbiosMultiuserConfig<TestMsg>>();
+    let config = app
+        .world()
+        .get_resource::<SymbiosMultiuserConfig<TestMsg>>();
     assert!(config.is_some());
     assert_eq!(config.unwrap().room_url, "wss://example.invalid/test_room");
 }
@@ -50,7 +52,9 @@ fn deferred_plugin_has_no_config_initially() {
     app.add_plugins(MinimalPlugins);
     app.add_plugins(SymbiosMultiuserPlugin::<TestMsg>::deferred());
 
-    let config = app.world().get_resource::<SymbiosMultiuserConfig<TestMsg>>();
+    let config = app
+        .world()
+        .get_resource::<SymbiosMultiuserConfig<TestMsg>>();
     assert!(config.is_none(), "deferred plugin should not insert config");
 }
 

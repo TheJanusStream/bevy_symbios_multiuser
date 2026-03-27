@@ -23,8 +23,9 @@
 //!    browser `WebSocket` API does not support custom headers).
 //! 3. The relay (`relay` module, feature-gated) validates the JWT claims and — when
 //!    `auth_required` is enabled — resolves the issuer's DID document to
-//!    cryptographically verify the ES256 signature against the `#atproto`
-//!    signing key. The authenticated DID becomes the peer's session identity.
+//!    cryptographically verify the signature (ES256/P-256 or ES256K/secp256k1)
+//!    against the `#atproto` signing key. The authenticated DID becomes the
+//!    peer's session identity.
 //! 4. Once signaling completes, data flows directly peer-to-peer over
 //!    WebRTC data channels.
 //!
