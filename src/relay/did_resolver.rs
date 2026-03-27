@@ -236,6 +236,7 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
 /// created in async code, dropping the async future (e.g. client TCP disconnect)
 /// would free the concurrency slot while the blocking DNS thread continues,
 /// allowing an attacker to bypass limits and exhaust the blocking pool.
+#[cfg_attr(test, derive(Debug))]
 struct ConcurrencyGuard(Arc<AtomicU64>);
 
 impl Drop for ConcurrencyGuard {
@@ -978,9 +979,21 @@ mod tests {
 
     // ── SSRF protection tests ─────────────────────────────────────────
 
+    /// Helper: call `validate_and_resolve_domain` with fresh counters.
+    async fn resolve_domain_for_test(
+        domain: &str,
+    ) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), String> {
+        validate_and_resolve_domain(
+            domain,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn ssrf_rejects_loopback() {
-        let result = validate_and_resolve_domain("localhost").await;
+        let result = resolve_domain_for_test("localhost").await;
         assert!(result.is_err(), "expected loopback to be rejected");
         assert!(
             result.unwrap_err().contains("SSRF protection"),
@@ -990,43 +1003,43 @@ mod tests {
 
     #[tokio::test]
     async fn ssrf_rejects_127_0_0_1() {
-        let result = validate_and_resolve_domain("127.0.0.1").await;
+        let result = resolve_domain_for_test("127.0.0.1").await;
         assert!(result.is_err(), "expected 127.0.0.1 to be rejected");
     }
 
     #[tokio::test]
     async fn ssrf_rejects_private_10_network() {
-        let result = validate_and_resolve_domain("10.0.0.1").await;
+        let result = resolve_domain_for_test("10.0.0.1").await;
         assert!(result.is_err(), "expected 10.x.x.x to be rejected");
     }
 
     #[tokio::test]
     async fn ssrf_rejects_private_172_network() {
-        let result = validate_and_resolve_domain("172.16.0.1").await;
+        let result = resolve_domain_for_test("172.16.0.1").await;
         assert!(result.is_err(), "expected 172.16.x.x to be rejected");
     }
 
     #[tokio::test]
     async fn ssrf_rejects_private_192_168_network() {
-        let result = validate_and_resolve_domain("192.168.1.1").await;
+        let result = resolve_domain_for_test("192.168.1.1").await;
         assert!(result.is_err(), "expected 192.168.x.x to be rejected");
     }
 
     #[tokio::test]
     async fn ssrf_rejects_link_local() {
-        let result = validate_and_resolve_domain("169.254.1.1").await;
+        let result = resolve_domain_for_test("169.254.1.1").await;
         assert!(result.is_err(), "expected link-local to be rejected");
     }
 
     #[tokio::test]
     async fn ssrf_rejects_loopback_with_port() {
-        let result = validate_and_resolve_domain("127.0.0.1:10250").await;
+        let result = resolve_domain_for_test("127.0.0.1:10250").await;
         assert!(result.is_err(), "expected 127.0.0.1:port to be rejected");
     }
 
     #[tokio::test]
     async fn ssrf_rejects_this_network_0_0_0_1() {
-        let result = validate_and_resolve_domain("0.0.0.1").await;
+        let result = resolve_domain_for_test("0.0.0.1").await;
         assert!(
             result.is_err(),
             "expected 0.0.0.1 (this-network) to be rejected"
@@ -1035,7 +1048,7 @@ mod tests {
 
     #[tokio::test]
     async fn ssrf_rejects_multicast() {
-        let result = validate_and_resolve_domain("224.0.0.1").await;
+        let result = resolve_domain_for_test("224.0.0.1").await;
         assert!(
             result.is_err(),
             "expected multicast 224.0.0.1 to be rejected"
@@ -1044,7 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn ssrf_rejects_broadcast() {
-        let result = validate_and_resolve_domain("255.255.255.255").await;
+        let result = resolve_domain_for_test("255.255.255.255").await;
         assert!(result.is_err(), "expected broadcast to be rejected");
     }
 
