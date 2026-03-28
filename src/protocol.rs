@@ -25,8 +25,8 @@ pub enum SignalPayload {
     Answer(String),
     /// An ICE candidate for NAT traversal.
     IceCandidate(String),
-    /// A new peer has joined the room.
+    /// A new peer has joined the room. The payload is the joining peer's session ID.
     PeerJoined(String),
-    /// A peer has left the room.
+    /// A peer has left the room. The payload is the leaving peer's session ID.
     PeerLeft(String),
 }

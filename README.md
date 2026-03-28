@@ -146,21 +146,23 @@ app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
 ));
 ```
 
-For games with a login screen, use the deferred constructor to register systems without opening a socket. Insert the config resource later when ready:
+For games with a login screen, use the deferred constructor to register systems without opening a socket. Insert both resources later when ready:
 
 ```rust
 // Deferred connection (session obtained after login):
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::deferred());
 
-// Later, after the user logs in:
-fn on_login(mut commands: Commands, session: AtprotoSession) {
-    commands.insert_resource(session);
+// Later, after the user logs in, insert both resources via Commands
+// (e.g., from a Bevy state-transition system or a one-shot system):
+fn on_login(mut commands: Commands, session: Res<AtprotoSession>) {
     commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
         room_url: "wss://relay.example.com/ws".to_string(),
         ice_servers: None,
         _marker: std::marker::PhantomData,
     });
 }
+// AtprotoSession itself is inserted as a resource once async login completes:
+//   commands.insert_resource(session); // session: AtprotoSession from create_session()
 ```
 
 ### Token Refresh for Long-Lived Apps

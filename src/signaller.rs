@@ -66,8 +66,10 @@ use ws_stream_wasm::{WsMessage as WasmWsMessage, WsMeta, WsStream};
 
 // ── Shared constants & helpers ───────────────────────────────────────────────
 
-/// Namespace UUID for deterministic `PeerId` generation from DID strings.
-/// Produced by `Uuid::new_v5(Uuid::NAMESPACE_URL, b"symbios:did")`.
+/// Namespace UUID for deterministic `PeerId` generation from DID strings
+/// (`Uuid::NAMESPACE_X500` — `6ba7b814-9dad-11d1-80b4-00c04fd430c8`).
+/// Using a fixed, well-known namespace ensures the same DID always maps to
+/// the same `PeerId` regardless of when or where it is computed.
 const DID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
@@ -126,11 +128,13 @@ pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
 /// A [`SignallerBuilder`] that injects an ATProto JWT into the WebSocket
 /// upgrade request's `Authorization` header.
 ///
-/// Supports two token modes:
+/// Supports three token modes:
 /// - **Static**: a fixed JWT cloned at construction (via [`signaller_for_session`]).
 /// - **Refreshable**: a shared [`TokenSource`] that the application can update
 ///   externally (via [`signaller_with_token_source`]). On each reconnect the
 ///   builder reads the latest token, avoiding stale-JWT rejections.
+/// - **Anonymous**: no JWT at all (via [`signaller_anonymous`]). Still speaks
+///   the relay's `SignalEnvelope` wire format; connects without authentication.
 #[derive(Debug, Clone)]
 pub struct SymbiosSignallerBuilder {
     /// Static JWT, used when no `token_source` is provided.

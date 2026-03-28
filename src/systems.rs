@@ -49,14 +49,18 @@ pub fn poll_peers<T: Send + Sync + 'static>(
     }
 }
 
-/// Drains incoming data from all channels, deserializes from `bincode`,
-/// and pushes [`NetworkReceived<T>`] entries to the [`NetworkQueue<T>`] resource.
 /// Maximum number of deserialization failures logged at `warn` level per
 /// invocation of [`receive_messages`]. After this many warnings, further
 /// failures are logged at `trace` to prevent an attacker from causing frame
 /// drops via synchronous log I/O on the game thread.
 const MAX_DESER_WARNS_PER_FRAME: usize = 3;
 
+/// Drains incoming data from all channels, deserializes from `bincode`,
+/// and pushes [`NetworkReceived<T>`] entries to the [`NetworkQueue<T>`] resource.
+///
+/// Deserialization failures are logged at `warn` up to
+/// [`MAX_DESER_WARNS_PER_FRAME`] times per call, then demoted to `trace`
+/// to prevent log-I/O floods from a malicious peer.
 pub fn receive_messages<T>(mut socket: ResMut<MatchboxSocket>, mut queue: ResMut<NetworkQueue<T>>)
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
