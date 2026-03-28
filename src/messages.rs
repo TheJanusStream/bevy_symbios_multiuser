@@ -161,7 +161,8 @@ pub struct PeerStateChanged {
 ///
 /// The type parameter `T` ties this queue to a specific
 /// [`SymbiosMultiuserPlugin<T>`](crate::plugin::SymbiosMultiuserPlugin)
-/// instance, so multiple plugins can coexist without sharing peer events.
+/// instance. Only one plugin instance should be added per app — the underlying
+/// `MatchboxSocket` is not generic, so two instances would share the same socket.
 #[derive(Resource, Debug)]
 pub struct PeerStateQueue<T: Send + Sync + 'static> {
     events: VecDeque<PeerStateChanged>,
@@ -199,9 +200,14 @@ impl<T: Send + Sync + 'static> PeerStateQueue<T> {
     }
 
     /// Drain all queued events.
-    pub fn drain(&mut self) -> impl Iterator<Item = PeerStateChanged> + '_ {
+    ///
+    /// Uses [`std::mem::take`] so the queue is immediately empty and no
+    /// lifetime borrow is held on `self`, matching [`NetworkQueue::drain`].
+    /// This prevents inconsistent internal state if the caller leaks the
+    /// iterator via [`std::mem::forget`].
+    pub fn drain(&mut self) -> impl Iterator<Item = PeerStateChanged> {
         self.warned_full = false;
-        self.events.drain(..)
+        std::mem::take(&mut self.events).into_iter()
     }
 
     /// Returns `true` if there are no queued events.

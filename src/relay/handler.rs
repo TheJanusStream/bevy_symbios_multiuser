@@ -605,20 +605,28 @@ async fn handle_socket(
                 // not the rate limiter clock). The cap is high enough that the
                 // refill always saturates RATE_BURST_CAPACITY.
                 let elapsed_ms = (elapsed.as_millis() as u64).min(u32::MAX as u64) as u32;
-                let refill = (elapsed_ms.saturating_mul(RATE_REFILL_PER_SECOND) / 1000).max(1);
-                let new_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
-                rate_tokens = new_tokens;
-                // When the bucket fills to capacity, reset the clock to `now`
-                // so that saturating_mul overflow on very long-idle connections
-                // (e.g. ping-kept-alive for 49+ days) cannot cause the timer
-                // to fall behind and grant successive free max bursts. When
-                // the bucket is not full, advance proportionally to tokens
-                // minted to preserve sub-token remainder accumulation.
-                if new_tokens == RATE_BURST_CAPACITY {
-                    rate_last_refill = now;
-                } else {
-                    rate_last_refill +=
-                        Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
+                let refill = elapsed_ms.saturating_mul(RATE_REFILL_PER_SECOND) / 1000;
+                // When integer division truncates to 0 (refill rate is low and
+                // insufficient time has accumulated), skip the update entirely.
+                // Advancing the timestamp without minting tokens would push
+                // `rate_last_refill` into the future, causing
+                // `now.duration_since(rate_last_refill)` to panic on the next
+                // packet. The check fires again once enough time has elapsed.
+                if refill > 0 {
+                    let new_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
+                    rate_tokens = new_tokens;
+                    // When the bucket fills to capacity, reset the clock to `now`
+                    // so that saturating_mul overflow on very long-idle connections
+                    // (e.g. ping-kept-alive for 49+ days) cannot cause the timer
+                    // to fall behind and grant successive free max bursts. When
+                    // the bucket is not full, advance proportionally to tokens
+                    // minted to preserve sub-token remainder accumulation.
+                    if new_tokens == RATE_BURST_CAPACITY {
+                        rate_last_refill = now;
+                    } else {
+                        rate_last_refill +=
+                            Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
+                    }
                 }
             }
 

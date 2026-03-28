@@ -12,9 +12,9 @@ use crate::auth::AtprotoSession;
 /// Configuration for the symbios multiuser plugin.
 ///
 /// The type parameter `T` ties this config to a specific
-/// [`SymbiosMultiuserPlugin<T>`] instance, so multiple plugins with different
-/// payload types can coexist in the same Bevy app without overwriting each
-/// other's configuration or resources.
+/// [`SymbiosMultiuserPlugin<T>`] instance. Only one plugin instance should be
+/// added per app — the underlying `MatchboxSocket` resource is not generic, so
+/// two instances would share the same socket and corrupt each other's messages.
 #[derive(Resource, Debug, Clone)]
 pub struct SymbiosMultiuserConfig<T> {
     /// WebSocket URL for the signaling server room.

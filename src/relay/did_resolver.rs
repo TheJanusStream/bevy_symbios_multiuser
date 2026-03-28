@@ -213,16 +213,21 @@ fn split_did_web_domain_path(raw: &str) -> Result<(&str, Option<&str>), String> 
 /// case-sensitive hex).
 fn normalize_did(did: &str) -> String {
     if let Some(rest) = did.strip_prefix("did:web:") {
-        // The domain is everything up to the first ':' after the method prefix
-        // (colons separate path segments in did:web). Lowercase only the domain.
-        if let Some(colon_pos) = rest.find(':') {
-            format!(
-                "did:web:{}{}",
-                rest[..colon_pos].to_ascii_lowercase(),
-                &rest[colon_pos..]
-            )
-        } else {
-            format!("did:web:{}", rest.to_ascii_lowercase())
+        // Use split_did_web_domain_path to correctly identify the domain
+        // boundary for both regular hosts and bracketed IPv6 addresses.
+        // A naïve `rest.find(':')` would match a colon *inside* an IPv6
+        // bracket group (e.g. `[2001:DB8::1]`) rather than the path separator
+        // colon that follows it, causing case permutations of the IPv6 address
+        // to bypass the moka cache and the per-DID request coalescing.
+        match split_did_web_domain_path(rest) {
+            Ok((domain, Some(path))) => {
+                format!("did:web:{}:{}", domain.to_ascii_lowercase(), path)
+            }
+            Ok((domain, None)) => {
+                format!("did:web:{}", domain.to_ascii_lowercase())
+            }
+            // Malformed DID — return as-is; downstream validation will reject it.
+            Err(_) => did.to_string(),
         }
     } else {
         did.to_string()
