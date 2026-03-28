@@ -147,8 +147,11 @@ pub struct WsQueryParams {
 /// identity. Unauthenticated requests receive HTTP 401.
 ///
 /// When `auth_required` is disabled, authentication is opportunistic: a valid
-/// JWT will still be used for identity, but missing or invalid tokens are
-/// silently ignored and a random UUID is assigned instead.
+/// JWT will still be used for identity, and a missing token results in a random
+/// UUID being assigned. However, an explicitly invalid (malformed, expired, or
+/// signature-failing) token is always rejected with HTTP 401 regardless of
+/// `auth_required`, to prevent split-brain where the client believes it is
+/// authenticated by its DID while peers see it as an anonymous UUID.
 ///
 /// Connection capacity is enforced atomically *before* the async identity
 /// extraction step to prevent concurrent handshakes from bypassing the limit.

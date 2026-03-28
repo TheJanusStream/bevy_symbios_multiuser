@@ -25,10 +25,11 @@
 //! Resolved keys are cached in memory with a 5-minute TTL.
 //! The authenticated DID becomes the peer's session identity.
 //!
-//! When `auth_required` is `false` (the default), authentication is
-//! opportunistic — clients presenting a valid, signature-verified token are
-//! identified by their DID, while unauthenticated clients fall back to random
-//! UUIDs. Tokens are only trusted when a DID resolver is configured.
+//! When `auth_required` is `false`, authentication is opportunistic — clients
+//! presenting a valid, signature-verified token are identified by their DID,
+//! while clients that present no token fall back to random UUIDs. An explicitly
+//! invalid token is rejected with HTTP 401 regardless of `auth_required`.
+//! Tokens are only trusted when a DID resolver is configured.
 //!
 //! # Room Isolation
 //!
@@ -66,6 +67,11 @@
 //! - **Handshake timeout** — The authentication/identity extraction phase is
 //!   capped at 15 seconds, preventing connection slot exhaustion from DIDs that
 //!   tarpit the HTTP fetch.
+//! - **WebSocket write timeout** — Every outbound write (signaling envelope or
+//!   server-side Ping frame) is wrapped in a 5-second timeout. Without this, an
+//!   attacker that opens a connection but never drains their TCP receive buffer
+//!   would cause `ws_tx.send` to block indefinitely; client-side Pings would
+//!   keep the idle-timeout from firing, permanently holding a connection slot.
 //! - **Self-targeting rejection** — SDP offers/answers addressed to the sender's
 //!   own session ID are dropped, preventing pointless self-negotiation loops.
 //! - **Invalid message disconnect** — Peers that send 10 cumulative invalid
@@ -175,11 +181,13 @@ pub struct RelayConfig {
     /// The address to bind the server to (e.g. `"0.0.0.0:3536"`).
     pub bind_addr: String,
     /// If `true`, reject WebSocket connections that do not present a valid
-    /// ATProto JWT (via header, subprotocol, or query param). Defaults to `false`.
+    /// ATProto JWT (via header, subprotocol, or query param). When `false`,
+    /// authentication is opportunistic: valid tokens are used for identity while
+    /// clients that present no token receive a random UUID.
     pub auth_required: bool,
     /// Maximum number of concurrent peer connections. New connections are
     /// rejected with HTTP 503 once this limit is reached. `0` means unlimited.
-    /// Defaults to `512`.
+    /// A reasonable starting value is `512`.
     pub max_peers: usize,
     /// The relay's own service DID (e.g. `did:web:relay.example.com`). When set,
     /// JWT `aud` claims are validated against this value to prevent cross-service

@@ -24,8 +24,9 @@
 //! 3. The relay (`relay` module, feature-gated) validates the JWT claims and — when
 //!    `auth_required` is enabled — resolves the issuer's DID document to
 //!    cryptographically verify the signature (ES256/P-256 or ES256K/secp256k1)
-//!    against the `#atproto` signing key. The authenticated DID becomes the
-//!    peer's session identity.
+//!    against the `#atproto` signing key. When [`RelayConfig::service_did`] is
+//!    set, the `aud` claim is also validated to prevent cross-service token
+//!    replay. The authenticated DID becomes the peer's session identity.
 //! 4. Once signaling completes, data flows directly peer-to-peer over
 //!    WebRTC data channels.
 //!
@@ -75,7 +76,7 @@
 //! - `relay` — Sovereign Broker relay server with DID-based JWT signature
 //!   verification (ES256 + ES256K), room-based peer isolation, atomic
 //!   connection limits, SSRF-hardened DID resolution, message size caps,
-//!   idle/handshake timeouts, HTTP-level Slowloris protection, server-side
+//!   idle/handshake/write timeouts, HTTP-level Slowloris protection, server-side
 //!   pings (WASM keep-alive), per-sender token-bucket rate limiting,
 //!   per-target burst limiting, per-domain and global `did:web` fetch
 //!   concurrency limiting, request coalescing, negative DID caching, peer ID
