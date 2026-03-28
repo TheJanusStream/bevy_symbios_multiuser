@@ -27,16 +27,29 @@ pub struct SymbiosMultiuserConfig<T> {
 }
 
 /// Marker resource inserted by [`open_socket`] to prevent re-opening the
-/// connection every frame. Stores the room URL so that changes to
-/// [`SymbiosMultiuserConfig`] (or its removal) can be detected and the
-/// socket torn down, allowing room changes without restarting the app.
+/// connection every frame. Stores the fields of [`SymbiosMultiuserConfig`]
+/// that affect the socket so that any change triggers a teardown and
+/// reconnect, allowing config updates without restarting the app.
 ///
 /// Generic over `T` so each plugin instance tracks its own socket independently.
 #[cfg(feature = "client")]
 #[derive(Resource)]
 struct SocketOpened<T> {
     room_url: String,
+    /// Flattened ICE config for change detection.
+    /// `RtcIceServerConfig` does not implement `PartialEq`, so we store its
+    /// fields directly as comparable primitives.
+    ice_key: Option<(Vec<String>, Option<String>, Option<String>)>,
     _marker: PhantomData<T>,
+}
+
+/// Extract a comparable key from an optional [`RtcIceServerConfig`].
+#[cfg(feature = "client")]
+fn ice_key(
+    ice: &Option<matchbox_socket::RtcIceServerConfig>,
+) -> Option<(Vec<String>, Option<String>, Option<String>)> {
+    ice.as_ref()
+        .map(|c| (c.urls.clone(), c.username.clone(), c.credential.clone()))
 }
 
 /// A generic multiplayer plugin that transports domain messages of type `T`
@@ -160,7 +173,9 @@ fn open_socket<T: Send + Sync + 'static>(
     if let Some(ref marker) = opened {
         let needs_teardown = match config.as_ref() {
             None => true,
-            Some(cfg) => cfg.room_url != marker.room_url,
+            Some(cfg) => {
+                cfg.room_url != marker.room_url || ice_key(&cfg.ice_servers) != marker.ice_key
+            }
         };
         if needs_teardown {
             tracing::info!("tearing down socket (config removed or room changed)");
@@ -207,6 +222,7 @@ fn open_socket<T: Send + Sync + 'static>(
     commands.open_socket(builder);
     commands.insert_resource(SocketOpened::<T> {
         room_url: config.room_url.clone(),
+        ice_key: ice_key(&config.ice_servers),
         _marker: PhantomData,
     });
 }

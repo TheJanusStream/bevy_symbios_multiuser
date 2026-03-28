@@ -218,6 +218,12 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
     }
 }
 
+/// Maximum time to wait for a WebSocket handshake to complete.
+/// Without this, a tarpitted or firewall-dropped TCP connection can hold the
+/// future pending forever, bypassing the retry loop entirely.
+#[cfg(not(target_arch = "wasm32"))]
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ── Native connection ────────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -226,11 +232,26 @@ impl SymbiosSignallerBuilder {
         &self,
         room_url: &str,
     ) -> Result<WebSocketStream<ConnectStream>, SignalingError> {
+        use futures_util::future::Either;
+
         let token = self.current_token();
         let request = build_ws_request(room_url, token.as_deref())
             .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
-        let (stream, _) = connect_async(request).await.map_err(SignalingError::from)?;
-        Ok(stream)
+
+        let connect_fut = connect_async(request);
+        let timeout_fut = futures_timer::Delay::new(WS_CONNECT_TIMEOUT);
+        futures_util::pin_mut!(connect_fut);
+        futures_util::pin_mut!(timeout_fut);
+
+        match futures_util::future::select(connect_fut, timeout_fut).await {
+            Either::Left((result, _)) => {
+                let (stream, _) = result.map_err(SignalingError::from)?;
+                Ok(stream)
+            }
+            Either::Right(_) => Err(SignalingError::UserImplementationError(
+                "WebSocket connection timed out".to_string(),
+            )),
+        }
     }
 }
 

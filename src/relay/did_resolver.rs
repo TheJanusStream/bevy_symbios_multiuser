@@ -572,39 +572,67 @@ impl DidResolver {
             let (domain_raw, _) = split_did_web_domain_path(raw)?;
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
 
-            // Obtain the per-domain counter before entering the blocking
-            // closure. The moka cache call is cheap and sync-safe.
-            let domain_counter = self
-                .domain_fetch_counts
-                .get_with(domain.clone(), || Arc::new(AtomicU64::new(0)));
-
-            // DNS resolution + concurrency guard acquisition happen inside
-            // spawn_blocking. Guards are returned so they outlive the blocking
-            // task and cover the subsequent HTTP fetch.
-            let (validated_addr, global_guard, domain_guard) = validate_and_resolve_domain(
-                &domain,
-                Arc::clone(&self.global_didweb_fetch_count),
-                domain_counter,
-            )
-            .await?;
-            _global_guard = Some(global_guard);
-            _domain_guard = Some(domain_guard);
-
-            // Extract hostname for DNS pinning. Bracketed IPv6 literals like
-            // `[2001:db8::1]:8443` must be handled specially — a naive
-            // `split(':').next()` would yield `[2001` instead of the full
-            // bracket expression.
-            let host_only = extract_hostname(&domain);
-
             // Use the full domain (host + port) as the cache key so that
             // `did:web:example.com%3A80` and `did:web:example.com` don't
             // share a pinned client (which would poison TLS on port 80).
             let cache_key = domain.clone();
 
-            // Check the domain client cache first.
+            // Check the domain client cache BEFORE spawning a blocking DNS
+            // resolution task. Many unique DIDs sharing the same domain
+            // (e.g. `did:web:victim.com:u:1`, `did:web:victim.com:u:2`) would
+            // otherwise each block a Tokio thread on getaddrinfo only to
+            // discard the resolved address and reuse the cached client.
             let client = if let Some(cached) = self.domain_clients.get(&cache_key) {
+                // Acquire concurrency guards for the HTTP fetch even when DNS
+                // is skipped — the guards limit concurrent fetches per domain.
+                // Since there is no spawn_blocking here, acquiring in async
+                // context is correct (no blocking thread outlives the guard).
+                let global_prev = self
+                    .global_didweb_fetch_count
+                    .fetch_add(1, Ordering::Relaxed);
+                _global_guard = Some(ConcurrencyGuard(Arc::clone(
+                    &self.global_didweb_fetch_count,
+                )));
+                if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
+                    return Err(format!(
+                        "global did:web concurrency limit exceeded \
+                         ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
+                    ));
+                }
+                let domain_counter = self
+                    .domain_fetch_counts
+                    .get_with(domain.clone(), || Arc::new(AtomicU64::new(0)));
+                let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
+                _domain_guard = Some(ConcurrencyGuard(domain_counter));
+                if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
+                    return Err(format!(
+                        "concurrency limit exceeded for did:web domain '{domain}' \
+                         ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
+                    ));
+                }
                 cached
             } else {
+                // No cached client — resolve DNS, validate the IP, and build a
+                // pinned client. Guards are acquired inside spawn_blocking so
+                // they are not freed if the async caller is cancelled mid-DNS.
+                let domain_counter = self
+                    .domain_fetch_counts
+                    .get_with(domain.clone(), || Arc::new(AtomicU64::new(0)));
+                let (validated_addr, global_guard, domain_guard) = validate_and_resolve_domain(
+                    &domain,
+                    Arc::clone(&self.global_didweb_fetch_count),
+                    domain_counter,
+                )
+                .await?;
+                _global_guard = Some(global_guard);
+                _domain_guard = Some(domain_guard);
+
+                // Extract hostname for DNS pinning. Bracketed IPv6 literals like
+                // `[2001:db8::1]:8443` must be handled specially — a naive
+                // `split(':').next()` would yield `[2001` instead of the full
+                // bracket expression.
+                let host_only = extract_hostname(&domain);
+
                 let pinned = reqwest::Client::builder()
                     .timeout(DID_FETCH_TIMEOUT)
                     .redirect(reqwest::redirect::Policy::none())

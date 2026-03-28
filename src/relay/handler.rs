@@ -321,11 +321,11 @@ async fn extract_identity(
         Ok(identity) => Ok(Some(identity)),
         Err(e) => {
             tracing::warn!(error = %e, "JWT validation failed");
-            if auth_required {
-                Err((StatusCode::UNAUTHORIZED, "Invalid JWT"))
-            } else {
-                Ok(None)
-            }
+            // A token was explicitly provided — always reject it if invalid,
+            // regardless of auth_required. Silently downgrading to a guest UUID
+            // would create split-brain: the client believes it is authenticated
+            // as its DID while peers see it as an anonymous UUID.
+            Err((StatusCode::UNAUTHORIZED, "Invalid JWT"))
         }
     }
 }
@@ -624,8 +624,9 @@ async fn handle_socket(
                     if new_tokens == RATE_BURST_CAPACITY {
                         rate_last_refill = now;
                     } else {
-                        rate_last_refill +=
-                            Duration::from_millis(refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64);
+                        rate_last_refill += Duration::from_millis(
+                            refill as u64 * 1000 / RATE_REFILL_PER_SECOND as u64,
+                        );
                     }
                 }
             }
