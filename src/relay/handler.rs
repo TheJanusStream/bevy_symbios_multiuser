@@ -112,6 +112,14 @@ const MAX_PEER_ID_LENGTH: usize = 512;
 /// holds the connection open for the full 10s DID fetch timeout).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Maximum time allowed for a single WebSocket write to complete.
+/// Prevents a Slowloris variant where an attacker opens connections and
+/// intentionally never drains their TCP receive buffer: the OS-level send
+/// buffer fills, `ws_tx.send` blocks indefinitely, and the write task stalls
+/// while the attacker's periodic client-side Pings keep the read-task idle
+/// timeout from firing — permanently holding a connection slot.
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Optional query parameters on the WebSocket upgrade URL.
 ///
 /// Used as a legacy fallback for WASM clients that pass the ATProto JWT via
@@ -452,12 +460,20 @@ async fn handle_socket(
                         Ok(j) => j,
                         Err(_) => continue,
                     };
-                    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                    if !matches!(
+                        tokio::time::timeout(WS_WRITE_TIMEOUT, ws_tx.send(Message::Text(json.into()))).await,
+                        Ok(Ok(()))
+                    ) {
+                        tracing::warn!("disconnecting peer: write timeout or error");
                         break;
                     }
                 }
                 _ = ping_interval.tick() => {
-                    if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                    if !matches!(
+                        tokio::time::timeout(WS_WRITE_TIMEOUT, ws_tx.send(Message::Ping(vec![].into()))).await,
+                        Ok(Ok(()))
+                    ) {
+                        tracing::warn!("disconnecting peer: write timeout or error");
                         break;
                     }
                 }

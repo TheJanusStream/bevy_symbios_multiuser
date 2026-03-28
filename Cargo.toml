@@ -32,7 +32,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"], optional = true }
 # Relay server dependencies
 axum = { version = "0.8", features = ["ws"], optional = true }
 tower-http = { version = "0.6", features = ["timeout"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
 dashmap = { version = "6", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 p256 = { version = "0.13", features = ["pkcs8"], optional = true }
