@@ -263,12 +263,20 @@ impl SymbiosSignallerBuilder {
 fn build_ws_request(
     url: &str,
     access_jwt: Option<&str>,
-) -> Result<tungstenite::http::Request<()>, tungstenite::http::Error> {
-    let mut builder = tungstenite::http::Request::builder().uri(url);
+) -> Result<tungstenite::http::Request<()>, tungstenite::Error> { // <-- Changed return type here
+    use tungstenite::client::IntoClientRequest;
+    
+    // 1. Let tungstenite parse the URL and automatically generate all the 
+    // mandatory WebSocket headers (Upgrade, Connection, Sec-WebSocket-Key)
+    let mut request = url.into_client_request()?;
+    
+    // 2. Inject our ATProto JWT into the pre-formatted request
     if let Some(token) = access_jwt {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
+        let header_value = format!("Bearer {token}").parse().unwrap();
+        request.headers_mut().insert("Authorization", header_value);
     }
-    builder.body(())
+    
+    Ok(request)
 }
 
 // ── WASM connection ──────────────────────────────────────────────────────────
@@ -482,8 +490,8 @@ impl Signaller for SymbiosSignaller {
                         })
                     }
                     SignalPayload::PeerJoined(ref id) => {
-                        let pid = self.get_or_create_peer_id(id);
-                        Ok(PeerEvent::NewPeer(pid))
+                        self.get_or_create_peer_id(id);
+                        continue;
                     }
                     SignalPayload::PeerLeft(ref id) => {
                         let pid = self.remove_peer(id);
