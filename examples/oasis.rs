@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum OasisMessage {
     Transform { position: [f32; 3] },
-    Identity { did: String },
+    Identity { did: String, handle: String },
+    Chat { text: String },
 }
 
 // --- State & Components ---
@@ -51,6 +52,33 @@ struct LocalPlayer;
 struct RemotePeer {
     peer_id: PeerId,
     did: Option<String>,
+    handle: Option<String>,
+}
+
+// --- Bevy Resources ---
+
+/// Rolling chat history, populated by both local sends and received messages.
+#[derive(Resource, Default)]
+struct ChatHistory {
+    /// (author handle, message text)
+    messages: Vec<(String, String)>,
+}
+
+/// Diagnostic state: a rolling event log for the debug panel.
+#[derive(Resource, Default)]
+struct DiagnosticsState {
+    log: std::collections::VecDeque<String>,
+}
+
+impl DiagnosticsState {
+    const MAX_ENTRIES: usize = 200;
+
+    fn push(&mut self, entry: String) {
+        self.log.push_back(entry);
+        if self.log.len() > Self::MAX_ENTRIES {
+            self.log.pop_front();
+        }
+    }
 }
 
 /// The relay's service DID, derived from its hostname.
@@ -79,10 +107,19 @@ fn main() {
         // DEFERRED: The socket won't open until we log in and insert the config
         .add_plugins(SymbiosMultiuserPlugin::<OasisMessage>::deferred())
         .init_state::<AppState>()
+        .init_resource::<ChatHistory>()
+        .init_resource::<DiagnosticsState>()
         .add_systems(Startup, setup_world)
         // UI (egui pass)
-        .add_systems(EguiPrimaryContextPass, login_ui)
-        .add_systems(Update, (poll_auth_task).run_if(in_state(AppState::Login)))
+        .add_systems(
+            EguiPrimaryContextPass,
+            login_ui.run_if(in_state(AppState::Login)),
+        )
+        .add_systems(
+            EguiPrimaryContextPass,
+            (diagnostics_ui, chat_ui).run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(Update, poll_auth_task.run_if(in_state(AppState::Login)))
         .add_systems(OnEnter(AppState::InGame), spawn_local_player)
         .add_systems(
             Update,
@@ -284,11 +321,13 @@ fn handle_peer_connections(
     mut peer_events: ResMut<PeerStateQueue<OasisMessage>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut diagnostics: ResMut<DiagnosticsState>,
     query: Query<(Entity, &RemotePeer)>,
 ) {
     for event in peer_events.drain() {
         match event.state {
             PeerConnectionState::Connected => {
+                diagnostics.push(format!("[+] Peer {} connected", event.peer));
                 // Spawn a blank ghost. It will get its texture when they broadcast their Identity.
                 commands.spawn((
                     Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -300,12 +339,19 @@ fn handle_peer_connections(
                     RemotePeer {
                         peer_id: event.peer,
                         did: None,
+                        handle: None,
                     },
                 ));
             }
             PeerConnectionState::Disconnected => {
                 for (entity, remote_peer) in query.iter() {
                     if remote_peer.peer_id == event.peer {
+                        let label = remote_peer
+                            .handle
+                            .as_deref()
+                            .or(remote_peer.did.as_deref())
+                            .unwrap_or("unknown");
+                        diagnostics.push(format!("[-] Peer {} ({}) disconnected", event.peer, label));
                         commands.entity(entity).despawn();
                     }
                 }
@@ -317,6 +363,7 @@ fn handle_peer_connections(
 fn handle_incoming_messages(
     mut commands: Commands,
     mut queue: ResMut<NetworkQueue<OasisMessage>>,
+    mut chat: ResMut<ChatHistory>,
     mut query: Query<(Entity, &mut RemotePeer, &mut Transform)>,
 ) {
     for msg in queue.drain() {
@@ -328,12 +375,14 @@ fn handle_incoming_messages(
                     }
                 }
             }
-            OasisMessage::Identity { did } => {
+            OasisMessage::Identity { did, handle } => {
                 for (entity, mut peer, _) in query.iter_mut() {
                     if peer.peer_id == msg.sender {
-                        if peer.did.as_ref() != Some(&did) {
+                        let did_changed = peer.did.as_ref() != Some(&did);
+                        peer.handle = Some(handle.clone());
+                        if did_changed {
                             peer.did = Some(did.clone());
-                            info!("Peer {} identified as {}", msg.sender, did);
+                            info!("Peer {} identified as {} ({})", msg.sender, handle, did);
 
                             // Spawn task to fetch their avatar
                             let pool = bevy::tasks::AsyncComputeTaskPool::get();
@@ -349,6 +398,15 @@ fn handle_incoming_messages(
                         }
                     }
                 }
+            }
+            OasisMessage::Chat { text } => {
+                // Look up the sender's handle from RemotePeer
+                let author = query
+                    .iter()
+                    .find(|(_, peer, _)| peer.peer_id == msg.sender)
+                    .and_then(|(_, peer, _)| peer.handle.clone())
+                    .unwrap_or_else(|| msg.sender.to_string());
+                chat.messages.push((author, text));
             }
         }
     }
@@ -370,12 +428,13 @@ fn broadcast_local_state(
             channel: ChannelKind::Unreliable,
         });
 
-        // Broadcast our identity periodically so new arrivals know who we are
+        // Broadcast our identity (with handle) periodically so new arrivals know who we are
         if *tick % 60 == 0 {
             if let Some(sess) = &session {
                 writer.write(Broadcast {
                     payload: OasisMessage::Identity {
                         did: sess.did.clone(),
+                        handle: sess.handle.clone(),
                     },
                     channel: ChannelKind::Reliable,
                 });
@@ -404,6 +463,145 @@ fn move_local_player(
             transform.translation.x += speed;
         }
     }
+}
+
+// --- UI Systems (InGame) ---
+
+fn diagnostics_ui(
+    mut contexts: EguiContexts,
+    session: Option<Res<AtprotoSession>>,
+    peers: Query<&RemotePeer>,
+    diagnostics: Res<DiagnosticsState>,
+) {
+    egui::SidePanel::left("diagnostics")
+        .resizable(true)
+        .default_width(280.0)
+        .show(contexts.ctx_mut().unwrap(), |ui| {
+            ui.heading("Diagnostics");
+            ui.separator();
+
+            // Local identity
+            ui.label("Local Identity");
+            if let Some(sess) = &session {
+                ui.monospace(format!("@{}", sess.handle));
+                ui.monospace(
+                    egui::RichText::new(&sess.did)
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            } else {
+                ui.label("(not authenticated)");
+            }
+
+            ui.separator();
+
+            // Peer roster
+            ui.label(format!("Peers ({})", peers.iter().count()));
+            for peer in peers.iter() {
+                let handle_str = peer.handle.as_deref().unwrap_or("identifying...");
+                let did_str = peer.did.as_deref().unwrap_or("unknown");
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::GREEN, "●");
+                    ui.vertical(|ui| {
+                        ui.monospace(format!("@{}", handle_str));
+                        ui.monospace(
+                            egui::RichText::new(did_str)
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    });
+                });
+            }
+            if peers.iter().count() == 0 {
+                ui.colored_label(egui::Color32::GRAY, "(no peers)");
+            }
+
+            ui.separator();
+
+            // Rolling event log
+            ui.label("Event Log");
+            let log_height = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("diag_log")
+                .auto_shrink([false; 2])
+                .stick_to_bottom(true)
+                .max_height(log_height)
+                .show(ui, |ui| {
+                    for entry in &diagnostics.log {
+                        ui.monospace(
+                            egui::RichText::new(entry)
+                                .small()
+                                .color(egui::Color32::LIGHT_GRAY),
+                        );
+                    }
+                });
+        });
+}
+
+fn chat_ui(
+    mut contexts: EguiContexts,
+    session: Option<Res<AtprotoSession>>,
+    mut chat: ResMut<ChatHistory>,
+    mut writer: MessageWriter<Broadcast<OasisMessage>>,
+    mut input: Local<String>,
+) {
+    egui::SidePanel::right("chat")
+        .resizable(true)
+        .default_width(300.0)
+        .show(contexts.ctx_mut().unwrap(), |ui| {
+            ui.heading("Chat");
+            ui.separator();
+
+            // Message history — leave room for the input row
+            let history_height = ui.available_height() - 36.0;
+            egui::ScrollArea::vertical()
+                .id_salt("chat_history")
+                .auto_shrink([false; 2])
+                .stick_to_bottom(true)
+                .max_height(history_height)
+                .show(ui, |ui| {
+                    for (author, text) in &chat.messages {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 180, 255),
+                                format!("[{}]", author),
+                            );
+                            ui.label(text);
+                        });
+                    }
+                });
+
+            ui.separator();
+
+            // Input row
+            ui.horizontal(|ui| {
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut *input).desired_width(f32::INFINITY));
+
+                let send = ui.button("Send");
+                let submit =
+                    send.clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+
+                if submit && !input.trim().is_empty() {
+                    let text = input.trim().to_string();
+                    input.clear();
+                    response.request_focus();
+
+                    // Echo to local history immediately
+                    let local_handle = session
+                        .as_ref()
+                        .map(|s| s.handle.clone())
+                        .unwrap_or_else(|| "me".into());
+                    chat.messages.push((local_handle, text.clone()));
+
+                    // Broadcast to peers
+                    writer.write(Broadcast {
+                        payload: OasisMessage::Chat { text },
+                        channel: ChannelKind::Reliable,
+                    });
+                }
+            });
+        });
 }
 
 // --- Decentralized Avatar Loading ---
