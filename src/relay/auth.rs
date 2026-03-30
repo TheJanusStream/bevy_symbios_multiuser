@@ -138,10 +138,6 @@ fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
 
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
-        .or_else(|_| {
-            // Some encoders emit standard base64 with padding — try that too.
-            base64::engine::general_purpose::URL_SAFE.decode(payload_b64)
-        })
         .map_err(|e| format!("JWT payload base64 decode failed: {e}"))?;
 
     let claims: AtprotoClaims = serde_json::from_slice(&payload_bytes)
@@ -195,7 +191,6 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
         .ok_or("malformed JWT: missing header")?;
     let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(header_b64)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(header_b64))
         .map_err(|e| format!("JWT header base64 decode failed: {e}"))?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)
         .map_err(|e| format!("JWT header parse failed: {e}"))?;

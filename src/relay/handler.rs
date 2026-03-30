@@ -44,11 +44,12 @@ const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 const MAX_INVALID_MESSAGES: usize = 10;
 
 /// Number of consecutive channel-full (`TrySendError::Full`) drops on the same
-/// target before the sender stops attempting delivery to that target for
-/// the remainder of this connection. Only channel-full errors accumulate
-/// strikes; closed channels (disconnected peers) are skipped per-message
-/// without accumulating strikes, so reconnected peers can immediately
-/// receive signals again. Truly stalled peers are reaped by
+/// target before further failures are silently discarded (no more log output).
+/// The send is still attempted on every message so the channel can recover:
+/// a successful send resets the counter back to zero. Only channel-full errors
+/// accumulate strikes; closed channels (disconnected peers) are skipped
+/// per-message without accumulating strikes, so reconnected peers can
+/// immediately receive signals again. Truly stalled peers are reaped by
 /// [`WS_IDLE_TIMEOUT`] rather than by sender-driven eviction, which would
 /// allow a malicious sender to kick arbitrary targets by flooding their
 /// channel.
@@ -400,12 +401,19 @@ async fn handle_socket(
     }
 
     // Announce the assigned session ID to the connecting client.
+    // Both sends are wrapped in WS_WRITE_TIMEOUT: without it an attacker that
+    // freezes their TCP receive window blocks these awaits indefinitely while
+    // holding a connection slot — a Slowloris variant that bypasses the idle
+    // timeout because the read/write tasks haven't been spawned yet.
     let welcome = serde_json::json!({ "type": "session_id", "id": session_id });
-    if ws_tx
-        .send(Message::Text(welcome.to_string().into()))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout(
+            WS_WRITE_TIMEOUT,
+            ws_tx.send(Message::Text(welcome.to_string().into())),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         state
             .peers
             .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
@@ -421,9 +429,19 @@ async fn handle_socket(
         .map(|entry| entry.key().clone())
         .collect();
     let peer_list = serde_json::json!({ "type": "peer_list", "peers": existing_peers });
-    let _ = ws_tx
-        .send(Message::Text(peer_list.to_string().into()))
-        .await;
+    if !matches!(
+        tokio::time::timeout(
+            WS_WRITE_TIMEOUT,
+            ws_tx.send(Message::Text(peer_list.to_string().into())),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        state
+            .peers
+            .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
+        return;
+    }
 
     // Notify existing peers in the same room about the new peer.
     // Collect senders first to avoid holding DashMap read locks across channel sends.
@@ -716,13 +734,13 @@ async fn handle_socket(
                 signal: envelope.signal,
             };
 
-            // Skip targets we've already given up on (backpressure maxed).
-            if backpressure_strikes
+            // Check strike count but do NOT skip the send: we always probe
+            // try_send so that a recovered (drained) channel resets the counter
+            // via the Ok(()) arm. Skipping the send permanently blackholes the
+            // target for the lifetime of the connection even after recovery.
+            let at_strike_limit = backpressure_strikes
                 .get(&target_id)
-                .is_some_and(|s| *s >= MAX_BACKPRESSURE_STRIKES)
-            {
-                continue;
-            }
+                .is_some_and(|s| *s >= MAX_BACKPRESSURE_STRIKES);
 
             if let Some(entry) = state_write.peers.get(&target_id) {
                 if entry.value().room != room {
@@ -738,23 +756,27 @@ async fn handle_socket(
                             backpressure_strikes.remove(&target_id);
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            let strikes =
-                                backpressure_strikes.entry(target_id.clone()).or_insert(0);
-                            *strikes += 1;
-                            tracing::warn!(
-                                target = %target_id,
-                                sender = %session_id,
-                                strikes = *strikes,
-                                "relay channel full for target, dropping signal (backpressure)"
-                            );
-                            if *strikes >= MAX_BACKPRESSURE_STRIKES {
+                            if !at_strike_limit {
+                                let strikes =
+                                    backpressure_strikes.entry(target_id.clone()).or_insert(0);
+                                *strikes += 1;
                                 tracing::warn!(
                                     target = %target_id,
                                     sender = %session_id,
-                                    "giving up on target after {MAX_BACKPRESSURE_STRIKES} \
-                                     consecutive backpressure hits (will drop future messages)"
+                                    strikes = *strikes,
+                                    "relay channel full for target, dropping signal (backpressure)"
                                 );
+                                if *strikes >= MAX_BACKPRESSURE_STRIKES {
+                                    tracing::warn!(
+                                        target = %target_id,
+                                        sender = %session_id,
+                                        "target hit {MAX_BACKPRESSURE_STRIKES} backpressure \
+                                         strikes; silencing logs until channel drains"
+                                    );
+                                }
                             }
+                            // If already at limit, drop silently — the send was
+                            // still attempted above so Ok(()) can still fire.
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // Target peer disconnected but hasn't been cleaned

@@ -272,12 +272,46 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
 /// created in async code, dropping the async future (e.g. client TCP disconnect)
 /// would free the concurrency slot while the blocking DNS thread continues,
 /// allowing an attacker to bypass limits and exhaust the blocking pool.
-#[cfg_attr(test, derive(Debug))]
-struct ConcurrencyGuard(Arc<AtomicU64>);
+///
+/// Domain guards carry an optional back-reference to `domain_fetch_counts` so
+/// that the map entry is pruned when the counter reaches zero. Without cleanup
+/// the DashMap would accumulate one entry per unique attacker-controlled domain
+/// string and grow without bound (OOM DoS). The `Arc::ptr_eq` check prevents
+/// removing a replacement entry that a concurrent request may have inserted
+/// between our `fetch_sub` and the `remove_if`.
+struct ConcurrencyGuard {
+    counter: Arc<AtomicU64>,
+    /// If set, remove the map entry on drop when `counter` reaches zero.
+    cleanup: Option<(Arc<DashMap<String, Arc<AtomicU64>>>, String)>,
+}
+
+impl ConcurrencyGuard {
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        Self { counter, cleanup: None }
+    }
+
+    fn new_domain(
+        counter: Arc<AtomicU64>,
+        map: Arc<DashMap<String, Arc<AtomicU64>>>,
+        key: String,
+    ) -> Self {
+        Self { counter, cleanup: Some((map, key)) }
+    }
+}
 
 impl Drop for ConcurrencyGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        if let Some((map, key)) = &self.cleanup {
+            // Remove the entry only if it still holds *our* Arc and the count
+            // is zero.  A concurrent request may have re-used the same Arc
+            // (counter now > 0) or replaced it with a new one (ptr_eq fails);
+            // in either case we must not evict the live entry.
+            let ours = Arc::clone(&self.counter);
+            map.remove_if(key, |_, v| {
+                Arc::ptr_eq(v, &ours) && v.load(Ordering::Relaxed) == 0
+            });
+        }
     }
 }
 
@@ -300,6 +334,7 @@ async fn validate_and_resolve_domain(
     domain: &str,
     global_counter: Arc<AtomicU64>,
     domain_counter: Arc<AtomicU64>,
+    domain_fetch_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
 ) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), String> {
     // Add default HTTPS port if no port is present, so ToSocketAddrs works.
     // Bracketed IPv6 addresses like [2001:db8::1] contain colons but have no
@@ -325,7 +360,7 @@ async fn validate_and_resolve_domain(
     tokio::task::spawn_blocking(move || {
         // Acquire the global concurrency guard on the blocking thread.
         let global_prev = global_counter.fetch_add(1, Ordering::Relaxed);
-        let global_guard = ConcurrencyGuard(global_counter);
+        let global_guard = ConcurrencyGuard::new(global_counter);
         if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
             return Err(format!(
                 "global did:web concurrency limit exceeded \
@@ -335,7 +370,8 @@ async fn validate_and_resolve_domain(
 
         // Acquire the per-domain concurrency guard on the blocking thread.
         let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
-        let domain_guard = ConcurrencyGuard(domain_counter);
+        let domain_guard =
+            ConcurrencyGuard::new_domain(domain_counter, domain_fetch_counts, domain_owned.clone());
         if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
             return Err(format!(
                 "concurrency limit exceeded for did:web domain '{domain_owned}' \
@@ -595,7 +631,7 @@ impl DidResolver {
                 let global_prev = self
                     .global_didweb_fetch_count
                     .fetch_add(1, Ordering::Relaxed);
-                _global_guard = Some(ConcurrencyGuard(Arc::clone(
+                _global_guard = Some(ConcurrencyGuard::new(Arc::clone(
                     &self.global_didweb_fetch_count,
                 )));
                 if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
@@ -610,7 +646,11 @@ impl DidResolver {
                     .or_insert_with(|| Arc::new(AtomicU64::new(0)))
                     .clone();
                 let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
-                _domain_guard = Some(ConcurrencyGuard(domain_counter));
+                _domain_guard = Some(ConcurrencyGuard::new_domain(
+                    domain_counter,
+                    Arc::clone(&self.domain_fetch_counts),
+                    domain.clone(),
+                ));
                 if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
                     return Err(format!(
                         "concurrency limit exceeded for did:web domain '{domain}' \
@@ -631,6 +671,7 @@ impl DidResolver {
                     &domain,
                     Arc::clone(&self.global_didweb_fetch_count),
                     domain_counter,
+                    Arc::clone(&self.domain_fetch_counts),
                 )
                 .await?;
                 _global_guard = Some(global_guard);
