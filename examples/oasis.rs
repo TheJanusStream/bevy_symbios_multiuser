@@ -31,6 +31,7 @@ struct LoginData {
     pds: String,
     handle: String,
     pass: String,
+    relay_host: String,
     error: Option<String>,
 }
 
@@ -40,10 +41,16 @@ impl Default for LoginData {
             pds: "https://bsky.social".into(),
             handle: "".into(),
             pass: "".into(),
+            relay_host: "".into(),
             error: None,
         }
     }
 }
+
+/// Relay hostname shared between `login_ui` (where the user types it) and
+/// `poll_auth_task` (where it is used to build the room URL and service DID).
+#[derive(Resource, Clone)]
+struct RelayHost(String);
 
 #[derive(Component)]
 struct LocalPlayer;
@@ -80,10 +87,6 @@ impl DiagnosticsState {
         }
     }
 }
-
-/// The relay's service DID, derived from its hostname.
-/// Used as the `aud` claim when requesting a service auth token.
-const RELAY_SERVICE_DID: &str = "did:web:<relay ip addr>.nip.io";
 
 /// Result of a completed login: the ATProto session plus a service token
 /// signed by the user's `#atproto` key (for relay authentication).
@@ -193,6 +196,10 @@ fn login_ui(
                 ui.label("App Password:");
                 ui.add(egui::TextEdit::singleline(&mut login_data.pass).password(true));
             });
+            ui.horizontal(|ui| {
+                ui.label("Relay Host:");
+                ui.text_edit_singleline(&mut login_data.relay_host);
+            });
 
             ui.add_space(10.0);
 
@@ -204,6 +211,10 @@ fn login_ui(
                         identifier: login_data.handle.clone(),
                         password: login_data.pass.clone(),
                     };
+                    let relay_host = login_data.relay_host.trim().to_string();
+                    let service_did = format!("did:web:{}", relay_host);
+
+                    commands.insert_resource(RelayHost(relay_host));
 
                     let pool = bevy::tasks::AsyncComputeTaskPool::get();
                     let task = pool.spawn(async move {
@@ -223,7 +234,7 @@ fn login_ui(
                                     &client,
                                     &session,
                                     &creds.pds_url,
-                                    RELAY_SERVICE_DID,
+                                    &service_did,
                                 )
                                 .await?;
                                 Ok(LoginResult { session, service_token })
@@ -247,6 +258,7 @@ fn poll_auth_task(
     mut tasks: Query<(Entity, &mut AuthTask)>,
     mut next_state: ResMut<NextState<AppState>>,
     mut login_data: Local<LoginData>,
+    relay_host: Option<Res<RelayHost>>,
 ) {
     for (entity, mut task) in &mut tasks {
         if let Some(result) =
@@ -265,8 +277,9 @@ fn poll_auth_task(
                     commands.insert_resource(TokenSourceRes(source));
 
                     // Inserting the config triggers the plugin to open the WebSocket.
+                    let host = relay_host.as_deref().map(|r| r.0.as_str()).unwrap_or("");
                     commands.insert_resource(SymbiosMultiuserConfig::<OasisMessage> {
-                        room_url: "wss://<relay ip addr>.nip.io/oasis".into(),
+                        room_url: format!("wss://{}/oasis", host),
                         ice_servers: None,
                         _marker: std::marker::PhantomData,
                     });
