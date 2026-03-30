@@ -98,23 +98,9 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
     /// a flood of large messages.
     pub(crate) fn push(&mut self, msg: NetworkReceived<T>) {
         if self.incoming.len() >= MAX_NETWORK_QUEUE_LEN {
-            if !self.warned_full {
-                bevy::log::warn!(
-                    "NetworkQueue full ({MAX_NETWORK_QUEUE_LEN} messages), dropping incoming messages"
-                );
-                self.warned_full = true;
-            }
             return;
         }
         if self.total_bytes.saturating_add(msg.packet_size) > MAX_NETWORK_QUEUE_BYTES {
-            if !self.warned_full {
-                bevy::log::warn!(
-                    total_bytes = self.total_bytes,
-                    msg_bytes = msg.packet_size,
-                    "NetworkQueue byte budget exceeded ({MAX_NETWORK_QUEUE_BYTES} bytes), dropping incoming messages"
-                );
-                self.warned_full = true;
-            }
             return;
         }
         self.total_bytes += msg.packet_size;
@@ -143,13 +129,34 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
         self.incoming.len()
     }
 
-    /// Returns `true` if this packet would be dropped by [`push`](Self::push).
+    /// Returns `true` if this packet would be dropped by [`push`](Self::push),
+    /// and logs a warning the first time the queue is found full (resetting on
+    /// the next [`drain`](Self::drain)).
     ///
     /// Call this *before* deserializing to avoid burning CPU on packets that are
     /// guaranteed to be discarded due to the count or byte-budget limits.
-    pub(crate) fn would_drop(&self, packet_size: usize) -> bool {
-        self.incoming.len() >= MAX_NETWORK_QUEUE_LEN
-            || self.total_bytes.saturating_add(packet_size) > MAX_NETWORK_QUEUE_BYTES
+    pub(crate) fn would_drop(&mut self, packet_size: usize) -> bool {
+        if self.incoming.len() >= MAX_NETWORK_QUEUE_LEN {
+            if !self.warned_full {
+                bevy::log::warn!(
+                    "NetworkQueue full ({MAX_NETWORK_QUEUE_LEN} messages), dropping incoming messages"
+                );
+                self.warned_full = true;
+            }
+            return true;
+        }
+        if self.total_bytes.saturating_add(packet_size) > MAX_NETWORK_QUEUE_BYTES {
+            if !self.warned_full {
+                bevy::log::warn!(
+                    total_bytes = self.total_bytes,
+                    msg_bytes = packet_size,
+                    "NetworkQueue byte budget exceeded ({MAX_NETWORK_QUEUE_BYTES} bytes), dropping incoming messages"
+                );
+                self.warned_full = true;
+            }
+            return true;
+        }
+        false
     }
 }
 

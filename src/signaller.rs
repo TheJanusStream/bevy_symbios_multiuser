@@ -523,8 +523,8 @@ impl Signaller for SymbiosSignaller {
                         })
                     }
                     SignalPayload::PeerJoined(ref id) => {
-                        self.get_or_create_peer_id(id);
-                        continue;
+                        let pid = self.get_or_create_peer_id(id);
+                        Ok(PeerEvent::NewPeer(pid))
                     }
                     SignalPayload::PeerLeft(ref id) => {
                         let pid = self.remove_peer(id);

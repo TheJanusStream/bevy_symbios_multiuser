@@ -31,6 +31,7 @@
 //!   a connection pool and spawns background workers, so the lower cap prevents
 //!   resource exhaustion from an attacker feeding unique `did:web` domains.
 
+use dashmap::DashMap;
 use jsonwebtoken::DecodingKey;
 use moka::sync::Cache;
 use p256::pkcs8::{EncodePublicKey, LineEnding};
@@ -132,7 +133,14 @@ pub struct DidResolver {
     /// so it reflects concurrent load rather than cumulative requests. This
     /// prevents attackers from permanently exhausting a domain's budget with
     /// fake requests that fail quickly.
-    domain_fetch_counts: Cache<String, Arc<AtomicU64>>,
+    ///
+    /// Uses an unbounded [`DashMap`] rather than a bounded moka cache to prevent
+    /// cache-eviction attacks: a bounded cache allows an attacker to evict a
+    /// domain's counter while requests are in-flight, causing a fresh counter
+    /// (value 0) to be created on the next access and bypassing the per-domain
+    /// concurrency limit. Entries are small (`Arc<AtomicU64>`) so the unbounded
+    /// growth is acceptable; the global concurrency limit caps in-flight domains.
+    domain_fetch_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
     /// Global in-flight `did:web` fetch counter across all domains. Incremented
     /// before and decremented after each fetch (via RAII guard). Works alongside
     /// the per-domain counter to cap concurrent outbound DNS + HTTP activity,
@@ -467,10 +475,7 @@ impl DidResolver {
             .time_to_live(DEFAULT_CACHE_TTL)
             .build();
 
-        let domain_fetch_counts = Cache::builder()
-            .max_capacity(MAX_DOMAIN_CLIENTS)
-            .time_to_live(DEFAULT_CACHE_TTL)
-            .build();
+        let domain_fetch_counts = Arc::new(DashMap::new());
 
         let global_didweb_fetch_count = Arc::new(AtomicU64::new(0));
 
@@ -601,7 +606,9 @@ impl DidResolver {
                 }
                 let domain_counter = self
                     .domain_fetch_counts
-                    .get_with(domain.clone(), || Arc::new(AtomicU64::new(0)));
+                    .entry(domain.clone())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .clone();
                 let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
                 _domain_guard = Some(ConcurrencyGuard(domain_counter));
                 if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
@@ -617,7 +624,9 @@ impl DidResolver {
                 // they are not freed if the async caller is cancelled mid-DNS.
                 let domain_counter = self
                     .domain_fetch_counts
-                    .get_with(domain.clone(), || Arc::new(AtomicU64::new(0)));
+                    .entry(domain.clone())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .clone();
                 let (validated_addr, global_guard, domain_guard) = validate_and_resolve_domain(
                     &domain,
                     Arc::clone(&self.global_didweb_fetch_count),
