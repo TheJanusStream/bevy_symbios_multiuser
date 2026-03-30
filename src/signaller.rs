@@ -269,10 +269,13 @@ impl SymbiosSignallerBuilder {
                     if let tungstenite::Error::Http(ref resp) = e {
                         let code = resp.status().as_u16();
                         if resp.status().is_client_error() {
-                            tracing::error!(status = code, "relay rejected connection (HTTP 4xx) — not retrying");
-                            return SignalingError::UserImplementationError(
-                                format!("http_client_error:{code}"),
+                            tracing::error!(
+                                status = code,
+                                "relay rejected connection (HTTP 4xx) — not retrying"
                             );
+                            return SignalingError::UserImplementationError(format!(
+                                "http_client_error:{code}"
+                            ));
                         }
                     }
                     SignalingError::from(e)
@@ -290,19 +293,20 @@ impl SymbiosSignallerBuilder {
 fn build_ws_request(
     url: &str,
     access_jwt: Option<&str>,
-) -> Result<tungstenite::http::Request<()>, tungstenite::Error> { // <-- Changed return type here
+) -> Result<tungstenite::http::Request<()>, tungstenite::Error> {
+    // <-- Changed return type here
     use tungstenite::client::IntoClientRequest;
-    
-    // 1. Let tungstenite parse the URL and automatically generate all the 
+
+    // 1. Let tungstenite parse the URL and automatically generate all the
     // mandatory WebSocket headers (Upgrade, Connection, Sec-WebSocket-Key)
     let mut request = url.into_client_request()?;
-    
+
     // 2. Inject our ATProto JWT into the pre-formatted request
     if let Some(token) = access_jwt {
         let header_value = format!("Bearer {token}").parse().unwrap();
         request.headers_mut().insert("Authorization", header_value);
     }
-    
+
     Ok(request)
 }
 

@@ -3,9 +3,11 @@
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use bevy_symbios_multiuser::auth::{AtprotoCredentials, AtprotoSession, create_session, get_service_auth};
-use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
+use bevy_symbios_multiuser::auth::{
+    AtprotoCredentials, AtprotoSession, create_session, get_service_auth,
+};
 use bevy_symbios_multiuser::prelude::*;
+use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 use serde::{Deserialize, Serialize};
 
 // --- Protocol ---
@@ -237,7 +239,10 @@ fn login_ui(
                                     &service_did,
                                 )
                                 .await?;
-                                Ok(LoginResult { session, service_token })
+                                Ok(LoginResult {
+                                    session,
+                                    service_token,
+                                })
                             })
                     });
                     commands.spawn(AuthTask(task));
@@ -265,7 +270,10 @@ fn poll_auth_task(
             futures_lite::future::block_on(futures_lite::future::poll_once(&mut task.0))
         {
             match result {
-                Ok(LoginResult { session, service_token }) => {
+                Ok(LoginResult {
+                    session,
+                    service_token,
+                }) => {
                     info!("Successfully authenticated as: {}", session.did);
                     // Insert the session for identity use (avatar fetch, etc.)
                     commands.insert_resource(session);
@@ -364,7 +372,8 @@ fn handle_peer_connections(
                             .as_deref()
                             .or(remote_peer.did.as_deref())
                             .unwrap_or("unknown");
-                        diagnostics.push(format!("[-] Peer {} ({}) disconnected", event.peer, label));
+                        diagnostics
+                            .push(format!("[-] Peer {} ({}) disconnected", event.peer, label));
                         commands.entity(entity).despawn();
                     }
                 }
@@ -595,13 +604,11 @@ fn chat_ui(
             ui.separator();
 
             ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut *input).desired_width(f32::INFINITY),
-                );
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut *input).desired_width(f32::INFINITY));
                 let send = ui.button("Send");
                 let submit = send.clicked()
-                    || (response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
 
                 if submit && !input.trim().is_empty() {
                     let text = input.trim().to_string();
