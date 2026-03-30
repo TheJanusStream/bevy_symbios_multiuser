@@ -287,7 +287,10 @@ struct ConcurrencyGuard {
 
 impl ConcurrencyGuard {
     fn new(counter: Arc<AtomicU64>) -> Self {
-        Self { counter, cleanup: None }
+        Self {
+            counter,
+            cleanup: None,
+        }
     }
 
     fn new_domain(
@@ -295,7 +298,10 @@ impl ConcurrencyGuard {
         map: Arc<DashMap<String, Arc<AtomicU64>>>,
         key: String,
     ) -> Self {
-        Self { counter, cleanup: Some((map, key)) }
+        Self {
+            counter,
+            cleanup: Some((map, key)),
+        }
     }
 }
 
