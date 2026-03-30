@@ -167,6 +167,11 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
             let ws = match self.try_connect(&room_url).await {
                 Ok(stream) => stream,
                 Err(e) => {
+                    // HTTP 4xx errors are permanent client-side rejections (e.g. 401
+                    // Invalid JWT). Retrying won't help — surface them immediately.
+                    if is_http_client_error(&e) {
+                        return Err(e);
+                    }
                     if let Some(ref mut remaining) = attempts {
                         if *remaining <= 1 {
                             return Err(SignalingError::NegotiationFailed(Box::new(e)));
@@ -222,6 +227,15 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
     }
 }
 
+/// Returns `true` if the error was tagged by `try_connect` as an HTTP 4xx response.
+///
+/// 4xx errors are permanent client-side rejections (e.g. 401 Invalid JWT,
+/// 403 Forbidden). The retry loop uses this to bail out immediately instead
+/// of burning through all reconnect attempts on a deterministic failure.
+fn is_http_client_error(e: &SignalingError) -> bool {
+    matches!(e, SignalingError::UserImplementationError(s) if s.starts_with("http_client_error:"))
+}
+
 /// Maximum time to wait for a WebSocket handshake to complete.
 /// Without this, a tarpitted or firewall-dropped TCP connection can hold the
 /// future pending forever, bypassing the retry loop entirely.
@@ -249,7 +263,20 @@ impl SymbiosSignallerBuilder {
 
         match futures_util::future::select(connect_fut, timeout_fut).await {
             Either::Left((result, _)) => {
-                let (stream, _) = result.map_err(SignalingError::from)?;
+                let (stream, _) = result.map_err(|e| {
+                    // Surface HTTP 4xx errors as a distinct variant so the retry loop
+                    // can fast-fail without wasting reconnect attempts on auth failures.
+                    if let tungstenite::Error::Http(ref resp) = e {
+                        let code = resp.status().as_u16();
+                        if resp.status().is_client_error() {
+                            tracing::error!(status = code, "relay rejected connection (HTTP 4xx) — not retrying");
+                            return SignalingError::UserImplementationError(
+                                format!("http_client_error:{code}"),
+                            );
+                        }
+                    }
+                    SignalingError::from(e)
+                })?;
                 Ok(stream)
             }
             Either::Right(_) => Err(SignalingError::UserImplementationError(

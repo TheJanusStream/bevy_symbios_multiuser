@@ -21,11 +21,17 @@ enum ChatMessage {
 }
 
 fn main() {
+    // 1. Read URL from CLI arguments, fallback to our Scaleway Caddy proxy
+    let room_url = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "wss://<relay ip addr>.nip.io/chat_room".to_string());
+
+    info!("Connecting to signaling server at: {}", room_url);
+
     App::new()
         .add_plugins(DefaultPlugins)
-        .add_plugins(SymbiosMultiuserPlugin::<ChatMessage>::new(
-            "wss://matchbox.example.com/chat_room",
-        ))
+        // 2. Pass the dynamic URL into the plugin
+        .add_plugins(SymbiosMultiuserPlugin::<ChatMessage>::new(room_url))
         .add_systems(Update, (handle_incoming, send_periodic_hello))
         .run();
 }

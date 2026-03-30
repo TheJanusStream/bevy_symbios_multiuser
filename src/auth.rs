@@ -61,6 +61,60 @@ struct RefreshSessionResponse {
     refresh_jwt: String,
 }
 
+/// Response from `com.atproto.server.getServiceAuth`.
+#[derive(Deserialize)]
+struct GetServiceAuthResponse {
+    token: String,
+}
+
+/// Request a service auth JWT from an ATProto PDS, targeting a specific audience DID.
+///
+/// Service auth tokens are signed with the user's `#atproto` signing key
+/// (held by the PDS on behalf of the user). Third-party services such as relay
+/// servers verify them by resolving the user's DID document and checking
+/// the signature against the `#atproto` verification key.
+///
+/// This is the correct token type for authenticating to relay servers.
+/// The access token from [`create_session`] is signed by the PDS's own service
+/// key, which third parties cannot verify without resolving the PDS's DID.
+///
+/// # Arguments
+///
+/// - `aud` — The DID of the target service (e.g. `"did:web:relay.example.com"`).
+///   The relay server's `service_did` must match this value if audience validation
+///   is enabled on the relay. Set to any valid DID when `service_did` is `None`.
+pub async fn get_service_auth(
+    client: &reqwest::Client,
+    session: &AtprotoSession,
+    pds_url: &str,
+    aud: &str,
+) -> Result<String, SymbiosError> {
+    validate_pds_url(pds_url)?;
+
+    let url = format!(
+        "{}/xrpc/com.atproto.server.getServiceAuth?aud={}",
+        pds_url.trim_end_matches('/'),
+        aud
+    );
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", session.access_jwt))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SymbiosError::AuthFailed(format!(
+            "getServiceAuth returned {status}: {body}"
+        )));
+    }
+
+    let response: GetServiceAuthResponse = resp.json().await?;
+    Ok(response.token)
+}
+
 /// Validate that a PDS URL is a well-formed HTTPS URL with a host.
 ///
 /// Uses `url::Url::parse` to reject malformed inputs like bare `"https://"`

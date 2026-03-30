@@ -58,6 +58,10 @@ relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid",
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.6", features = ["html_reports"] }
+bevy_egui = "0.39.1"
+image = "0.25.10"
+futures-lite = "2.6.1"
+bevy_asset = "0.18.1"
 
 [[bench]]
 name = "message_serialization"

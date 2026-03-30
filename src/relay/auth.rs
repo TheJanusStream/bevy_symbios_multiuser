@@ -22,6 +22,28 @@ use base64::Engine;
 use jsonwebtoken::{Algorithm, Validation, decode};
 use serde::Deserialize;
 
+/// JWT `aud` claim — can be a single string or an array of strings per RFC 7519 §4.1.3.
+///
+/// Standard JWT libraries may encode a single audience as either `"did:web:svc"` or
+/// `["did:web:svc"]`. We accept both so that PDS implementations using array-style
+/// encoding don't cause claim deserialization to fail before DID resolution even starts.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AudClaim {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl AudClaim {
+    /// Returns `true` if `value` is present in the audience claim.
+    pub fn contains(&self, value: &str) -> bool {
+        match self {
+            AudClaim::Single(s) => s == value,
+            AudClaim::Multiple(v) => v.iter().any(|s| s == value),
+        }
+    }
+}
+
 /// Claims extracted from an ATProto access JWT.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // Fields are read by jsonwebtoken's validation logic
@@ -31,7 +53,8 @@ pub struct AtprotoClaims {
     /// Token expiration time (Unix timestamp).
     pub exp: u64,
     /// The intended audience (service DID). Optional — older tokens may omit it.
-    pub aud: Option<String>,
+    /// Accepts both a plain string and a JSON array (RFC 7519 §4.1.3).
+    pub aud: Option<AudClaim>,
 }
 
 /// A successfully validated peer identity.
@@ -76,10 +99,14 @@ pub async fn validate_atproto_jwt(
     // be used to authenticate against Game B's relay.
     if let Some(expected) = expected_aud {
         match &claims.aud {
-            Some(aud) if aud == expected => {}
+            Some(aud) if aud.contains(expected) => {}
             Some(aud) => {
+                let displayed = match aud {
+                    AudClaim::Single(s) => format!("'{s}'"),
+                    AudClaim::Multiple(v) => format!("{v:?}"),
+                };
                 return Err(format!(
-                    "JWT audience mismatch: token is for '{aud}', expected '{expected}'"
+                    "JWT audience mismatch: token is for {displayed}, expected '{expected}'"
                 ));
             }
             None => {
