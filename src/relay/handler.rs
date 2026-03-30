@@ -192,30 +192,6 @@ pub async fn ws_handler(
         None
     };
 
-    // Enforce a separate handshake slot limit so that tarpitted DID fetches
-    // (e.g. attacker-controlled did:web servers that hold connections open)
-    // cannot exhaust all connection slots. At most max_peers/4 connections
-    // may be in the handshake phase simultaneously.
-    let _handshake_guard = if state.max_handshakes > 0 {
-        let prev = state
-            .active_handshakes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if prev >= state.max_handshakes {
-            state
-                .active_handshakes
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            // _conn_guard drops here, decrementing the connection counter.
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Too many pending handshakes",
-            )
-                .into_response();
-        }
-        Some(AtomicGuard(Arc::clone(&state.active_handshakes)))
-    } else {
-        None
-    };
-
     let identity = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         extract_identity(
@@ -235,11 +211,6 @@ pub async fn ws_handler(
             return (StatusCode::GATEWAY_TIMEOUT, "Authentication timed out").into_response();
         }
     };
-
-    // Handshake phase is over — release the handshake slot so it can be
-    // reused by other incoming connections. The connection slot (_conn_guard)
-    // remains held for the lifetime of the WebSocket session.
-    drop(_handshake_guard);
 
     // If the client used the Sec-WebSocket-Protocol subprotocol trick to pass
     // the JWT, we must echo "access_token" back or the browser will abort.
@@ -780,12 +751,12 @@ async fn handle_socket(
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // Target peer disconnected but hasn't been cleaned
-                            // up from the DashMap yet. Skip this message but do
-                            // NOT permanently ban the target — if they reconnect,
-                            // they'll get a fresh channel in the DashMap and we
-                            // need to be able to deliver to it. The stale entry
-                            // will be removed when its connection task finishes
-                            // cleanup.
+                            // up from the DashMap yet. Clear any accumulated
+                            // strike state — the channel is gone so the strikes
+                            // would never be reset via Ok(()), causing a
+                            // permanent memory leak on long-lived connections
+                            // that interact with many transient peers.
+                            backpressure_strikes.remove(&target_id);
                             tracing::debug!(
                                 target = %target_id,
                                 "target channel closed, dropping this message"

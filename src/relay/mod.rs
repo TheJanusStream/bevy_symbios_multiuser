@@ -232,13 +232,6 @@ pub struct RelayState {
     /// Prevents TOCTOU bypasses where concurrent handshakes all pass the
     /// `max_peers` check before any of them insert into `peers`.
     pub active_connections: Arc<AtomicUsize>,
-    /// Atomic counter tracking connections currently in the handshake phase
-    /// (identity extraction / DID resolution). Capped at `max_peers / 4` to
-    /// prevent attackers from exhausting all connection slots by tarpitting
-    /// the DID fetch phase with slow-responding servers.
-    pub active_handshakes: Arc<AtomicUsize>,
-    /// Maximum concurrent handshakes allowed (derived from `max_peers / 4`).
-    pub max_handshakes: usize,
 }
 
 impl RelayState {
@@ -247,14 +240,6 @@ impl RelayState {
         // works when `auth_required` is false: clients presenting a valid JWT
         // get identified by their DID, while unauthenticated clients fall back
         // to random UUIDs.
-        // Reserve at most 25% of slots for in-progress handshakes. This ensures
-        // that even if all handshake slots are tarpitted, 75% of capacity
-        // remains available for established connections.
-        let max_handshakes = if max_peers > 0 {
-            (max_peers / 4).max(1)
-        } else {
-            0
-        };
         Self {
             peers: Arc::new(DashMap::new()),
             auth_required,
@@ -262,8 +247,6 @@ impl RelayState {
             did_resolver: Some(did_resolver::DidResolver::new()),
             service_did,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            active_handshakes: Arc::new(AtomicUsize::new(0)),
-            max_handshakes,
         }
     }
 }

@@ -52,6 +52,10 @@ pub struct AtprotoClaims {
     pub iss: String,
     /// Token expiration time (Unix timestamp).
     pub exp: u64,
+    /// Not-before time (Unix timestamp). Optional — tokens without this claim
+    /// are valid immediately. When present, the token must not be accepted
+    /// before this time (RFC 7519 §4.1.5).
+    pub nbf: Option<u64>,
     /// The intended audience (service DID). Optional — older tokens may omit it.
     /// Accepts both a plain string and a JSON array (RFC 7519 §4.1.3).
     pub aud: Option<AudClaim>,
@@ -131,10 +135,14 @@ pub async fn validate_atproto_jwt(
 /// any JWT with `"alg": "ES256K"` would fail deserialization before we could
 /// reach our manual `k256` verification path.
 fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
-    let mut parts = token.splitn(3, '.');
-    let _header_b64 = parts.next().ok_or("malformed JWT: missing header")?;
-    let payload_b64 = parts.next().ok_or("malformed JWT: missing payload")?;
-    let _sig = parts.next().ok_or("malformed JWT: missing signature")?;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "malformed JWT: expected 3 parts, got {}",
+            parts.len()
+        ));
+    }
+    let payload_b64 = parts[1];
 
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
@@ -157,6 +165,7 @@ fn verify_signature(token: &str, resolved: &ResolvedKey) -> Result<(), String> {
         ResolvedKey::P256(key) => {
             let mut validation = Validation::new(Algorithm::ES256);
             validation.validate_exp = true;
+            validation.validate_nbf = true;
             validation.validate_aud = false;
             decode::<AtprotoClaims>(token, key, &validation)
                 .map_err(|e| format!("JWT signature verification failed: {e}"))?;
@@ -220,7 +229,7 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|e| format!("ES256K signature verification failed: {e}"))?;
 
-    // Also validate expiry by decoding claims (without sig check)
+    // Validate time-based claims (without sig check — signature already verified above).
     let claims = decode_claims(token)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -228,6 +237,11 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
         .as_secs();
     if claims.exp < now {
         return Err("JWT has expired".to_string());
+    }
+    if let Some(nbf) = claims.nbf {
+        if now < nbf {
+            return Err("JWT not yet valid (nbf)".to_string());
+        }
     }
 
     Ok(())

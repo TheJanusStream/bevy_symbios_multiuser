@@ -279,6 +279,7 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
 /// string and grow without bound (OOM DoS). The `Arc::ptr_eq` check prevents
 /// removing a replacement entry that a concurrent request may have inserted
 /// between our `fetch_sub` and the `remove_if`.
+#[derive(Debug)]
 struct ConcurrencyGuard {
     counter: Arc<AtomicU64>,
     /// If set, remove the map entry on drop when `counter` reaches zero.
@@ -336,10 +337,14 @@ impl Drop for ConcurrencyGuard {
 /// this, an attacker could repeatedly connect/disconnect to queue un-cancellable
 /// blocking tasks while the concurrency counter stays at zero, exhausting the
 /// Tokio blocking thread pool (512 threads by default).
+///
+/// The per-domain counter is looked up **and incremented** inside `spawn_blocking`
+/// while holding the [`DashMap`] entry lock. This closes the TOCTOU race where
+/// [`ConcurrencyGuard::drop`] could call `remove_if` between the map lookup and
+/// the `fetch_add`, causing a new request to track state on a disconnected `Arc`.
 async fn validate_and_resolve_domain(
     domain: &str,
     global_counter: Arc<AtomicU64>,
-    domain_counter: Arc<AtomicU64>,
     domain_fetch_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
 ) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), String> {
     // Add default HTTPS port if no port is present, so ToSocketAddrs works.
@@ -375,7 +380,17 @@ async fn validate_and_resolve_domain(
         }
 
         // Acquire the per-domain concurrency guard on the blocking thread.
-        let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
+        // The fetch_add is performed while holding the DashMap entry lock so
+        // that ConcurrencyGuard::drop cannot call remove_if between the map
+        // lookup and the increment (TOCTOU race fix).
+        let domain_prev;
+        let domain_counter = {
+            let entry = domain_fetch_counts
+                .entry(domain_owned.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            domain_prev = entry.fetch_add(1, Ordering::Relaxed);
+            Arc::clone(&*entry)
+        };
         let domain_guard =
             ConcurrencyGuard::new_domain(domain_counter, domain_fetch_counts, domain_owned.clone());
         if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
@@ -646,12 +661,17 @@ impl DidResolver {
                          ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
                     ));
                 }
-                let domain_counter = self
-                    .domain_fetch_counts
-                    .entry(domain.clone())
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                    .clone();
-                let domain_prev = domain_counter.fetch_add(1, Ordering::Relaxed);
+                // Increment while holding the entry lock to close the TOCTOU
+                // race between fetch_add and remove_if in ConcurrencyGuard::drop.
+                let domain_prev;
+                let domain_counter = {
+                    let entry = self
+                        .domain_fetch_counts
+                        .entry(domain.clone())
+                        .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+                    domain_prev = entry.fetch_add(1, Ordering::Relaxed);
+                    Arc::clone(&*entry)
+                };
                 _domain_guard = Some(ConcurrencyGuard::new_domain(
                     domain_counter,
                     Arc::clone(&self.domain_fetch_counts),
@@ -666,17 +686,12 @@ impl DidResolver {
                 cached
             } else {
                 // No cached client — resolve DNS, validate the IP, and build a
-                // pinned client. Guards are acquired inside spawn_blocking so
-                // they are not freed if the async caller is cancelled mid-DNS.
-                let domain_counter = self
-                    .domain_fetch_counts
-                    .entry(domain.clone())
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                    .clone();
+                // pinned client. Guards (including the domain counter increment)
+                // are acquired inside spawn_blocking so they are not freed if
+                // the async caller is cancelled mid-DNS.
                 let (validated_addr, global_guard, domain_guard) = validate_and_resolve_domain(
                     &domain,
                     Arc::clone(&self.global_didweb_fetch_count),
-                    domain_counter,
                     Arc::clone(&self.domain_fetch_counts),
                 )
                 .await?;
@@ -1098,7 +1113,7 @@ mod tests {
         validate_and_resolve_domain(
             domain,
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(DashMap::new()),
         )
         .await
     }
