@@ -233,6 +233,10 @@ pub struct RelayState {
     /// Prevents TOCTOU bypasses where concurrent handshakes all pass the
     /// `max_peers` check before any of them insert into `peers`.
     pub active_connections: Arc<AtomicUsize>,
+    /// Atomic counter tracking connections currently in the auth/DID-resolution
+    /// phase. Capped at `max_peers / 4` (minimum 1) to prevent DID tarpit
+    /// attacks from exhausting all connection slots while legitimate peers wait.
+    pub active_handshakes: Arc<AtomicUsize>,
 }
 
 impl RelayState {
@@ -248,6 +252,7 @@ impl RelayState {
             did_resolver: Some(did_resolver::DidResolver::new()),
             service_did,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            active_handshakes: Arc::new(AtomicUsize::new(0)),
         }
     }
 }

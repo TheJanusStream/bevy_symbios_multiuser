@@ -124,6 +124,16 @@ pub async fn validate_atproto_jwt(
         )));
     }
 
+    // Reject unsupported DID methods before calling the resolver. The resolver
+    // returns a generic error string for unknown methods, and blindly mapping
+    // that error to AuthError::Transient (HTTP 503) would prompt automated
+    // clients to retry a permanently-invalid credential indefinitely.
+    if !did.starts_with("did:plc:") && !did.starts_with("did:web:") {
+        return Err(AuthError::InvalidToken(format!(
+            "unsupported DID method in JWT issuer: {did}"
+        )));
+    }
+
     // Validate audience claim when the relay has a service DID configured.
     // Prevents cross-service token replay: a JWT issued for Game A cannot
     // be used to authenticate against Game B's relay.
@@ -293,7 +303,7 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
         .map_err(|e| format!("system time error: {e}"))?
         .as_secs();
     // Apply the same leeway as the P-256 path for consistency.
-    if claims.exp + LEEWAY_SECS < now {
+    if claims.exp.saturating_add(LEEWAY_SECS) < now {
         return Err("JWT has expired".to_string());
     }
     if let Some(nbf) = claims.nbf {

@@ -192,6 +192,30 @@ pub async fn ws_handler(
         None
     };
 
+    // Reserve a handshake slot: at most max_peers / 4 connections may be in
+    // the auth/DID-resolution phase simultaneously. Prevents DID tarpit
+    // attacks from exhausting the entire connection budget while legitimate
+    // peers are blocked waiting for slow DID-hosting servers to respond.
+    let _handshake_guard = if state.max_peers > 0 {
+        let handshake_limit = (state.max_peers / 4).max(1);
+        let prev = state
+            .active_handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev >= handshake_limit {
+            state
+                .active_handshakes
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many connections pending authentication",
+            )
+                .into_response();
+        }
+        Some(AtomicGuard(Arc::clone(&state.active_handshakes)))
+    } else {
+        None
+    };
+
     let identity = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         extract_identity(
@@ -207,10 +231,14 @@ pub async fn ws_handler(
         Ok(result) => result,
         Err(_) => {
             tracing::warn!("identity extraction timed out, dropping connection");
-            // _conn_guard drops here, decrementing the counter.
+            // _conn_guard and _handshake_guard both drop here.
             return (StatusCode::GATEWAY_TIMEOUT, "Authentication timed out").into_response();
         }
     };
+
+    // Auth complete — release the handshake slot. The connection slot
+    // (_conn_guard) is kept for the lifetime of the WebSocket session.
+    drop(_handshake_guard);
 
     // If the client used the Sec-WebSocket-Protocol subprotocol trick to pass
     // the JWT, we must echo "access_token" back or the browser will abort.
