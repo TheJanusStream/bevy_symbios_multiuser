@@ -125,6 +125,18 @@ pub struct TokenSourceRes(pub TokenSource);
 /// because the lock is only held for a brief `.clone()` (never across `.await`
 /// points). Do **not** hold a guard from this lock across an `.await` — if you
 /// need longer-lived access, clone the inner value first and release the guard.
+///
+/// In particular, **never hold the write guard while awaiting a network call**
+/// (e.g. `get_service_auth`). The signaller's `new_signaller` task acquires the
+/// read lock on every reconnect attempt; if the write lock is held for the
+/// duration of an async HTTP request, that reconnect will block indefinitely.
+/// The correct pattern is to complete the async call first, then acquire the
+/// write lock only for the instant needed to swap the value:
+///
+/// ```rust,ignore
+/// let new_token = get_service_auth(...).await?;   // network call — no lock held
+/// *token_source.write().unwrap() = Some(new_token); // lock held only for swap
+/// ```
 pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
 
 /// A [`SignallerBuilder`] that injects an ATProto JWT into the WebSocket

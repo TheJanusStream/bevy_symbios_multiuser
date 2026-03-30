@@ -248,7 +248,11 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
     } else if did.starts_with("did:web:") {
         let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
         let (domain_raw, path_raw) = split_did_web_domain_path(raw)?;
-        // Percent-decode %3A back to : for port numbers (e.g. example.com%3A8443).
+        // The W3C did:web spec requires only the port-separator colon to be
+        // percent-encoded as %3A in the method-specific identifier.  We decode
+        // exactly that sequence and nothing else: DNS hostnames do not use
+        // RFC 3986 percent-encoding (IDNs are expressed as punycode ACE labels),
+        // so any remaining `%XX` in the domain indicates a malformed DID.
         let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
 
         if let Some(path_segments) = path_raw {
@@ -632,6 +636,8 @@ impl DidResolver {
         let pinned_client = if did.starts_with("did:web:") {
             let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
             let (domain_raw, _) = split_did_web_domain_path(raw)?;
+            // Only %3A/%3a (port separator) is decoded — see did_document_url
+            // for the rationale on intentionally skipping full RFC 3986 decode.
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
 
             // Use the full domain (host + port) as the cache key so that
