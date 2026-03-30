@@ -22,6 +22,30 @@ use base64::Engine;
 use jsonwebtoken::{Algorithm, Validation, decode};
 use serde::Deserialize;
 
+/// Error returned by [`validate_atproto_jwt`].
+///
+/// Distinguishes permanent authentication failures (invalid token, bad
+/// signature, expired) from transient infrastructure failures (resolver
+/// overloaded, DNS unreachable). Callers map these to different HTTP status
+/// codes: 401 for `InvalidToken`, 503 for `Transient`.
+#[derive(Debug)]
+pub enum AuthError {
+    /// JWT is structurally malformed, has an invalid signature, or is expired.
+    /// Retrying with the same token will not succeed.
+    InvalidToken(String),
+    /// Transient infrastructure failure — DID resolver is overloaded or the
+    /// DID hosting server is temporarily unreachable. Clients should retry.
+    Transient(String),
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthError::InvalidToken(s) | AuthError::Transient(s) => s.fmt(f),
+        }
+    }
+}
+
 /// JWT `aud` claim — can be a single string or an array of strings per RFC 7519 §4.1.3.
 ///
 /// Standard JWT libraries may encode a single audience as either `"did:web:svc"` or
@@ -89,13 +113,15 @@ pub async fn validate_atproto_jwt(
     token: &str,
     resolver: &DidResolver,
     expected_aud: Option<&str>,
-) -> Result<ValidatedIdentity, String> {
+) -> Result<ValidatedIdentity, AuthError> {
     // Step 1: Decode without signature verification to read claims.
-    let claims = decode_claims(token)?;
+    let claims = decode_claims(token).map_err(AuthError::InvalidToken)?;
     let did = &claims.iss;
 
     if !did.starts_with("did:") {
-        return Err(format!("invalid DID in JWT issuer: {did}"));
+        return Err(AuthError::InvalidToken(format!(
+            "invalid DID in JWT issuer: {did}"
+        )));
     }
 
     // Validate audience claim when the relay has a service DID configured.
@@ -109,19 +135,31 @@ pub async fn validate_atproto_jwt(
                     AudClaim::Single(s) => format!("'{s}'"),
                     AudClaim::Multiple(v) => format!("{v:?}"),
                 };
-                return Err(format!(
+                return Err(AuthError::InvalidToken(format!(
                     "JWT audience mismatch: token is for {displayed}, expected '{expected}'"
-                ));
+                )));
             }
             None => {
-                return Err(format!("JWT missing aud claim, expected '{expected}'"));
+                return Err(AuthError::InvalidToken(format!(
+                    "JWT missing aud claim, expected '{expected}'"
+                )));
             }
         }
     }
 
-    // Step 2–3: Verify the signature against the DID document key.
-    let resolved = resolver.resolve_key(did).await?;
-    verify_signature(token, &resolved)?;
+    // Step 2: Resolve the DID document key. Resolution failures (DNS down,
+    // concurrency limit exceeded) are transient — map to AuthError::Transient
+    // so callers can return 503 rather than 401.
+    let resolved = resolver
+        .resolve_key(did)
+        .await
+        .map_err(AuthError::Transient)?;
+
+    // Step 3: Verify the JWT signature on a blocking thread (ECDSA is CPU-bound;
+    // running it on the async executor starves other tasks under connection floods).
+    verify_signature(token, &resolved)
+        .await
+        .map_err(AuthError::InvalidToken)?;
     tracing::debug!(did = %did, "JWT signature verified via DID document");
 
     Ok(ValidatedIdentity { did: did.clone() })
@@ -154,25 +192,44 @@ fn decode_claims(token: &str) -> Result<AtprotoClaims, String> {
     Ok(claims)
 }
 
+/// Clock-skew leeway for time-based JWT claims (seconds).
+///
+/// Matches the default leeway applied by `jsonwebtoken` on the P-256 path,
+/// ensuring consistent behaviour across both key types. Short-lived ATProto
+/// tokens combined with any NTP drift would otherwise cause sporadic failures
+/// exclusively for users whose PDS uses secp256k1 keys.
+const LEEWAY_SECS: u64 = 60;
+
 /// Verify the JWT signature against a resolved public key.
+///
+/// Both ECDSA paths are offloaded to [`tokio::task::spawn_blocking`]: a single
+/// verification takes ~1–2 ms, but under a connection flood an attacker can
+/// saturate the async executor with CPU-bound crypto, starving I/O tasks. The
+/// blocking thread pool is the correct place for this work.
 ///
 /// P-256 keys are verified via `jsonwebtoken`'s built-in ES256 support.
 /// K-256 (secp256k1) keys are verified manually since `jsonwebtoken` does
 /// not support ES256K: the JWT signing input is hashed with SHA-256 and
 /// the ECDSA signature is verified using `k256::ecdsa`.
-fn verify_signature(token: &str, resolved: &ResolvedKey) -> Result<(), String> {
-    match resolved {
+async fn verify_signature(token: &str, resolved: &ResolvedKey) -> Result<(), String> {
+    let token_owned = token.to_string();
+    let resolved_owned = resolved.clone();
+    tokio::task::spawn_blocking(move || match resolved_owned {
         ResolvedKey::P256(key) => {
             let mut validation = Validation::new(Algorithm::ES256);
             validation.validate_exp = true;
             validation.validate_nbf = true;
             validation.validate_aud = false;
-            decode::<AtprotoClaims>(token, key, &validation)
+            validation.leeway = LEEWAY_SECS;
+            decode::<AtprotoClaims>(&token_owned, &key, &validation)
                 .map_err(|e| format!("JWT signature verification failed: {e}"))?;
             Ok(())
         }
-        ResolvedKey::K256(public_key) => verify_es256k(token, public_key),
-    }
+        ResolvedKey::K256(public_key) => verify_es256k(&token_owned, &public_key),
+    })
+    .await
+    .map_err(|e| format!("ECDSA verification task panicked: {e}"))
+    .and_then(|r| r)
 }
 
 /// Manually verify an ES256K JWT signature using the `k256` crate.
@@ -235,11 +292,12 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("system time error: {e}"))?
         .as_secs();
-    if claims.exp < now {
+    // Apply the same leeway as the P-256 path for consistency.
+    if claims.exp + LEEWAY_SECS < now {
         return Err("JWT has expired".to_string());
     }
     if let Some(nbf) = claims.nbf {
-        if now < nbf {
+        if now + LEEWAY_SECS < nbf {
             return Err("JWT not yet valid (nbf)".to_string());
         }
     }
@@ -318,13 +376,13 @@ mod tests {
         DecodingKey::from_ec_pem(pem.as_bytes()).expect("parse EC PEM")
     }
 
-    #[test]
-    fn verify_signature_accepts_valid_jwt() {
+    #[tokio::test]
+    async fn verify_signature_accepts_valid_jwt() {
         let secret = test_key_pair();
         let token = sign_test_jwt("did:plc:testuser", &secret);
         let decoding_key = decoding_key_from_p256(&secret.public_key());
 
-        let result = verify_signature(&token, &ResolvedKey::P256(decoding_key));
+        let result = verify_signature(&token, &ResolvedKey::P256(decoding_key)).await;
         assert!(
             result.is_ok(),
             "verify_signature failed: {:?}",
@@ -332,8 +390,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_signature_rejects_wrong_key() {
+    #[tokio::test]
+    async fn verify_signature_rejects_wrong_key() {
         let secret = test_key_pair();
         let token = sign_test_jwt("did:plc:testuser", &secret);
 
@@ -347,7 +405,7 @@ mod tests {
 
         let wrong_key = decoding_key_from_p256(&wrong_secret.public_key());
 
-        let result = verify_signature(&token, &ResolvedKey::P256(wrong_key));
+        let result = verify_signature(&token, &ResolvedKey::P256(wrong_key)).await;
         assert!(result.is_err());
         assert!(
             result

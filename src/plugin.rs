@@ -6,9 +6,6 @@ use matchbox_socket::RtcIceServerConfig;
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 
-#[cfg(feature = "client")]
-use crate::auth::AtprotoSession;
-
 /// Configuration for the symbios multiuser plugin.
 ///
 /// The type parameter `T` ties this config to a specific
@@ -163,7 +160,6 @@ fn open_socket<T: Send + Sync + 'static>(
     config: Option<Res<SymbiosMultiuserConfig<T>>>,
     opened: Option<Res<SocketOpened<T>>>,
     socket: Option<Res<MatchboxSocket>>,
-    #[cfg(feature = "client")] session: Option<Res<AtprotoSession>>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
 ) {
     // Teardown: if the socket was opened but the config was removed or the
@@ -208,18 +204,16 @@ fn open_socket<T: Send + Sync + 'static>(
     }
 
     // Always use the Symbios signaller so the relay receives SignalEnvelope
-    // payloads. Prefer a shared TokenSource (supports token refresh on
-    // reconnect) over a static session clone. Fall back to anonymous mode
-    // when neither is available.
+    // payloads. Use the shared TokenSource when present (supports token
+    // refresh on reconnect). Fall back to anonymous mode — do not implicitly
+    // grab AtprotoSession, as it may be present only for UI purposes and
+    // silently transmitting it would cause unexpected 401 rejections.
     #[cfg(feature = "client")]
     {
         let signaller = if let Some(ts) = token_source {
             crate::signaller::signaller_with_token_source(ts.0.clone())
         } else {
-            match session {
-                Some(s) => crate::signaller::signaller_for_session(&s),
-                None => crate::signaller::signaller_anonymous(),
-            }
+            crate::signaller::signaller_anonymous()
         };
         builder = builder.signaller_builder(signaller);
     }

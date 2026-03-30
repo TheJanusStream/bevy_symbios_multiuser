@@ -302,7 +302,18 @@ async fn extract_identity(
 
     match auth::validate_atproto_jwt(token, &resolver, service_did).await {
         Ok(identity) => Ok(Some(identity)),
-        Err(e) => {
+        Err(auth::AuthError::Transient(e)) => {
+            // DID resolver is overloaded or the DID hosting server is
+            // temporarily unreachable. This is not the client's fault —
+            // returning 401 here would cause signallers to permanently abort
+            // reconnects on what is actually a transient load spike.
+            tracing::warn!(error = %e, "JWT validation failed: transient resolver error");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service temporarily unavailable, please retry",
+            ))
+        }
+        Err(auth::AuthError::InvalidToken(e)) => {
             tracing::warn!(error = %e, "JWT validation failed");
             // A token was explicitly provided — always reject it if invalid,
             // regardless of auth_required. Silently downgrading to a guest UUID
@@ -648,12 +659,17 @@ async fn handle_socket(
                 per_target_last_reset = now;
             }
             if rate_tokens == 0 {
-                tracing::warn!(
+                // Drop the message rather than hard-disconnecting. A 50-person
+                // room can burst >500 signals during mesh init; severing the
+                // connection would permanently break WebRTC negotiation for
+                // legitimate peers. Silently dropping excess signals is far
+                // less damaging — ICE and SDP have their own retry logic.
+                tracing::debug!(
                     session = %session_id,
-                    "disconnecting peer: rate limit exhausted (burst {RATE_BURST_CAPACITY}, \
+                    "dropping signal: rate limit exhausted (burst {RATE_BURST_CAPACITY}, \
                      refill {RATE_REFILL_PER_SECOND}/s)"
                 );
-                break;
+                continue;
             }
             rate_tokens -= 1;
 
