@@ -547,19 +547,27 @@ fn chat_ui(
 ) {
     egui::SidePanel::right("chat")
         .resizable(true)
-        .default_width(300.0)
+        // Constrain horizontal growth regardless of content width.
+        .width_range(200.0..=500.0)
+        .default_width(400.0)
         .show(contexts.ctx_mut().unwrap(), |ui| {
             ui.heading("Chat");
             ui.separator();
 
-            // Message history — leave room for the input row
-            let history_height = ui.available_height() - 36.0;
+            // Read available height once, before placing any content, so the
+            // value is stable across frames (SidePanel height = full window
+            // height, which is constant). Subtracting a fixed budget for the
+            // separator + input row avoids any feedback loop.
+            let scroll_height = (ui.available_height() - 40.0).max(60.0);
+
             egui::ScrollArea::vertical()
                 .id_salt("chat_history")
-                .auto_shrink([false; 2])
+                .max_height(scroll_height)
                 .stick_to_bottom(true)
-                .max_height(history_height)
                 .show(ui, |ui| {
+                    // Clamp content to the available width so message text wraps
+                    // instead of pushing the panel wider.
+                    ui.set_max_width(ui.available_width());
                     for (author, text) in &chat.messages {
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(
@@ -573,28 +581,26 @@ fn chat_ui(
 
             ui.separator();
 
-            // Input row
             ui.horizontal(|ui| {
-                let response =
-                    ui.add(egui::TextEdit::singleline(&mut *input).desired_width(f32::INFINITY));
-
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut *input).desired_width(f32::INFINITY),
+                );
                 let send = ui.button("Send");
-                let submit =
-                    send.clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                let submit = send.clicked()
+                    || (response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
 
                 if submit && !input.trim().is_empty() {
                     let text = input.trim().to_string();
                     input.clear();
                     response.request_focus();
 
-                    // Echo to local history immediately
                     let local_handle = session
                         .as_ref()
                         .map(|s| s.handle.clone())
                         .unwrap_or_else(|| "me".into());
                     chat.messages.push((local_handle, text.clone()));
 
-                    // Broadcast to peers
                     writer.write(Broadcast {
                         payload: OasisMessage::Chat { text },
                         channel: ChannelKind::Reliable,
