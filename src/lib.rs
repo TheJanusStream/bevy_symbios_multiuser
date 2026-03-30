@@ -15,8 +15,16 @@
 //! Authentication flows through a **Sovereign Broker** pattern:
 //!
 //! 1. The client authenticates with an ATProto PDS via
-//!    [`auth::create_session`], obtaining a JWT access token.
-//! 2. The [`signaller::SymbiosSignallerBuilder`] passes this JWT to the
+//!    [`auth::create_session`], obtaining an [`auth::AtprotoSession`]. For
+//!    relay authentication with `auth_required = true`, the client must then
+//!    call [`auth::get_service_auth`] to obtain a *service auth token* — a
+//!    JWT signed by the user's `#atproto` key that third-party relays can
+//!    verify via DID document resolution. The `access_jwt` from
+//!    `create_session` is signed by the PDS service key and cannot be
+//!    verified this way. Wrap the service token in a
+//!    [`signaller::TokenSourceRes`] resource so the signaller uses it on
+//!    each connection attempt.
+//! 2. The [`signaller::SymbiosSignallerBuilder`] passes this token to the
 //!    relay during the WebSocket handshake. On native targets, the token is
 //!    sent as an `Authorization: Bearer` header. On WASM targets, the token
 //!    is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the

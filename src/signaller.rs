@@ -303,7 +303,9 @@ fn build_ws_request(
 
     // 2. Inject our ATProto JWT into the pre-formatted request
     if let Some(token) = access_jwt {
-        let header_value = format!("Bearer {token}").parse().unwrap();
+        let header_value = format!("Bearer {token}")
+            .parse::<tungstenite::http::HeaderValue>()
+            .map_err(|e| tungstenite::Error::HttpFormat(e.into()))?;
         request.headers_mut().insert("Authorization", header_value);
     }
 

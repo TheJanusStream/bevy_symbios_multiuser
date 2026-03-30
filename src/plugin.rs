@@ -187,7 +187,12 @@ fn open_socket<T: Send + Sync + 'static>(
             // after the deferred commands are applied.
             return;
         }
-        // Config exists and URL matches — socket already open, nothing to do.
+        // Config exists and URL matches — but if the socket was lost (disconnect
+        // or external removal), clear the marker so it can be reopened next frame.
+        if socket.is_none() {
+            tracing::info!("socket was lost while config unchanged, clearing marker for reconnect");
+            commands.remove_resource::<SocketOpened<T>>();
+        }
         return;
     }
     let Some(config) = config else {

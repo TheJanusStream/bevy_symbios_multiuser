@@ -75,6 +75,12 @@ where
 
         let messages = channel.receive();
         for (peer, packet) in messages {
+            // Skip deserialization entirely if the queue would drop this packet
+            // anyway — avoids burning CPU on packets that are mathematically
+            // guaranteed to be discarded due to count or byte-budget limits.
+            if queue.would_drop(packet.len()) {
+                continue;
+            }
             match bincode_options().deserialize::<T>(&packet) {
                 Ok(payload) => {
                     tracing::trace!(

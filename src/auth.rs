@@ -92,13 +92,13 @@ pub async fn get_service_auth(
     validate_pds_url(pds_url)?;
 
     let url = format!(
-        "{}/xrpc/com.atproto.server.getServiceAuth?aud={}",
-        pds_url.trim_end_matches('/'),
-        aud
+        "{}/xrpc/com.atproto.server.getServiceAuth",
+        pds_url.trim_end_matches('/')
     );
 
     let resp = client
         .get(&url)
+        .query(&[("aud", aud)])
         .header("Authorization", format!("Bearer {}", session.access_jwt))
         .send()
         .await?;

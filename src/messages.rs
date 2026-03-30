@@ -142,6 +142,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
     pub fn len(&self) -> usize {
         self.incoming.len()
     }
+
+    /// Returns `true` if this packet would be dropped by [`push`](Self::push).
+    ///
+    /// Call this *before* deserializing to avoid burning CPU on packets that are
+    /// guaranteed to be discarded due to the count or byte-budget limits.
+    pub(crate) fn would_drop(&self, packet_size: usize) -> bool {
+        self.incoming.len() >= MAX_NETWORK_QUEUE_LEN
+            || self.total_bytes.saturating_add(packet_size) > MAX_NETWORK_QUEUE_BYTES
+    }
 }
 
 /// A peer connection state change event.

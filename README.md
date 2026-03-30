@@ -118,12 +118,20 @@ let config = RelayConfig {
 cargo run --example basic_chat
 ```
 
+### Running the Oasis Example
+
+A multiplayer sandbox that demonstrates the full authentication flow: ATProto login, service token acquisition, `TokenSourceRes` setup, deferred plugin connection, and in-game identity display.
+
+```sh
+cargo run --example oasis
+```
+
 ## ATProto Authentication
 
-The `auth` module provides functions to create and refresh ATProto sessions:
+The `auth` module provides functions to create and refresh ATProto sessions, and to obtain service auth tokens for relay authentication.
 
 ```rust
-use bevy_symbios_multiuser::auth::{AtprotoCredentials, create_session};
+use bevy_symbios_multiuser::auth::{AtprotoCredentials, create_session, get_service_auth};
 
 let client = reqwest::Client::new();
 let credentials = AtprotoCredentials {
@@ -136,52 +144,73 @@ let session = create_session(&client, &credentials).await?;
 println!("Authenticated as DID: {}", session.did);
 ```
 
-Insert the resulting `AtprotoSession` as a Bevy resource and the custom signaller will automatically use the JWT when connecting to the relay. The socket opens reactively on the first frame after `SymbiosMultiuserConfig<T>` exists, so the session can be inserted at any time before the config:
+**Important:** The `access_jwt` from `create_session` is signed by the PDS's own service key, which third-party relays cannot verify. When connecting to a relay with `auth_required = true`, use `get_service_auth` to obtain a *service auth token* — this JWT is signed by the user's `#atproto` key (held by the PDS on their behalf) and can be verified by any relay that resolves the user's DID document:
 
 ```rust
-// Immediate connection (session available at startup):
-app.insert_resource(session);
+// Obtain a service auth token for relay authentication.
+// `aud` must match the relay's `service_did` if audience validation is enabled.
+let service_token = get_service_auth(
+    &client,
+    &session,
+    "https://bsky.social",        // pds_url
+    "did:web:relay.example.com",  // aud: the relay's service DID
+).await?;
+```
+
+Wrap the service token in a `TokenSourceRes` resource. The plugin prefers this over `AtprotoSession` and reads the latest token on each reconnect:
+
+```rust
+use std::sync::{Arc, RwLock};
+use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
+
+let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+app.insert_resource(session);                          // used for identity (DID, handle)
+app.insert_resource(TokenSourceRes(token_source));     // used for relay authentication
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
     "wss://relay.example.com/ws",
 ));
 ```
 
-For games with a login screen, use the deferred constructor to register systems without opening a socket. Insert both resources later when ready:
+For games with a login screen, use the deferred constructor to register systems without opening a socket. Insert all resources later when ready:
 
 ```rust
 // Deferred connection (session obtained after login):
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::deferred());
 
-// Later, after the user logs in, insert both resources via Commands
-// (e.g., from a Bevy state-transition system or a one-shot system):
-fn on_login(mut commands: Commands) {
+// Later, after the user logs in, insert resources via Commands:
+fn on_login(mut commands: Commands, service_token: String, session: AtprotoSession) {
+    let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+    commands.insert_resource(session);
+    commands.insert_resource(TokenSourceRes(source));
     commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
         room_url: "wss://relay.example.com/ws".to_string(),
         ice_servers: None,
         _marker: std::marker::PhantomData,
     });
 }
-// AtprotoSession must be inserted before or alongside the config so the
-// signaller can read it when the socket opens on the next frame:
-//   commands.insert_resource(session); // session: AtprotoSession from create_session()
 ```
 
 ### Token Refresh for Long-Lived Apps
 
-ATProto access tokens are short-lived. If the token expires between the initial connection and a later reconnect, the relay will reject the stale JWT. For long-lived applications, insert a `TokenSourceRes` resource instead of (or alongside) `AtprotoSession`. The plugin prefers `TokenSourceRes` when both are present, reading the latest token on each reconnect:
+Both ATProto access tokens and service auth tokens are short-lived. For long-lived applications, refresh both when they expire and update the `TokenSource` with a new service auth token:
 
 ```rust
 use std::sync::{Arc, RwLock};
+use bevy_symbios_multiuser::auth::{refresh_session, get_service_auth};
 use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 
-let token_source: TokenSource = Arc::new(RwLock::new(Some(session.access_jwt.clone())));
+let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
 app.insert_resource(TokenSourceRes(token_source.clone()));
 
-// Later, after refreshing the session:
-let new_session = bevy_symbios_multiuser::auth::refresh_session(
-    &client, &session, "https://bsky.social",
+// Later, when tokens are near expiry:
+let new_session = refresh_session(&client, &session, "https://bsky.social").await?;
+let new_service_token = get_service_auth(
+    &client,
+    &new_session,
+    "https://bsky.social",
+    "did:web:relay.example.com",
 ).await?;
-*token_source.write().unwrap() = Some(new_session.access_jwt.clone());
+*token_source.write().unwrap() = Some(new_service_token);
 ```
 
 ## Modules
@@ -192,7 +221,7 @@ let new_session = bevy_symbios_multiuser::auth::refresh_session(
 | `messages` | `Broadcast<T>`, `NetworkReceived<T>`, `NetworkQueue<T>`, `ChannelKind`, `PeerConnectionState`, `PeerStateChanged`, `PeerStateQueue<T>` |
 | `systems` | ECS systems for transmit, receive, and peer state polling; `bincode_options()` for serialization compatibility |
 | `protocol` | Shared signaling wire format (`SignalEnvelope`, `SignalPayload`) |
-| `auth` | ATProto session creation and refresh (feature: `client`) |
+| `auth` | ATProto session creation (`create_session`), refresh (`refresh_session`), and service auth token acquisition for relay authentication (`get_service_auth`) (feature: `client`) |
 | `signaller` | Custom `matchbox_socket::Signaller` with JWT injection, refreshable `TokenSource`/`TokenSourceRes` for reconnects, and anonymous mode (feature: `client`) |
 | `relay` | Sovereign Broker relay server with DID-based JWT verification (feature: `relay`) |
 | `error` | `SymbiosError` error types |
