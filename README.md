@@ -14,7 +14,7 @@ The architecture follows a **Sovereign Broker** pattern: clients authenticate wi
 - **Generic Message Bus** — Define your own domain-specific protocol type `T: Serialize + Deserialize`, and the plugin handles serialization (via `bincode`) and transport.
 - **Dual Channels** — Reliable (ordered, guaranteed) for state mutations and Unreliable (best-effort) for ephemeral presence data.
 - **ATProto Authentication** — Federated identity via `com.atproto.server.createSession` for Bluesky/ATProto-based auth. The JWT is passed to the relay via the `Authorization` header (native) or `Sec-WebSocket-Protocol` subprotocol trick (WASM).
-- **Sovereign Broker Relay** — Optional signaling server built on Axum with full ATProto JWT verification, room-based peer isolation, and defense-in-depth hardening. When `auth_required` is enabled, the relay resolves the signer's DID document (via `plc.directory` for `did:plc`, or HTTPS for `did:web` — domain-only DIDs use `/.well-known/did.json`, path-based DIDs use `/{path}/did.json`), extracts the `#atproto` signing key (P-256/ES256 or secp256k1/ES256K), and cryptographically verifies the JWT signature. Resolved keys are cached in memory (5-minute TTL) with request coalescing to prevent cache stampedes; failed resolutions are negatively cached for 60 seconds to prevent DDoS reflection. The URL path determines the room — peers in different rooms are fully isolated and cannot exchange signals. Hardening includes: a 10-second HTTP request timeout (Slowloris protection), atomic connection limits (`max_peers`), a handshake slot budget (`max_peers / 4`) to prevent DID tarpit attacks, a 64 KiB WebSocket message size cap, SSRF protection with DNS-pinning for `did:web` (capped at 100 domain clients), streamed DID document body limits (256 KiB), a 120-second idle timeout with 30-second server-side pings (for WASM keep-alive), a 15-second handshake timeout, a 5-second WebSocket write timeout (prevents blocked sends from holding connection slots when the client's TCP receive buffer is full), self-targeting SDP rejection, control signal filtering, automatic disconnect after 10 cumulative invalid messages, per-target backpressure tracking (50 consecutive channel-full strikes silently stops delivery; closed channels are skipped without accumulating strikes so reconnected peers recover immediately), per-target burst limiting (64 messages per sender-target pair per rate window, preventing one sender from filling a target's 256-slot relay channel with garbage that would starve legitimate signals from other peers), per-sender token-bucket rate limiting (burst 500, refill 20/s), per-domain `did:web` fetch concurrency limiting (10 concurrent), global `did:web` fetch concurrency limiting (50 concurrent), request coalescing, negative DID caching (60s), peer ID length validation (512-byte cap after deserialization), unique target cap (256 distinct targets per sender per rate window), and JWT audience validation (`service_did`) to prevent cross-service token replay.
+- **Sovereign Broker Relay** — Optional signaling server (Axum + Tokio) with ATProto JWT verification, room-based peer isolation, and defense-in-depth hardening. When `auth_required` is enabled, the relay resolves the signer's DID document (via `plc.directory` for `did:plc`, or HTTPS for `did:web` — domain-only DIDs use `/.well-known/did.json`, path-based DIDs use `/{path}/did.json`), extracts the `#atproto` signing key (P-256/ES256 or secp256k1/ES256K), and cryptographically verifies the JWT signature. The URL path determines the room — peers in different rooms are fully isolated and cannot exchange signals. See [Relay Hardening](#relay-hardening) for the full security inventory.
 - **Custom Signaller** — A `matchbox_socket::Signaller` implementation (`SymbiosSignallerBuilder`) that bridges between the matchbox protocol and the relay's wire format, injecting the JWT during WebSocket upgrade. Supports static tokens (`signaller_for_session`), a refreshable `TokenSource` (`signaller_with_token_source`) for long-lived applications where ATProto access tokens expire between reconnects, and anonymous mode (`signaller_anonymous`) for unauthenticated connections.
 - **Cross-Platform** — Runs on native targets (via `async-tungstenite`) and in the browser (via `ws_stream_wasm` on WASM).
 - **Bevy-Native** — Outbound messages use Bevy's `MessageWriter<Broadcast<T>>`. Inbound messages are delivered via `NetworkQueue<T>` and `PeerStateQueue<T>` resources, which are safe to drain from any schedule (`Update`, `FixedUpdate`, etc.) without risk of silent message loss. The queues are bounded (4,096 messages and 64 MiB total byte budget for `NetworkQueue`) to prevent memory exhaustion from a malicious flood — excess messages are dropped with a warning.
@@ -111,6 +111,35 @@ let config = RelayConfig {
     service_did: Some("did:web:relay.example.com".to_string()),
 };
 ```
+
+#### Relay Hardening
+
+The relay applies multiple independent layers of defense:
+
+- **HTTP timeout (10 s)** — Slowloris protection: connections that do not complete the WebSocket upgrade within 10 seconds are dropped.
+- **Atomic connection limits** — `max_peers` slots are reserved before DID resolution to prevent TOCTOU bypasses. New connections receive HTTP 503 when the limit is reached.
+- **Handshake slot budget** — At most `max_peers / 4` connections may be in the auth/DID-resolution phase simultaneously, preventing DID tarpit attacks from exhausting all slots.
+- **Handshake timeout (15 s)** — The authentication phase is capped at 15 seconds per connection.
+- **WebSocket message cap (64 KiB)** — Incoming WebSocket frames are limited to 64 KiB.
+- **SSRF protection** — `did:web` domains are resolved and validated against private/loopback IPs; the address is pinned via DNS to prevent rebinding. HTTP redirects are disabled.
+- **DID document body limit (256 KiB)** — Responses are streamed with an incremental size check; the fetch aborts before buffering an oversized payload.
+- **DID key cache (5-min TTL, 10 000 entries)** — Resolved keys are cached using W-TinyLFU eviction. `moka::future::Cache` coalesces concurrent lookups for the same DID to prevent DDoS amplification.
+- **Negative DID cache (60 s)** — Failed resolutions are cached for 60 seconds to prevent DDoS reflection against DID hosting servers.
+- **Domain client cap (100)** — Per-domain `reqwest::Client` instances (DNS-pinned for SSRF) are capped at 100, bounding connection-pool and worker overhead.
+- **Per-domain `did:web` fetch concurrency (10)** — At most 10 concurrent in-flight fetches per `did:web` domain.
+- **Global `did:web` fetch concurrency (50)** — Total concurrent `did:web` fetches across all domains.
+- **Idle timeout (120 s) + server-side pings (30 s)** — Idle connections are disconnected after 120 seconds. Server pings keep WASM clients alive (browsers cannot initiate WebSocket pings).
+- **WebSocket write timeout (5 s)** — Each outbound write is capped at 5 seconds, preventing an attacker that never drains their TCP receive buffer from holding a connection slot while periodic pings suppress the idle timeout.
+- **Self-targeting rejection** — SDP offers/answers addressed to the sender's own session ID are dropped.
+- **Control signal filtering** — Clients cannot forge `PeerJoined`/`PeerLeft` events; only the relay originates these.
+- **Invalid message disconnect (10 cumulative)** — Peers that send 10 cumulative invalid messages (malformed JSON, binary frames, forged control signals) are disconnected.
+- **Peer ID length cap (512 bytes)** — `peer_id` fields in `SignalEnvelope` are validated after deserialization.
+- **Per-target backpressure (50 strikes)** — When a target's relay channel (256 slots) is full, delivery silently stops after 50 consecutive channel-full strikes. Successful sends reset the counter; closed channels do not accumulate strikes so reconnected peers recover immediately.
+- **Per-target burst limit (64 msg/window)** — Each sender may route at most 64 messages to the same target per rate window, preventing one sender from monopolising a target's relay channel and starving signals from other peers.
+- **Per-sender token-bucket rate limit (burst 500, refill 20/s)** — Messages are dropped when the token budget is exhausted; the peer remains connected so that ICE/SDP retry logic can recover.
+- **Unique target cap (256/window)** — Each sender may address at most 256 distinct targets per window; senders that exceed this are disconnected.
+- **JWT audience validation** — When `service_did` is set, the relay validates the JWT `aud` claim to prevent cross-service token replay.
+- **Room isolation** — Cross-room signals are dropped; peers only see events from peers in the same room.
 
 ### Running the Basic Chat Example
 

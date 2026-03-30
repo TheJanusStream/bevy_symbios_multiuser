@@ -10,9 +10,7 @@
 //! [`signaller_anonymous`]) so that the relay receives the expected
 //! `SignalEnvelope` JSON, rather than matchbox's incompatible default format.
 //! When a [`TokenSourceRes`] resource is present, the signaller uses the shared
-//! token source for automatic refresh on reconnect. Otherwise, if an
-//! [`AtprotoSession`](crate::auth::AtprotoSession) resource is present, the JWT
-//! is cloned once and included in the WebSocket handshake. If neither is
+//! token source for automatic refresh on reconnect. If no token source is
 //! available, the signaller connects without authentication (anonymous mode).
 //!
 //! # Platform Support
@@ -101,11 +99,15 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
 /// use std::sync::{Arc, RwLock};
 /// use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 ///
-/// let source: TokenSource = Arc::new(RwLock::new(Some(session.access_jwt.clone())));
+/// // Use the service auth token from `get_service_auth`, not `access_jwt`.
+/// // Relay servers verify service auth tokens via DID document resolution;
+/// // `access_jwt` is signed by the PDS service key and cannot be verified
+/// // by a third-party relay.
+/// let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
 /// app.insert_resource(TokenSourceRes(source.clone()));
 ///
-/// // Later, after refreshing:
-/// *source.write().unwrap() = Some(new_jwt);
+/// // Later, after refreshing the session and calling get_service_auth again:
+/// *source.write().unwrap() = Some(new_service_token);
 /// ```
 #[derive(bevy::prelude::Resource, Clone)]
 pub struct TokenSourceRes(pub TokenSource);

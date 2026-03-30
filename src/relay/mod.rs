@@ -121,7 +121,8 @@
 //!   tokens per second. The high burst accommodates WebRTC mesh initialization
 //!   (joining a room with N peers generates N SDP offers + multiple ICE
 //!   candidates each), while the low refill rate caps sustained throughput.
-//!   Peers that exhaust their tokens are immediately disconnected.
+//!   Messages are dropped when the token budget is exhausted; the peer
+//!   remains connected so that ICE/SDP retry logic can recover.
 //! - **Per-domain DID fetch concurrency limit** — Each `did:web` domain is
 //!   limited to 10 concurrent in-flight fetches. Slots are released as soon as
 //!   each fetch completes (via RAII guard), so attacker requests that fail
