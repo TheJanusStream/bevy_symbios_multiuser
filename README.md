@@ -40,7 +40,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
-            "wss://matchbox.example.com/my_room",
+            "wss://relay.example.com/my_room",
         ))
         .add_systems(Update, (handle_incoming, send_movement))
         .run();
@@ -206,17 +206,17 @@ For games with a login screen, use the deferred constructor to register systems 
 // Deferred connection (session obtained after login):
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::deferred());
 
-// Later, after the user logs in, insert resources via Commands:
-fn on_login(mut commands: Commands, service_token: String, session: AtprotoSession) {
-    let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
-    commands.insert_resource(session);
-    commands.insert_resource(TokenSourceRes(source));
-    commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
-        room_url: "wss://relay.example.com/ws".to_string(),
-        ice_servers: None,
-        _marker: std::marker::PhantomData,
-    });
-}
+// Later, after login completes (e.g. polled from an async task result in an
+// Update system — see examples/oasis.rs for a full implementation), insert
+// these resources to open the connection:
+let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+commands.insert_resource(session);
+commands.insert_resource(TokenSourceRes(source));
+commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
+    room_url: "wss://relay.example.com/ws".to_string(),
+    ice_servers: None,
+    _marker: std::marker::PhantomData,
+});
 ```
 
 ### Token Refresh for Long-Lived Apps

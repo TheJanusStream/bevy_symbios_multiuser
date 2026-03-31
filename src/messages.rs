@@ -56,9 +56,10 @@ const MAX_NETWORK_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// consumer runs in `FixedUpdate` at a lower tick rate than the render
 /// framerate. The host application must drain the queue manually.
 ///
-/// The queue is capped at [`MAX_NETWORK_QUEUE_LEN`] entries. When full,
-/// new messages are dropped and a warning is logged, preventing an
-/// out-of-memory condition from a malicious flood.
+/// The queue is bounded by both a count limit ([`MAX_NETWORK_QUEUE_LEN`] = 4,096
+/// entries) and a total byte budget ([`MAX_NETWORK_QUEUE_BYTES`] = 64 MiB). When
+/// either limit is reached, new messages are dropped and a warning is logged,
+/// preventing an out-of-memory condition from a malicious flood.
 ///
 /// # Example
 ///

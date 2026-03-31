@@ -55,7 +55,7 @@
 //!     App::new()
 //!         .add_plugins(DefaultPlugins)
 //!         .add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
-//!             "wss://matchbox.example.com/my_room",
+//!             "wss://relay.example.com/my_room",
 //!         ))
 //!         .add_systems(Update, (handle_incoming, send_movement))
 //!         .run();

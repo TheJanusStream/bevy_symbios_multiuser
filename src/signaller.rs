@@ -594,6 +594,16 @@ impl SymbiosSignaller {
 ///
 /// The JWT is cloned once at construction. If the token expires before a
 /// reconnect, prefer [`signaller_with_token_source`] instead.
+///
+/// # Note on relay authentication
+///
+/// This function stores the `access_jwt` from the session. The Symbios relay
+/// verifies tokens by resolving the user's DID document and checking the
+/// `#atproto` signing key — it **cannot** verify `access_jwt`, because that
+/// token is signed by the PDS's own service key, not the user's key. For
+/// authenticated relay connections (`auth_required = true`), obtain a service
+/// auth token via [`crate::auth::get_service_auth`] and use
+/// [`signaller_with_token_source`] with a [`TokenSource`] wrapping that token.
 pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
         access_jwt: Some(session.access_jwt.clone()),
@@ -612,12 +622,19 @@ pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn S
 /// ```rust,ignore
 /// use std::sync::{Arc, RwLock};
 /// use bevy_symbios_multiuser::signaller::{signaller_with_token_source, TokenSource};
+/// use bevy_symbios_multiuser::auth::{get_service_auth, refresh_session};
 ///
-/// let token_source: TokenSource = Arc::new(RwLock::new(Some(session.access_jwt.clone())));
+/// // Use the service auth token from `get_service_auth`, not `access_jwt`.
+/// // The Symbios relay verifies tokens via DID document resolution; `access_jwt`
+/// // is signed by the PDS service key and cannot be verified that way.
+/// let service_token = get_service_auth(&client, &session, pds_url, relay_did).await?;
+/// let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
 /// let builder = signaller_with_token_source(token_source.clone());
 ///
-/// // Later, after refreshing the session:
-/// *token_source.write().unwrap() = Some(new_session.access_jwt.clone());
+/// // Later, when the service token is near expiry, refresh both tokens and update:
+/// let new_session = refresh_session(&client, &session, pds_url).await?;
+/// let new_token = get_service_auth(&client, &new_session, pds_url, relay_did).await?;
+/// *token_source.write().unwrap() = Some(new_token);
 /// ```
 pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
