@@ -3,6 +3,18 @@
 //! Provides a minimal auth flow using `reqwest` to call
 //! `com.atproto.server.createSession` on a Personal Data Server (PDS),
 //! returning a JWT access token and the user's DID.
+//!
+//! # Runtime requirement
+//!
+//! Every async function in this module uses [`reqwest`], which **requires a
+//! Tokio runtime**. Calling them from a Bevy system directly will panic with
+//! `"must be called from within a Tokio runtime"`.
+//!
+//! The recommended pattern is to spawn a detached Tokio task from a Bevy
+//! `AsyncComputeTaskPool` task, or to call them from inside a
+//! `tokio::runtime::Runtime::block_on` block. See `examples/oasis.rs` for a
+//! concrete example that wraps auth calls in a single-threaded Tokio runtime
+//! spawned inside a Bevy task.
 
 use crate::error::SymbiosError;
 use bevy::prelude::*;

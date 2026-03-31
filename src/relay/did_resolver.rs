@@ -477,10 +477,19 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
         }
         std::net::IpAddr::V6(v6) => {
             let segments = v6.segments();
-            // fc00::/7 (unique local)
+            // fc00::/7 (unique local, RFC 4193)
             (segments[0] & 0xfe00) == 0xfc00
-            // ff00::/8 (multicast)
+            // ff00::/8 (multicast, RFC 4291)
             || (segments[0] & 0xff00) == 0xff00
+            // 100::/64 (discard-only, RFC 6666)
+            || (segments[0] == 0x0100
+                && segments[1] == 0
+                && segments[2] == 0
+                && segments[3] == 0)
+            // 2001:2::/48 (benchmarking, RFC 5180)
+            || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000)
+            // 2001:db8::/32 (documentation, RFC 3849)
+            || (segments[0] == 0x2001 && segments[1] == 0x0db8)
         }
     }
 }
