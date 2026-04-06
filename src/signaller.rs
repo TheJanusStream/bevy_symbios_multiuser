@@ -170,7 +170,8 @@ impl SymbiosSignallerBuilder {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignallerBuilder for SymbiosSignallerBuilder {
     async fn new_signaller(
         &self,
@@ -342,8 +343,7 @@ impl SymbiosSignallerBuilder {
             None => vec![],
         };
 
-        let proto_refs: Vec<&str> = protocols.iter().copied().collect();
-        let (_meta, stream) = WsMeta::connect(room_url, Some(proto_refs.as_slice()))
+        let (_meta, stream) = WsMeta::connect(room_url, Some(protocols))
             .await
             .map_err(|e| SignalingError::UserImplementationError(e.to_string()))?;
 
@@ -472,7 +472,8 @@ impl SymbiosSignaller {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl Signaller for SymbiosSignaller {
     async fn send(&mut self, request: PeerRequest) -> Result<(), SignalingError> {
         match request {
