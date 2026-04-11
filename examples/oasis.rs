@@ -220,30 +220,34 @@ fn login_ui(
 
                     let pool = bevy::tasks::AsyncComputeTaskPool::get();
                     let task = pool.spawn(async move {
-                        tokio::runtime::Builder::new_current_thread()
+                        // Network code on end-user machines must not assume
+                        // the OS has spare file descriptors / epoll slots.
+                        // Surface a build failure as a normal login error
+                        // instead of panicking the entire game client.
+                        let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
-                            .unwrap()
-                            .block_on(async move {
-                                let client = reqwest::Client::new();
-                                let session = create_session(&client, &creds).await?;
-                                // Service auth tokens are signed with the user's
-                                // #atproto key, which the relay can verify against
-                                // the user's DID document. The access_jwt from
-                                // createSession is signed by the PDS service key —
-                                // unusable for third-party verification.
-                                let service_token = get_service_auth(
-                                    &client,
-                                    &session,
-                                    &creds.pds_url,
-                                    &service_did,
-                                )
-                                .await?;
-                                Ok(LoginResult {
-                                    session,
-                                    service_token,
-                                })
+                            .map_err(|e| {
+                                SymbiosError::AuthFailed(format!(
+                                    "failed to build tokio runtime: {e}"
+                                ))
+                            })?;
+                        rt.block_on(async move {
+                            let client = reqwest::Client::new();
+                            let session = create_session(&client, &creds).await?;
+                            // Service auth tokens are signed with the user's
+                            // #atproto key, which the relay can verify against
+                            // the user's DID document. The access_jwt from
+                            // createSession is signed by the PDS service key —
+                            // unusable for third-party verification.
+                            let service_token =
+                                get_service_auth(&client, &session, &creds.pds_url, &service_did)
+                                    .await?;
+                            Ok(LoginResult {
+                                session,
+                                service_token,
                             })
+                        })
                     });
                     commands.spawn(AuthTask(task));
                 }
@@ -324,15 +328,21 @@ fn spawn_local_player(
         ))
         .id();
 
-    // Fetch our OWN avatar
+    // Fetch our OWN avatar. Build failures (e.g. fd exhaustion on the host)
+    // are surfaced as a missing avatar instead of a panic.
     let pool = bevy::tasks::AsyncComputeTaskPool::get();
     let did = session.did.clone();
     let task = pool.spawn(async move {
-        tokio::runtime::Builder::new_current_thread()
+        match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
-            .block_on(fetch_avatar_bytes(did))
+        {
+            Ok(rt) => rt.block_on(fetch_avatar_bytes(did)),
+            Err(e) => {
+                warn!(error = %e, "failed to build tokio runtime for own avatar fetch");
+                None
+            }
+        }
     });
     commands.entity(player_ent).insert(AvatarFetchTask(task));
 }
@@ -387,6 +397,7 @@ fn handle_incoming_messages(
     mut queue: ResMut<NetworkQueue<OasisMessage>>,
     mut chat: ResMut<ChatHistory>,
     mut query: Query<(Entity, &mut RemotePeer, &mut Transform)>,
+    session_map: Res<PeerSessionMapRes>,
 ) {
     for msg in queue.drain() {
         match msg.payload {
@@ -398,6 +409,22 @@ fn handle_incoming_messages(
                 }
             }
             OasisMessage::Identity { did, handle } => {
+                // The relay authenticated each peer against their ATProto DID
+                // and exposes the binding through `PeerSessionMapRes`. Refuse
+                // any self-reported DID that does not match the relay's view —
+                // otherwise an attacker with a throwaway account could
+                // broadcast `Identity { did: "did:plc:admin" }` and impersonate
+                // anyone over the (unauthenticated) WebRTC data channel.
+                let authenticated_did = session_map.session_id(&msg.sender);
+                if authenticated_did.as_deref() != Some(did.as_str()) {
+                    warn!(
+                        sender = %msg.sender,
+                        claimed = %did,
+                        authenticated = ?authenticated_did,
+                        "rejecting Identity message — claimed DID does not match the relay-authenticated session"
+                    );
+                    continue;
+                }
                 for (entity, mut peer, _) in query.iter_mut() {
                     if peer.peer_id == msg.sender {
                         let did_changed = peer.did.as_ref() != Some(&did);
@@ -406,15 +433,23 @@ fn handle_incoming_messages(
                             peer.did = Some(did.clone());
                             info!("Peer {} identified as {} ({})", msg.sender, handle, did);
 
-                            // Spawn task to fetch their avatar
+                            // Spawn task to fetch their avatar. If the host
+                            // has run out of file descriptors / epoll slots,
+                            // `Builder::build()` returns Err — log and skip
+                            // the fetch instead of crashing the game client.
                             let pool = bevy::tasks::AsyncComputeTaskPool::get();
                             let did_clone = did.clone();
                             let task = pool.spawn(async move {
-                                tokio::runtime::Builder::new_current_thread()
+                                match tokio::runtime::Builder::new_current_thread()
                                     .enable_all()
                                     .build()
-                                    .unwrap()
-                                    .block_on(fetch_avatar_bytes(did_clone))
+                                {
+                                    Ok(rt) => rt.block_on(fetch_avatar_bytes(did_clone)),
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to build tokio runtime for avatar fetch");
+                                        None
+                                    }
+                                }
                             });
                             commands.entity(entity).insert(AvatarFetchTask(task));
                         }
@@ -451,16 +486,16 @@ fn broadcast_local_state(
         });
 
         // Broadcast our identity (with handle) periodically so new arrivals know who we are
-        if *tick % 60 == 0 {
-            if let Some(sess) = &session {
-                writer.write(Broadcast {
-                    payload: OasisMessage::Identity {
-                        did: sess.did.clone(),
-                        handle: sess.handle.clone(),
-                    },
-                    channel: ChannelKind::Reliable,
-                });
-            }
+        if (*tick).is_multiple_of(60)
+            && let Some(sess) = &session
+        {
+            writer.write(Broadcast {
+                payload: OasisMessage::Identity {
+                    did: sess.did.clone(),
+                    handle: sess.handle.clone(),
+                },
+                channel: ChannelKind::Reliable,
+            });
         }
     }
 }

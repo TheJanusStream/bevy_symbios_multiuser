@@ -416,13 +416,15 @@ async fn validate_and_resolve_domain(
         }
 
         for addr in &addrs {
-            // Unmap IPv4-mapped IPv6 (::ffff:a.b.c.d) back to IPv4 before safety
-            // checks. Without this, an attacker can bypass loopback/private checks
-            // by resolving to e.g. ::ffff:127.0.0.1 (std's is_loopback() returns
-            // false for the V6 mapped form).
+            // Unmap any IPv6 that embeds an IPv4 address back to IPv4 before
+            // safety checks. `to_ipv4()` covers BOTH IPv4-mapped (::ffff:a.b.c.d)
+            // AND IPv4-compatible (::a.b.c.d) forms — using `to_ipv4_mapped()`
+            // would miss the compatible form, letting an attacker bypass the
+            // loopback check by resolving to e.g. `::127.0.0.1`, which dual-stack
+            // Linux silently routes to the v4 loopback interface.
             let ip = match addr.ip() {
                 std::net::IpAddr::V6(v6) => v6
-                    .to_ipv4_mapped()
+                    .to_ipv4()
                     .map(std::net::IpAddr::V4)
                     .unwrap_or(std::net::IpAddr::V6(v6)),
                 v4 => v4,

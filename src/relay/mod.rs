@@ -8,14 +8,18 @@
 //! # Authentication
 //!
 //! When [`RelayConfig::auth_required`] is `true`, every connecting client must
-//! present a valid ATProto access JWT. The relay accepts the token from three
+//! present a valid ATProto access JWT. The relay accepts the token from two
 //! sources, checked in order:
 //!
 //! 1. `Authorization: Bearer <token>` header (native clients).
 //! 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients
 //!    using the subprotocol trick — the relay echoes the selected subprotocol
 //!    back per RFC 6455).
-//! 3. `?token=<token>` query parameter (legacy WASM fallback).
+//!
+//! Bearer tokens are intentionally **not** accepted via query string: query
+//! parameters are routinely captured in plaintext by reverse proxy access logs,
+//! load balancers, and intermediate firewalls, which would leak ATProto session
+//! credentials into operator-side logs the user never consented to share.
 //!
 //! The relay resolves the issuer's DID document (via `plc.directory` for
 //! `did:plc`, or HTTPS for `did:web` — domain-only DIDs use

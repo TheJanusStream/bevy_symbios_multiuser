@@ -4,14 +4,13 @@ use super::{PeerEntry, RelayState};
 use crate::protocol::{SignalEnvelope, SignalPayload};
 use axum::{
     extract::{
-        OriginalUri, Query, State, WebSocketUpgrade,
+        OriginalUri, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -100,13 +99,6 @@ const PER_TARGET_WINDOW: Duration = Duration::from_secs(1);
 /// bounding the memory footprint of the per-target map.
 const MAX_UNIQUE_TARGETS: usize = 256;
 
-/// Maximum allowed length (in bytes) for the `peer_id` field in a
-/// [`SignalEnvelope`]. DIDs and UUIDs are well under 256 bytes; anything
-/// larger is either malformed or an attempt to bloat per-target maps and
-/// log output. Checked after deserialization to reject oversized fields
-/// that fit within [`MAX_WS_MESSAGE_SIZE`] but are still abusive.
-const MAX_PEER_ID_LENGTH: usize = 512;
-
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
 /// slots by presenting DIDs that tarpit the HTTP fetch (e.g. a server that
@@ -131,16 +123,6 @@ const UNLIMITED_HANDSHAKE_BUDGET: usize = 256;
 /// timeout from firing — permanently holding a connection slot.
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Optional query parameters on the WebSocket upgrade URL.
-///
-/// Used as a legacy fallback for WASM clients that pass the ATProto JWT via
-/// `?token=<jwt>`. The preferred WASM transport is the `Sec-WebSocket-Protocol`
-/// subprotocol trick; this query parameter exists for compatibility.
-#[derive(Debug, Deserialize)]
-pub struct WsQueryParams {
-    token: Option<String>,
-}
-
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
 ///
 /// The URL path determines the peer's **room** — e.g. `wss://relay/game_A`
@@ -148,11 +130,15 @@ pub struct WsQueryParams {
 /// only see and communicate with other peers in the same room.
 ///
 /// When `auth_required` is enabled on the relay, the handler extracts an
-/// ATProto JWT from one of three sources (checked in order):
+/// ATProto JWT from one of two sources (checked in order):
 ///
 /// 1. `Authorization: Bearer <token>` header (native clients).
 /// 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients).
-/// 3. `?token=<token>` query parameter (legacy WASM fallback).
+///
+/// Bearer tokens are intentionally **not** accepted via query string: query
+/// parameters are logged in plaintext by reverse proxies, edge load balancers,
+/// and intermediate firewalls, which would leak ATProto session credentials
+/// into operator-side logs that the user never consented to share.
 ///
 /// The token is validated and the authenticated DID becomes the peer's session
 /// identity. Unauthenticated requests receive HTTP 401.
@@ -170,7 +156,6 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Query(query): Query<WsQueryParams>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
     // Extract the room from the URL path. Normalize so "/" and "" both map to
@@ -246,7 +231,6 @@ pub async fn ws_handler(
         HANDSHAKE_TIMEOUT,
         extract_identity(
             &headers,
-            query.token.as_deref(),
             state.auth_required,
             state.did_resolver.as_ref(),
             state.service_did.as_deref(),
@@ -297,17 +281,15 @@ pub async fn ws_handler(
 }
 
 /// Attempt to extract a [`ValidatedIdentity`](auth::ValidatedIdentity) from
-/// one of three sources (checked in order):
+/// one of two sources (checked in order):
 ///
 /// 1. `Authorization: Bearer <token>` header (native clients).
 /// 2. `Sec-WebSocket-Protocol: access_token, <token>` header (WASM clients).
-/// 3. `?token=<token>` query parameter (legacy WASM fallback).
 ///
 /// Returns `Err` with a 401 response only when `auth_required` is true and
-/// no valid token is found in any source.
+/// no valid token is found in either source.
 async fn extract_identity(
     headers: &HeaderMap,
-    query_token: Option<&str>,
     auth_required: bool,
     resolver: Option<&DidResolver>,
     service_did: Option<&str>,
@@ -332,8 +314,7 @@ async fn extract_identity(
             }
         });
 
-    // 3. Fall back to query parameter (legacy WASM clients).
-    let token = header_token.or(protocol_token).or(query_token);
+    let token = header_token.or(protocol_token);
 
     let Some(token) = token else {
         if auth_required {
@@ -632,26 +613,12 @@ async fn handle_socket(
                 }
             };
 
-            // Reject oversized peer_id fields. DIDs and UUIDs are well
-            // under 512 bytes; larger values bloat per-target maps, log
-            // output, and tracing allocations.
-            if envelope.peer_id.len() > MAX_PEER_ID_LENGTH {
-                invalid_count += 1;
-                tracing::warn!(
-                    session = %session_id,
-                    peer_id_len = envelope.peer_id.len(),
-                    count = invalid_count,
-                    "dropping signal with oversized peer_id (max {MAX_PEER_ID_LENGTH} bytes)"
-                );
-                if invalid_count >= MAX_INVALID_MESSAGES {
-                    tracing::warn!(
-                        session = %session_id,
-                        "disconnecting peer after {MAX_INVALID_MESSAGES} invalid messages"
-                    );
-                    break;
-                }
-                continue;
-            }
+            // Note: oversized `peer_id` fields are rejected during JSON
+            // deserialization above by `protocol::deserialize_bounded_peer_id`,
+            // which short-circuits `from_str` from the borrowed string visitor
+            // before any owned String for the offending field is allocated.
+            // The error path falls through to the generic "invalid envelope"
+            // branch, so no separate post-parse length check is needed here.
 
             // Reject control signals from clients — only the relay may
             // originate PeerJoined/PeerLeft to prevent mesh spoofing.
