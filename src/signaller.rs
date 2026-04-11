@@ -6,9 +6,9 @@
 //! protocol and the relay's [`SignalEnvelope`]/[`SignalPayload`] wire format.
 //!
 //! The plugin **always** uses this signaller (via
-//! [`signaller_with_token_source`], [`signaller_for_session`], or
-//! [`signaller_anonymous`]) so that the relay receives the expected
-//! `SignalEnvelope` JSON, rather than matchbox's incompatible default format.
+//! [`signaller_with_token_source`] or [`signaller_anonymous`]) so that the
+//! relay receives the expected `SignalEnvelope` JSON, rather than matchbox's
+//! incompatible default format.
 //! When a [`TokenSourceRes`] resource is present, the signaller uses the shared
 //! token source for automatic refresh on reconnect. If no token source is
 //! available, the signaller connects without authentication (anonymous mode).
@@ -28,12 +28,17 @@
 //!
 //! # Token Refresh
 //!
-//! ATProto access tokens are short-lived. [`signaller_for_session`] clones the
-//! JWT once at construction, so reconnects after token expiry will fail. For
-//! long-lived applications, use [`signaller_with_token_source`] instead: it
-//! accepts a shared [`TokenSource`] that the application can update externally
-//! (e.g. after calling [`crate::auth::refresh_session`]), ensuring the
-//! signaller always uses the latest token on reconnect.
+//! Service auth tokens are short-lived. Use [`signaller_with_token_source`]:
+//! it accepts a shared [`TokenSource`] that the application can update
+//! externally (e.g. after calling [`crate::auth::get_service_auth`] with a
+//! refreshed session), ensuring the signaller always uses the latest token
+//! on reconnect.
+//!
+//! Note that the ATProto `access_jwt` from [`crate::auth::create_session`]
+//! is signed by the PDS service key and **cannot** be verified by a
+//! third-party relay that resolves DID documents. Always wrap a service auth
+//! token from [`crate::auth::get_service_auth`], not `access_jwt`, in the
+//! [`TokenSource`].
 
 use crate::protocol::{SignalEnvelope, SignalPayload};
 #[allow(unused_imports)] // SinkExt is used by .send() inside async_trait impls
@@ -205,11 +210,10 @@ pub struct TokenSourceRes(pub TokenSource);
 /// ```
 pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
 
-/// A [`SignallerBuilder`] that injects an ATProto JWT into the WebSocket
+/// A [`SignallerBuilder`] that injects a service auth JWT into the WebSocket
 /// upgrade request's `Authorization` header.
 ///
-/// Supports three token modes:
-/// - **Static**: a fixed JWT cloned at construction (via [`signaller_for_session`]).
+/// Supports two token modes:
 /// - **Refreshable**: a shared [`TokenSource`] that the application can update
 ///   externally (via [`signaller_with_token_source`]). On each reconnect the
 ///   builder reads the latest token, avoiding stale-JWT rejections.
@@ -217,10 +221,7 @@ pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
 ///   the relay's `SignalEnvelope` wire format; connects without authentication.
 #[derive(Debug, Clone)]
 pub struct SymbiosSignallerBuilder {
-    /// Static JWT, used when no `token_source` is provided.
-    access_jwt: Option<String>,
-    /// Shared, externally-refreshable token. When present, takes priority
-    /// over `access_jwt` so reconnects use the latest refreshed token.
+    /// Shared, externally-refreshable token.
     token_source: Option<TokenSource>,
     /// Shared `PeerId → session_id` map updated by the signaller as peers
     /// join and leave. When present, the application can resolve the real
@@ -229,33 +230,13 @@ pub struct SymbiosSignallerBuilder {
 }
 
 impl SymbiosSignallerBuilder {
-    /// Return the current JWT, preferring the refreshable [`TokenSource`]
-    /// over the static `access_jwt`.
+    /// Return the current JWT from the refreshable [`TokenSource`], if any.
     fn current_token(&self) -> Option<String> {
-        if let Some(source) = &self.token_source {
-            source.read().unwrap_or_else(|e| e.into_inner()).clone()
-        } else {
-            self.access_jwt.clone()
-        }
+        self.token_source
+            .as_ref()
+            .and_then(|s| s.read().unwrap_or_else(|e| e.into_inner()).clone())
     }
 }
-
-/// Hard cap on connection attempts when running in the browser.
-///
-/// On native targets, `try_connect` inspects the underlying tungstenite error
-/// and surfaces HTTP 4xx responses (e.g. `401 Invalid JWT`) so that
-/// `is_http_client_error` can fast-fail the retry loop on permanent
-/// authentication failures. The browser `WebSocket` API, by contrast,
-/// deliberately hides the HTTP status code of a failed handshake for security
-/// reasons — every failure surfaces as a generic connection error.
-///
-/// Without a cap, a WASM client presenting an expired or invalid JWT would
-/// burn through `attempts = None` (unlimited) reconnect attempts forever,
-/// hammering the relay with useless handshakes that always fail. Clamp the
-/// retry budget on WASM so that even permanently-broken auth eventually gives
-/// up and surfaces an error to the application.
-#[cfg(target_arch = "wasm32")]
-const WASM_MAX_RETRY_ATTEMPTS: u16 = 10;
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -265,19 +246,6 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
         mut attempts: Option<u16>,
         room_url: String,
     ) -> Result<Box<dyn Signaller>, SignalingError> {
-        // On WASM the browser hides HTTP status codes for failed WebSocket
-        // handshakes, so we cannot distinguish "401 invalid JWT" (permanent)
-        // from "TCP RST" (transient). Clamp the retry budget to prevent an
-        // unlimited-retry caller from spamming the relay with handshakes that
-        // will never succeed.
-        #[cfg(target_arch = "wasm32")]
-        {
-            attempts = Some(match attempts {
-                Some(n) => n.min(WASM_MAX_RETRY_ATTEMPTS),
-                None => WASM_MAX_RETRY_ATTEMPTS,
-            });
-        }
-
         let signaller = 'connect: loop {
             let ws = match self.try_connect(&room_url).await {
                 Ok(stream) => stream,
@@ -575,6 +543,25 @@ impl SymbiosSignaller {
     }
 }
 
+/// Clear any peer bindings this signaller owns from the shared
+/// [`PeerSessionMap`] when it is dropped.
+///
+/// Without this, every reconnect (new `SymbiosSignaller` constructed by the
+/// builder) would leak entries keyed by its own freshly-minted random
+/// `PeerId`s into the shared map. For long-lived games on flaky connections,
+/// the map would grow unbounded.
+impl Drop for SymbiosSignaller {
+    fn drop(&mut self) {
+        let Some(map) = self.session_map.as_ref() else {
+            return;
+        };
+        let mut guard = map.write().unwrap_or_else(|e| e.into_inner());
+        for pid in self.peer_to_session.keys() {
+            guard.remove(pid);
+        }
+    }
+}
+
 // ── Platform-specific read_text / Signaller impl ─────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -735,29 +722,6 @@ impl SymbiosSignaller {
 
 // ── Public constructor ───────────────────────────────────────────────────────
 
-/// Create an [`Arc`]-wrapped [`SymbiosSignallerBuilder`] ready for use with
-/// [`WebRtcSocketBuilder::signaller_builder`](matchbox_socket::WebRtcSocket).
-///
-/// The JWT is cloned once at construction. If the token expires before a
-/// reconnect, prefer [`signaller_with_token_source`] instead.
-///
-/// # Note on relay authentication
-///
-/// This function stores the `access_jwt` from the session. The Symbios relay
-/// verifies tokens by resolving the user's DID document and checking the
-/// `#atproto` signing key — it **cannot** verify `access_jwt`, because that
-/// token is signed by the PDS's own service key, not the user's key. For
-/// authenticated relay connections (`auth_required = true`), obtain a service
-/// auth token via [`crate::auth::get_service_auth`] and use
-/// [`signaller_with_token_source`] with a [`TokenSource`] wrapping that token.
-pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn SignallerBuilder> {
-    Arc::new(SymbiosSignallerBuilder {
-        access_jwt: Some(session.access_jwt.clone()),
-        token_source: None,
-        session_map: None,
-    })
-}
-
 /// Create a [`SymbiosSignallerBuilder`] backed by a shared [`TokenSource`].
 ///
 /// On each reconnect attempt, the builder reads the latest token from the
@@ -785,7 +749,6 @@ pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn S
 /// ```
 pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
-        access_jwt: None,
         token_source: Some(source),
         session_map: None,
     })
@@ -799,7 +762,6 @@ pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuil
 /// JSON format.
 pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
-        access_jwt: None,
         token_source: None,
         session_map: None,
     })
@@ -811,24 +773,11 @@ pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
 /// produces, so reconnects keep populating the same map and the application's
 /// [`PeerSessionMapRes`] view stays consistent.
 ///
-/// Anonymous (no-JWT) variant. For authenticated variants, prefer
-/// [`signaller_for_session_with_map`] or
-/// [`signaller_with_token_source_and_map`].
+/// Anonymous (no-JWT) variant. For authenticated connections, use
+/// [`signaller_with_token_source_and_map`] with a service auth token from
+/// [`crate::auth::get_service_auth`].
 pub fn signaller_anonymous_with_map(session_map: PeerSessionMap) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
-        access_jwt: None,
-        token_source: None,
-        session_map: Some(session_map),
-    })
-}
-
-/// Authenticated static-JWT variant of [`signaller_anonymous_with_map`].
-pub fn signaller_for_session_with_map(
-    session: &crate::auth::AtprotoSession,
-    session_map: PeerSessionMap,
-) -> Arc<dyn SignallerBuilder> {
-    Arc::new(SymbiosSignallerBuilder {
-        access_jwt: Some(session.access_jwt.clone()),
         token_source: None,
         session_map: Some(session_map),
     })
@@ -840,7 +789,6 @@ pub fn signaller_with_token_source_and_map(
     session_map: PeerSessionMap,
 ) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
-        access_jwt: None,
         token_source: Some(source),
         session_map: Some(session_map),
     })

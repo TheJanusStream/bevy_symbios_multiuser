@@ -33,20 +33,29 @@ pub struct SymbiosMultiuserConfig<T> {
 #[derive(Resource)]
 struct SocketOpened<T> {
     room_url: String,
-    /// Flattened ICE config for change detection.
-    /// `RtcIceServerConfig` does not implement `PartialEq`, so we store its
-    /// fields directly as comparable primitives.
-    ice_key: Option<(Vec<String>, Option<String>, Option<String>)>,
+    /// ICE config stored as-is for change detection. `RtcIceServerConfig`
+    /// lacks `PartialEq`, so comparison happens in [`ice_unchanged`] by
+    /// comparing individual fields by reference — this avoids cloning the
+    /// URL vector on every frame just to answer a boolean equality check.
+    ice: Option<RtcIceServerConfig>,
     _marker: PhantomData<T>,
 }
 
-/// Extract a comparable key from an optional [`RtcIceServerConfig`].
+/// Return `true` if the live [`RtcIceServerConfig`] matches the one recorded
+/// in the [`SocketOpened`] marker. Compares field-by-field by reference to
+/// avoid the per-frame heap allocations of cloning a comparable key tuple.
 #[cfg(feature = "client")]
-fn ice_key(
-    ice: &Option<matchbox_socket::RtcIceServerConfig>,
-) -> Option<(Vec<String>, Option<String>, Option<String>)> {
-    ice.as_ref()
-        .map(|c| (c.urls.clone(), c.username.clone(), c.credential.clone()))
+fn ice_unchanged(
+    current: &Option<RtcIceServerConfig>,
+    stored: &Option<RtcIceServerConfig>,
+) -> bool {
+    match (current, stored) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.urls == b.urls && a.username == b.username && a.credential == b.credential
+        }
+        _ => false,
+    }
 }
 
 /// A generic multiplayer plugin that transports domain messages of type `T`
@@ -189,7 +198,8 @@ fn open_socket<T: Send + Sync + 'static>(
         let needs_teardown = match config.as_ref() {
             None => true,
             Some(cfg) => {
-                cfg.room_url != marker.room_url || ice_key(&cfg.ice_servers) != marker.ice_key
+                cfg.room_url != marker.room_url
+                    || !ice_unchanged(&cfg.ice_servers, &marker.ice)
             }
         };
         if needs_teardown {
@@ -244,7 +254,7 @@ fn open_socket<T: Send + Sync + 'static>(
     commands.open_socket(builder);
     commands.insert_resource(SocketOpened::<T> {
         room_url: config.room_url.clone(),
-        ice_key: ice_key(&config.ice_servers),
+        ice: config.ice_servers.clone(),
         _marker: PhantomData,
     });
 }
