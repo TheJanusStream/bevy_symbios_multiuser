@@ -243,6 +243,67 @@ fn normalize_did(did: &str) -> String {
     }
 }
 
+/// Canonicalize a `did:web` "domain" string (host plus optional port) into the
+/// ASCII form that `reqwest` (and the `url` crate underneath it) will use when
+/// it actually parses the request URL. The hostname portion is run through
+/// IDNA so that an Internationalized Domain Name like `tést.attacker.com` is
+/// converted to its Punycode/ACE form (`xn--test-9ua.attacker.com`).
+///
+/// Why this exists: the SSRF protection pins a validated IP address into a
+/// per-domain `reqwest::Client` via `ClientBuilder::resolve(host, addr)`. The
+/// pin map is keyed by the exact hostname string passed to `resolve`. If we
+/// passed the raw Unicode host but the URL crate canonicalized it to ASCII
+/// before lookup, hyper would miss the pin entry and fall back to system DNS,
+/// re-opening a TOCTOU DNS rebinding hole that the pin was supposed to close.
+///
+/// Bracketed IPv6 literals already use ASCII characters, so they are
+/// returned unchanged (only validated for the closing bracket).
+fn canonicalize_did_web_domain(domain: &str) -> Result<String, String> {
+    if domain.starts_with('[') {
+        // Bracketed IPv6 — `]` must be present, optionally followed by `:port`.
+        let bracket_end = domain
+            .find(']')
+            .ok_or_else(|| "did:web IPv6 host missing closing ']'".to_string())?;
+        let after = &domain[bracket_end + 1..];
+        if !after.is_empty() && !after.starts_with(':') {
+            return Err(format!(
+                "unexpected characters after IPv6 bracket in did:web: '{domain}'"
+            ));
+        }
+        return Ok(domain.to_string());
+    }
+
+    // Split off an optional port suffix. Hostnames cannot contain `:` (only
+    // brackets-around-IPv6 can), so the first colon — if any — is the port
+    // separator. We canonicalize only the hostname through IDNA and then
+    // re-attach the port verbatim.
+    let (host_part, port_part) = match domain.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, Some(p)),
+        _ => (domain, None),
+    };
+
+    // `url::Host::parse` runs the WHATWG URL host parser, which applies IDNA
+    // (`domain_to_ascii`) for DNS-style names and parses literal IPv4
+    // addresses. This is exactly the canonicalization reqwest will perform
+    // when it parses the request URL, so the resulting host string is what
+    // ends up keyed into hyper's resolve map.
+    let canonical_host = match url::Host::parse(host_part) {
+        Ok(url::Host::Domain(d)) => d,
+        Ok(url::Host::Ipv4(v4)) => v4.to_string(),
+        Ok(url::Host::Ipv6(v6)) => format!("[{v6}]"),
+        Err(e) => {
+            return Err(format!(
+                "did:web host '{host_part}' is not a valid hostname: {e}"
+            ));
+        }
+    };
+
+    Ok(match port_part {
+        Some(p) => format!("{canonical_host}:{p}"),
+        None => canonical_host,
+    })
+}
+
 fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
     if did.starts_with("did:plc:") {
         Ok(format!("{}/{did}", plc_directory.trim_end_matches('/')))
@@ -255,6 +316,12 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
         // RFC 3986 percent-encoding (IDNs are expressed as punycode ACE labels),
         // so any remaining `%XX` in the domain indicates a malformed DID.
         let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
+        // Canonicalize through IDNA so Unicode hostnames are converted to
+        // their ACE/Punycode form *before* the URL is built. This ensures the
+        // host string we put into the URL matches what reqwest will see after
+        // its own URL parse, which is the same string used to look up the
+        // pinned DNS entry — closing the IDN/Punycode SSRF bypass.
+        let domain = canonicalize_did_web_domain(&domain)?;
 
         if let Some(path_segments) = path_raw {
             // Path-based: did:web:example.com:u:alice → example.com/u/alice/did.json
@@ -661,6 +728,14 @@ impl DidResolver {
             // Only %3A/%3a (port separator) is decoded — see did_document_url
             // for the rationale on intentionally skipping full RFC 3986 decode.
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
+            // Canonicalize via IDNA so the validated address, the resolve-pin
+            // key, and the URL host all use the same ASCII/Punycode form.
+            // Without this, a Unicode hostname like `tést.attacker.com` would
+            // be pinned under its raw Unicode key while reqwest looks it up
+            // under the URL-canonicalized `xn--test-9ua.attacker.com`, missing
+            // the pin and silently falling back to system DNS — re-opening the
+            // SSRF/DNS-rebinding hole the pin was supposed to close.
+            let domain = canonicalize_did_web_domain(&domain)?;
 
             // Use the full domain (host + port) as the cache key so that
             // `did:web:example.com%3A80` and `did:web:example.com` don't
@@ -1142,6 +1217,75 @@ mod tests {
         let url =
             did_document_url("did:web:[2001:db8::1]%3A8443:u:bob", DEFAULT_PLC_DIRECTORY).unwrap();
         assert_eq!(url, "https://[2001:db8::1]:8443/u/bob/did.json");
+    }
+
+    // ── IDN / Punycode canonicalization tests ──────────────────────────
+
+    #[test]
+    fn canonicalize_unicode_hostname_to_punycode() {
+        // The whole point: a Unicode hostname must be converted to its
+        // ASCII/Punycode form so the value matches what reqwest's URL parser
+        // produces and the SSRF DNS pin lookup actually finds the entry.
+        let canonical = canonicalize_did_web_domain("tést.attacker.com").unwrap();
+        assert_eq!(canonical, "xn--tst-bma.attacker.com");
+    }
+
+    #[test]
+    fn canonicalize_preserves_port_after_idna() {
+        let canonical = canonicalize_did_web_domain("tést.attacker.com:8443").unwrap();
+        assert_eq!(canonical, "xn--tst-bma.attacker.com:8443");
+    }
+
+    #[test]
+    fn canonicalize_ascii_hostname_unchanged() {
+        let canonical = canonicalize_did_web_domain("example.com").unwrap();
+        assert_eq!(canonical, "example.com");
+    }
+
+    #[test]
+    fn canonicalize_lowercases_ascii_hostname() {
+        // url::Host::parse normalizes case as well, so EXAMPLE.com → example.com.
+        let canonical = canonicalize_did_web_domain("EXAMPLE.com").unwrap();
+        assert_eq!(canonical, "example.com");
+    }
+
+    #[test]
+    fn canonicalize_ipv6_bracketed_unchanged() {
+        let canonical = canonicalize_did_web_domain("[2001:db8::1]").unwrap();
+        assert_eq!(canonical, "[2001:db8::1]");
+    }
+
+    #[test]
+    fn canonicalize_ipv6_with_port_unchanged() {
+        let canonical = canonicalize_did_web_domain("[2001:db8::1]:8443").unwrap();
+        assert_eq!(canonical, "[2001:db8::1]:8443");
+    }
+
+    #[test]
+    fn canonicalize_rejects_unclosed_ipv6_bracket() {
+        let result = canonicalize_did_web_domain("[2001:db8::1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing closing"));
+    }
+
+    #[test]
+    fn did_web_idn_url_uses_punycode_host() {
+        // End-to-end: a did:web with a Unicode label must produce a URL whose
+        // host has been canonicalized to ASCII before reqwest ever sees it.
+        // If this regresses, the resolve()-pin key and the URL host fall out
+        // of sync and the SSRF protection is silently bypassed.
+        let url = did_document_url("did:web:tést.attacker.com", DEFAULT_PLC_DIRECTORY).unwrap();
+        assert_eq!(url, "https://xn--tst-bma.attacker.com/.well-known/did.json");
+    }
+
+    #[test]
+    fn did_web_idn_with_port_url_uses_punycode_host() {
+        let url = did_document_url(
+            "did:web:tést.attacker.com%3A8443:u:bob",
+            DEFAULT_PLC_DIRECTORY,
+        )
+        .unwrap();
+        assert_eq!(url, "https://xn--tst-bma.attacker.com:8443/u/bob/did.json");
     }
 
     #[test]

@@ -92,11 +92,29 @@ const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// connection alive and prevent the [`WS_IDLE_TIMEOUT`] from firing.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Maximum burst of messages a peer may send before being throttled.
-/// Must accommodate WebRTC mesh initialization: joining a room with N peers
-/// generates N SDP offers + ~3-10 ICE candidates each, all within milliseconds.
-/// A burst of 500 allows joining rooms of ~40 peers without throttling.
-const RATE_BURST_CAPACITY: u32 = 500;
+/// Per-peer signal budget assumed for full WebRTC mesh initialization. A peer
+/// joining a room of N other peers needs to exchange roughly:
+/// - 1 SDP offer per remote peer
+/// - 1 SDP answer per remote peer (for the inbound side)
+/// - ~10 trickled ICE candidates per remote peer
+///
+/// Round to 16 messages per peer to leave headroom. Used to scale both the
+/// per-sender token-bucket burst and the unique-target cap from the operator's
+/// configured `max_peers`, so legitimate mesh init never trips the limiter
+/// regardless of room size. Without this, the hard-coded burst (previously 500)
+/// silently dropped signaling messages for any room larger than ~40 peers,
+/// permanently fragmenting the WebRTC mesh.
+const SIGNALS_PER_REMOTE_PEER: u32 = 16;
+
+/// Floor on the per-sender token-bucket burst capacity. The actual burst is
+/// `max(RATE_BURST_FLOOR, max_peers * SIGNALS_PER_REMOTE_PEER)` so small relays
+/// still get a generous initial burst, and large relays scale automatically.
+const RATE_BURST_FLOOR: u32 = 1024;
+
+/// Cap on the per-sender token-bucket burst capacity. Bounds the worst-case
+/// memory footprint and per-connection log noise while still being far above
+/// any plausible mesh init for the largest realistic relay deployments.
+const RATE_BURST_CEILING: u32 = 16_384;
 
 /// Steady-state token refill rate (tokens per second). After the initial burst
 /// is spent, peers are limited to this rate. Legitimate signalling rarely
@@ -118,12 +136,37 @@ const PER_TARGET_BURST_LIMIT: u32 = 64;
 /// target keys.
 const PER_TARGET_WINDOW: Duration = Duration::from_secs(1);
 
-/// Maximum number of unique targets a single sender may address within one
-/// [`PER_TARGET_WINDOW`]. Legitimate peers target at most the number of
-/// peers in their room; an attacker forging random target IDs would quickly
-/// exceed this cap. Set to 256 to comfortably cover large rooms while
-/// bounding the memory footprint of the per-target map.
-const MAX_UNIQUE_TARGETS: usize = 256;
+/// Floor on the unique-target cap. The actual cap is
+/// `max(MAX_UNIQUE_TARGETS_FLOOR, max_peers)` so the limit always covers a
+/// full-mesh send to every other peer in the room, regardless of how the
+/// operator has configured `max_peers`. Without this scaling, a hard-coded
+/// 256 cap caused any peer joining a room with >256 participants to be
+/// instantly disconnected on its very first burst of SDP offers.
+const MAX_UNIQUE_TARGETS_FLOOR: usize = 256;
+
+/// Cap on the unique-target limit even when `max_peers` is `0` (unlimited)
+/// or extremely large. Bounds the per-connection HashMap memory footprint
+/// while still being well above any realistic single-room peer count.
+const MAX_UNIQUE_TARGETS_CEILING: usize = 4096;
+
+/// Compute the per-sender token-bucket burst capacity for the configured
+/// relay capacity. Scaled so that joining a maximally-full room never trips
+/// the rate limiter on legitimate WebRTC mesh setup.
+fn rate_burst_for(max_peers: usize) -> u32 {
+    let scaled = (max_peers as u64).saturating_mul(SIGNALS_PER_REMOTE_PEER as u64);
+    let scaled = scaled.min(RATE_BURST_CEILING as u64) as u32;
+    scaled.max(RATE_BURST_FLOOR)
+}
+
+/// Compute the unique-target cap for the configured relay capacity. Sized so
+/// that a peer can address every other peer in the room within a single
+/// [`PER_TARGET_WINDOW`] without tripping the cap.
+fn unique_targets_for(max_peers: usize) -> usize {
+    if max_peers == 0 {
+        return MAX_UNIQUE_TARGETS_CEILING;
+    }
+    max_peers.clamp(MAX_UNIQUE_TARGETS_FLOOR, MAX_UNIQUE_TARGETS_CEILING)
+}
 
 /// Maximum time allowed for the authentication/identity extraction phase of
 /// the WebSocket handshake. Prevents attackers from exhausting connection
@@ -590,10 +633,14 @@ async fn handle_socket(
         let mut per_target_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
         let mut per_target_last_reset = tokio::time::Instant::now();
-        // Per-sender token-bucket rate limiter with high burst capacity.
-        // The burst allows WebRTC mesh initialization (N offers + N*K ICE
-        // candidates) while the low refill rate caps sustained throughput.
-        let mut rate_tokens: u32 = RATE_BURST_CAPACITY;
+        // Per-sender token-bucket rate limiter. Burst capacity is scaled from
+        // the relay's `max_peers` so that joining a maximally-full room never
+        // exhausts the budget on legitimate WebRTC mesh init, regardless of
+        // how the operator sized the relay. The low refill rate caps sustained
+        // throughput once the initial burst is spent.
+        let rate_burst_capacity = rate_burst_for(state_write.max_peers);
+        let max_unique_targets = unique_targets_for(state_write.max_peers);
+        let mut rate_tokens: u32 = rate_burst_capacity;
         let mut rate_last_refill = tokio::time::Instant::now();
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws_rx.next()).await {
@@ -703,7 +750,7 @@ async fn handle_socket(
                 // sub-interval. The check fires again once enough time has
                 // elapsed.
                 if refill > 0 {
-                    let new_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
+                    let new_tokens = (rate_tokens + refill).min(rate_burst_capacity);
                     rate_tokens = new_tokens;
                     // When the bucket fills to capacity, reset the clock to `now`
                     // so that saturating_mul overflow on very long-idle connections
@@ -711,7 +758,7 @@ async fn handle_socket(
                     // to fall behind and grant successive free max bursts. When
                     // the bucket is not full, advance proportionally to tokens
                     // minted to preserve sub-token remainder accumulation.
-                    if new_tokens == RATE_BURST_CAPACITY {
+                    if new_tokens == rate_burst_capacity {
                         rate_last_refill = now;
                     } else {
                         rate_last_refill += Duration::from_millis(
@@ -730,17 +777,27 @@ async fn handle_socket(
                 per_target_last_reset = now;
             }
             if rate_tokens == 0 {
-                // Drop the message rather than hard-disconnecting. A 50-person
-                // room can burst >500 signals during mesh init; severing the
-                // connection would permanently break WebRTC negotiation for
-                // legitimate peers. Silently dropping excess signals is far
-                // less damaging — ICE and SDP have their own retry logic.
-                tracing::debug!(
+                // Disconnect the peer rather than silently dropping the
+                // signal. SDP offers/answers and trickled ICE candidates are
+                // not retransmitted by `RTCPeerConnection` or by Matchbox over
+                // the signaling channel — STUN's retry logic only covers
+                // candidate-pair probing on the data path, not the SDP/ICE
+                // exchange itself. Dropping a signaling message therefore
+                // permanently fragments the WebRTC mesh: targeted peers stall
+                // forever in the "connecting" state. The burst capacity is
+                // scaled from `max_peers` (`rate_burst_for`) to comfortably
+                // cover full mesh init for the operator's configured room
+                // size, so legitimate peers should never reach this branch.
+                // A peer that does has either misbehaved or been compromised;
+                // dropping the connection is the correct failure signal so
+                // the client surfaces a hard error instead of stalling.
+                tracing::warn!(
                     session = %session_id,
-                    "dropping signal: rate limit exhausted (burst {RATE_BURST_CAPACITY}, \
-                     refill {RATE_REFILL_PER_SECOND}/s)"
+                    burst = rate_burst_capacity,
+                    refill_per_sec = RATE_REFILL_PER_SECOND,
+                    "disconnecting peer: signal rate budget exhausted"
                 );
-                continue;
+                break;
             }
             rate_tokens -= 1;
 
@@ -760,14 +817,18 @@ async fn handle_socket(
             // Unique target cap: reject senders addressing an absurd number
             // of distinct targets within one window. Legitimate peers target
             // at most the number of peers in their room; an attacker forging
-            // random target IDs to bloat the map will hit this cap.
+            // random target IDs to bloat the map will hit this cap. The cap
+            // is scaled from `max_peers` (`unique_targets_for`) so that any
+            // legitimate full-mesh send fits comfortably under the limit
+            // regardless of how the operator sized the relay.
             if !per_target_counts.contains_key(&target_id)
-                && per_target_counts.len() >= MAX_UNIQUE_TARGETS
+                && per_target_counts.len() >= max_unique_targets
             {
                 tracing::warn!(
                     session = %session_id,
                     unique_targets = per_target_counts.len(),
-                    "disconnecting peer: exceeded unique target cap ({MAX_UNIQUE_TARGETS})"
+                    cap = max_unique_targets,
+                    "disconnecting peer: exceeded unique target cap"
                 );
                 break;
             }
@@ -920,4 +981,77 @@ async fn handle_socket(
 
     // _conn_guard drops here, decrementing the counter.
     tracing::info!(session = %session_id_write, "peer disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_burst_floor_applies_for_small_relays() {
+        // Tiny relays still get the floor so even single-peer rooms have
+        // headroom for re-negotiation bursts.
+        assert_eq!(rate_burst_for(1), RATE_BURST_FLOOR);
+        assert_eq!(rate_burst_for(8), RATE_BURST_FLOOR);
+    }
+
+    #[test]
+    fn rate_burst_scales_with_max_peers() {
+        // Default-config relay (max_peers = 512) should comfortably fit a
+        // full-mesh init: 512 * 16 signals = 8192, which is below the ceiling
+        // and well above the legacy hard-coded burst of 500 that triggered
+        // silent drops in larger rooms.
+        let burst = rate_burst_for(512);
+        assert!(burst >= 512 * SIGNALS_PER_REMOTE_PEER);
+        assert!(burst <= RATE_BURST_CEILING);
+        assert!(burst > 500);
+    }
+
+    #[test]
+    fn rate_burst_caps_at_ceiling() {
+        // Pathologically large `max_peers` must not produce an unbounded
+        // per-connection token budget — keeps the worst-case memory and log
+        // noise bounded.
+        assert_eq!(rate_burst_for(1_000_000), RATE_BURST_CEILING);
+    }
+
+    #[test]
+    fn rate_burst_for_unlimited_uses_floor() {
+        // `max_peers == 0` ("unlimited") still needs *some* burst budget; we
+        // pick the floor here because the unique-target ceiling already caps
+        // legitimate full-mesh sends.
+        assert_eq!(rate_burst_for(0), RATE_BURST_FLOOR);
+    }
+
+    #[test]
+    fn unique_targets_cover_default_max_peers() {
+        // Critical regression check for the "instant ban after joining a
+        // 512-peer room" bug: with the default max_peers of 512, the cap
+        // must be at least 512 so a peer can address every other peer in
+        // the room within a single PER_TARGET_WINDOW.
+        assert!(unique_targets_for(512) >= 512);
+    }
+
+    #[test]
+    fn unique_targets_floor_for_small_rooms() {
+        // Small relays still get the floor so legitimate per-target sends
+        // never trip the cap on a tiny room.
+        assert_eq!(unique_targets_for(8), MAX_UNIQUE_TARGETS_FLOOR);
+        assert_eq!(unique_targets_for(256), MAX_UNIQUE_TARGETS_FLOOR);
+    }
+
+    #[test]
+    fn unique_targets_caps_at_ceiling() {
+        // Bounded per-connection HashMap memory even when max_peers is huge.
+        assert_eq!(unique_targets_for(1_000_000), MAX_UNIQUE_TARGETS_CEILING);
+    }
+
+    #[test]
+    fn unique_targets_unlimited_uses_ceiling() {
+        // `max_peers == 0` ("unlimited") falls back to the ceiling rather
+        // than the floor, since the operator has explicitly opted out of a
+        // configured cap and we still want to comfortably accommodate large
+        // rooms without trapping legitimate clients.
+        assert_eq!(unique_targets_for(0), MAX_UNIQUE_TARGETS_CEILING);
+    }
 }

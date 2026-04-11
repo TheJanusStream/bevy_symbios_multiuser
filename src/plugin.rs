@@ -211,10 +211,39 @@ fn open_socket<T: Send + Sync + 'static>(
             // after the deferred commands are applied.
             return;
         }
-        // Config exists and URL matches — but if the socket was lost (disconnect
-        // or external removal), clear the marker so it can be reopened next frame.
-        if socket.is_none() {
-            tracing::info!("socket was lost while config unchanged, clearing marker for reconnect");
+        // Config exists and URL matches. We have to detect three distinct
+        // "the socket is no longer usable" cases here so the next frame can
+        // open a fresh one (and pick up any refreshed token along the way):
+        //
+        // 1. The `MatchboxSocket` resource has been removed entirely (e.g. an
+        //    external system called `commands.close_socket()`).
+        // 2. The signaling/message-loop task has terminated. `bevy_matchbox`
+        //    does *not* automatically remove the `MatchboxSocket` resource on
+        //    a signaling drop — the `WebRtcSocket` keeps living in the ECS
+        //    world while its background task is dead — so relying on
+        //    `socket.is_none()` alone would silently miss every real
+        //    disconnect (idle timeout, network flap, server restart) and
+        //    leave the plugin in a "permanently broken but resource-present"
+        //    state. We detect a dead message loop by checking
+        //    `any_channel_closed()`: when the loop terminates it drops the
+        //    channel receivers, which closes the channel senders that the
+        //    `WebRtcSocket` exposes. Both the reliable and unreliable
+        //    channels live or die together with the loop, so this catches
+        //    every signaling-side drop without false positives during
+        //    healthy steady-state operation.
+        // 3. Neither (1) nor (2) — socket is healthy, leave everything alone.
+        let socket_dead = socket.as_ref().is_some_and(|s| s.any_channel_closed());
+        if socket.is_none() || socket_dead {
+            if socket_dead {
+                tracing::info!(
+                    "matchbox socket message loop terminated, tearing down for reconnect"
+                );
+                commands.remove_resource::<MatchboxSocket>();
+            } else {
+                tracing::info!(
+                    "socket was lost while config unchanged, clearing marker for reconnect"
+                );
+            }
             commands.remove_resource::<SocketOpened<T>>();
         }
         return;
