@@ -240,6 +240,23 @@ impl SymbiosSignallerBuilder {
     }
 }
 
+/// Hard cap on connection attempts when running in the browser.
+///
+/// On native targets, `try_connect` inspects the underlying tungstenite error
+/// and surfaces HTTP 4xx responses (e.g. `401 Invalid JWT`) so that
+/// `is_http_client_error` can fast-fail the retry loop on permanent
+/// authentication failures. The browser `WebSocket` API, by contrast,
+/// deliberately hides the HTTP status code of a failed handshake for security
+/// reasons — every failure surfaces as a generic connection error.
+///
+/// Without a cap, a WASM client presenting an expired or invalid JWT would
+/// burn through `attempts = None` (unlimited) reconnect attempts forever,
+/// hammering the relay with useless handshakes that always fail. Clamp the
+/// retry budget on WASM so that even permanently-broken auth eventually gives
+/// up and surfaces an error to the application.
+#[cfg(target_arch = "wasm32")]
+const WASM_MAX_RETRY_ATTEMPTS: u16 = 10;
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignallerBuilder for SymbiosSignallerBuilder {
@@ -248,6 +265,19 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
         mut attempts: Option<u16>,
         room_url: String,
     ) -> Result<Box<dyn Signaller>, SignalingError> {
+        // On WASM the browser hides HTTP status codes for failed WebSocket
+        // handshakes, so we cannot distinguish "401 invalid JWT" (permanent)
+        // from "TCP RST" (transient). Clamp the retry budget to prevent an
+        // unlimited-retry caller from spamming the relay with handshakes that
+        // will never succeed.
+        #[cfg(target_arch = "wasm32")]
+        {
+            attempts = Some(match attempts {
+                Some(n) => n.min(WASM_MAX_RETRY_ATTEMPTS),
+                None => WASM_MAX_RETRY_ATTEMPTS,
+            });
+        }
+
         let signaller = 'connect: loop {
             let ws = match self.try_connect(&room_url).await {
                 Ok(stream) => stream,

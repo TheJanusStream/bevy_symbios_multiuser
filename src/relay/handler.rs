@@ -113,6 +113,16 @@ const MAX_PEER_ID_LENGTH: usize = 512;
 /// holds the connection open for the full 10s DID fetch timeout).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Hard cap on simultaneously in-flight handshakes when `max_peers` is `0`
+/// ("unlimited"). Without this cap, an unlimited-peers configuration would
+/// disable the handshake tarpit budget entirely, allowing an attacker to
+/// open tens of thousands of TCP connections and tie them all up in the
+/// 15-second authentication phase before any idle timeout could reap them.
+/// The fixed value is high enough to never throttle legitimate traffic
+/// against a normally-loaded relay while still bounding attacker resource
+/// consumption.
+const UNLIMITED_HANDSHAKE_BUDGET: usize = 256;
+
 /// Maximum time allowed for a single WebSocket write to complete.
 /// Prevents a Slowloris variant where an attacker opens connections and
 /// intentionally never drains their TCP receive buffer: the OS-level send
@@ -165,7 +175,15 @@ pub async fn ws_handler(
 ) -> impl IntoResponse {
     // Extract the room from the URL path. Normalize so "/" and "" both map to
     // the same default room, and strip trailing slashes for consistency.
-    let room = uri.path().trim_matches('/').to_string();
+    // Percent-decode the path so that `/my%20room` and `/my room` (which an
+    // overly-permissive client might transmit) resolve to the same room rather
+    // than splitting peers across two parallel rooms by accident. Invalid UTF-8
+    // sequences are replaced with U+FFFD so the room name remains a valid
+    // String key.
+    let raw_room = uri.path().trim_matches('/');
+    let room = percent_encoding::percent_decode_str(raw_room)
+        .decode_utf8_lossy()
+        .into_owned();
     let room = if room.is_empty() {
         "default".to_string()
     } else {
@@ -196,8 +214,18 @@ pub async fn ws_handler(
     // the auth/DID-resolution phase simultaneously. Prevents DID tarpit
     // attacks from exhausting the entire connection budget while legitimate
     // peers are blocked waiting for slow DID-hosting servers to respond.
-    let _handshake_guard = if state.max_peers > 0 {
-        let handshake_limit = (state.max_peers / 4).max(1);
+    //
+    // When max_peers == 0 ("unlimited"), the operator only intends to lift the
+    // overall connection cap — they still need protection against handshake
+    // tarpits, which would otherwise pin tens of thousands of TCP connections
+    // in the 15-second authentication phase. Fall back to a fixed budget so the
+    // tarpit cap is always enforced regardless of `max_peers`.
+    let handshake_limit = if state.max_peers > 0 {
+        (state.max_peers / 4).max(1)
+    } else {
+        UNLIMITED_HANDSHAKE_BUDGET
+    };
+    let _handshake_guard = {
         let prev = state
             .active_handshakes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -211,9 +239,7 @@ pub async fn ws_handler(
             )
                 .into_response();
         }
-        Some(AtomicGuard(Arc::clone(&state.active_handshakes)))
-    } else {
-        None
+        AtomicGuard(Arc::clone(&state.active_handshakes))
     };
 
     let identity = match tokio::time::timeout(
@@ -367,21 +393,26 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    // Atomically replace any existing connection for this session ID.
+    // Atomically replace any existing connection for this (room, session_id).
     // Using the `entry` API avoids a TOCTOU race where two concurrent
     // reconnects could both see `None` from `get()` and both `insert()`,
     // orphaning the first connection's write task.
+    //
+    // The map is keyed by `(room, session_id)` so the same authenticated
+    // identity may legitimately hold concurrent connections in different
+    // rooms; only a same-room reconnect from the same identity replaces the
+    // prior entry.
+    let peer_key = (room.clone(), session_id.clone());
     let old_entry_info = {
         use dashmap::mapref::entry::Entry;
         let new_peer = PeerEntry {
             tx: relay_tx,
             conn_id,
-            room: room.clone(),
         };
-        match state.peers.entry(session_id.clone()) {
+        match state.peers.entry(peer_key.clone()) {
             Entry::Occupied(mut occ) => {
                 let old = occ.insert(new_peer);
-                Some((old.room, old.tx))
+                Some(old.tx)
             }
             Entry::Vacant(vac) => {
                 vac.insert(new_peer);
@@ -390,13 +421,16 @@ async fn handle_socket(
         }
     };
 
-    // If we replaced an old connection, notify peers in the OLD room and
-    // drop the old sender (which will cause its write task to terminate).
-    if let Some((old_room, _old_tx)) = old_entry_info {
+    // If we replaced an old connection (same identity reconnecting to the
+    // same room), notify the other peers in that room so their WebRTC mesh
+    // state for this session_id is torn down before the new PeerJoined fires.
+    // Peers in *other* rooms are unaffected because the old connection there
+    // (if any) lives under a different (room, session_id) key.
+    if let Some(_old_tx) = old_entry_info {
         let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
             .peers
             .iter()
-            .filter(|entry| *entry.key() != session_id && entry.value().room == old_room)
+            .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
             .map(|entry| entry.value().tx.clone())
             .collect();
         for sender in leave_senders {
@@ -426,7 +460,7 @@ async fn handle_socket(
     ) {
         state
             .peers
-            .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
+            .remove_if(&peer_key, |_, entry| entry.conn_id == conn_id);
         // _conn_guard drops here, decrementing the counter.
         return;
     }
@@ -435,8 +469,8 @@ async fn handle_socket(
     let existing_peers: Vec<String> = state
         .peers
         .iter()
-        .filter(|entry| *entry.key() != session_id && entry.value().room == room)
-        .map(|entry| entry.key().clone())
+        .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
+        .map(|entry| entry.key().1.clone())
         .collect();
     let peer_list = serde_json::json!({ "type": "peer_list", "peers": existing_peers });
     if !matches!(
@@ -449,7 +483,7 @@ async fn handle_socket(
     ) {
         state
             .peers
-            .remove_if(&session_id, |_, entry| entry.conn_id == conn_id);
+            .remove_if(&peer_key, |_, entry| entry.conn_id == conn_id);
         return;
     }
 
@@ -458,7 +492,7 @@ async fn handle_socket(
     let peer_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
         .peers
         .iter()
-        .filter(|entry| *entry.key() != session_id && entry.value().room == room)
+        .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
         .map(|entry| entry.value().tx.clone())
         .collect();
     for sender in peer_senders {
@@ -470,6 +504,7 @@ async fn handle_socket(
     }
 
     let session_id_write = session_id.clone();
+    let room_write = room.clone();
     let state_write = state.clone();
 
     // Forward messages from the relay channel to the WebSocket, and
@@ -760,55 +795,51 @@ async fn handle_socket(
                 .get(&target_id)
                 .is_some_and(|s| *s >= MAX_BACKPRESSURE_STRIKES);
 
-            if let Some(entry) = state_write.peers.get(&target_id) {
-                if entry.value().room != room {
-                    tracing::warn!(
-                        session = %session_id,
-                        target = %target_id,
-                        "dropping cross-room signal"
-                    );
-                } else {
-                    match entry.value().tx.try_send(forwarded) {
-                        Ok(()) => {
-                            // Successful send — reset strike counter for this target.
-                            backpressure_strikes.remove(&target_id);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            if !at_strike_limit {
-                                let strikes =
-                                    backpressure_strikes.entry(target_id.clone()).or_insert(0);
-                                *strikes += 1;
+            // Look up the target by `(room, target_id)` so cross-room
+            // forwarding is impossible by construction: a peer in room A
+            // cannot synthesise a key into room B.
+            let target_key = (room.clone(), target_id.clone());
+            if let Some(entry) = state_write.peers.get(&target_key) {
+                match entry.value().tx.try_send(forwarded) {
+                    Ok(()) => {
+                        // Successful send — reset strike counter for this target.
+                        backpressure_strikes.remove(&target_id);
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        if !at_strike_limit {
+                            let strikes =
+                                backpressure_strikes.entry(target_id.clone()).or_insert(0);
+                            *strikes += 1;
+                            tracing::warn!(
+                                target = %target_id,
+                                sender = %session_id,
+                                strikes = *strikes,
+                                "relay channel full for target, dropping signal (backpressure)"
+                            );
+                            if *strikes >= MAX_BACKPRESSURE_STRIKES {
                                 tracing::warn!(
                                     target = %target_id,
                                     sender = %session_id,
-                                    strikes = *strikes,
-                                    "relay channel full for target, dropping signal (backpressure)"
+                                    "target hit {MAX_BACKPRESSURE_STRIKES} backpressure \
+                                     strikes; silencing logs until channel drains"
                                 );
-                                if *strikes >= MAX_BACKPRESSURE_STRIKES {
-                                    tracing::warn!(
-                                        target = %target_id,
-                                        sender = %session_id,
-                                        "target hit {MAX_BACKPRESSURE_STRIKES} backpressure \
-                                         strikes; silencing logs until channel drains"
-                                    );
-                                }
                             }
-                            // If already at limit, drop silently — the send was
-                            // still attempted above so Ok(()) can still fire.
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // Target peer disconnected but hasn't been cleaned
-                            // up from the DashMap yet. Clear any accumulated
-                            // strike state — the channel is gone so the strikes
-                            // would never be reset via Ok(()), causing a
-                            // permanent memory leak on long-lived connections
-                            // that interact with many transient peers.
-                            backpressure_strikes.remove(&target_id);
-                            tracing::debug!(
-                                target = %target_id,
-                                "target channel closed, dropping this message"
-                            );
-                        }
+                        // If already at limit, drop silently — the send was
+                        // still attempted above so Ok(()) can still fire.
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Target peer disconnected but hasn't been cleaned
+                        // up from the DashMap yet. Clear any accumulated
+                        // strike state — the channel is gone so the strikes
+                        // would never be reset via Ok(()), causing a
+                        // permanent memory leak on long-lived connections
+                        // that interact with many transient peers.
+                        backpressure_strikes.remove(&target_id);
+                        tracing::debug!(
+                            target = %target_id,
+                            "target channel closed, dropping this message"
+                        );
                     }
                 }
             } else {
@@ -839,14 +870,16 @@ async fn handle_socket(
 
     // Cleanup: only remove the peer entry if it still belongs to *this*
     // connection. A reconnect may have already replaced it with a new sender.
+    let cleanup_key = (room_write.clone(), session_id_write.clone());
     let was_removed = state
         .peers
-        .remove_if(&session_id_write, |_, entry| entry.conn_id == conn_id);
+        .remove_if(&cleanup_key, |_, entry| entry.conn_id == conn_id);
     if was_removed.is_none() {
-        // Another connection owns this session ID now — skip broadcast.
+        // Another connection owns this (room, session_id) now — skip broadcast.
         // _conn_guard drops here, decrementing the counter.
         tracing::debug!(
             session = %session_id_write,
+            room = %room_write,
             "stale connection cleanup skipped (session was replaced)"
         );
         return;
@@ -854,7 +887,7 @@ async fn handle_socket(
     let remaining_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
         .peers
         .iter()
-        .filter(|entry| entry.value().room == room)
+        .filter(|entry| entry.key().0 == room_write)
         .map(|entry| entry.value().tx.clone())
         .collect();
     for sender in remaining_senders {

@@ -38,6 +38,14 @@
 //! rooms — peers only see `PeerJoined`/`PeerLeft` events and can only exchange
 //! signals with other peers in the same room. Cross-room signals are dropped.
 //! Connecting to `/` (or with no path) places the peer in a `"default"` room.
+//! Room paths are percent-decoded so that `/my%20room` and `/my room` resolve
+//! to the same room.
+//!
+//! Peer state is keyed by `(room, session_id)`, so the same authenticated
+//! identity may legitimately hold concurrent connections in different rooms
+//! (e.g. a lobby and a game room). Within a single room, a reconnect from the
+//! same identity still replaces the prior entry and emits a `PeerLeft` to the
+//! room so the WebRTC mesh state machine can recover cleanly.
 //!
 //! # Hardening
 //!
@@ -107,7 +115,9 @@
 //! - **Handshake slot budget** — At most `max_peers / 4` connections may be
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
-//!   fetch with slow-responding servers.
+//!   fetch with slow-responding servers. When `max_peers == 0` (unlimited),
+//!   the budget falls back to a fixed cap so the tarpit protection is never
+//!   silently disabled by an unlimited-peers configuration.
 //! - **Per-target burst limiting** — Each sender may route at most 64 messages
 //!   to the same target within a single rate-refill window. This prevents one
 //!   sender from filling a target's relay channel (256 slots) with garbage,
@@ -209,16 +219,18 @@ pub struct PeerEntry {
     /// Unique ID for this specific WebSocket connection, used to distinguish
     /// reconnects and prevent stale cleanup from clobbering a newer session.
     pub conn_id: uuid::Uuid,
-    /// The room this peer belongs to, derived from the WebSocket URL path.
-    /// Peers only see and communicate with other peers in the same room.
-    pub room: String,
 }
 
 /// Shared server state holding the map of connected peers.
 #[derive(Clone)]
 pub struct RelayState {
-    /// Maps peer session IDs to their WebSocket message senders.
-    pub peers: Arc<DashMap<String, PeerEntry>>,
+    /// Maps `(room, session_id)` pairs to their WebSocket message senders.
+    /// Keying by `(room, session_id)` rather than `session_id` alone allows the
+    /// same authenticated identity to hold concurrent connections in different
+    /// rooms (e.g. a lobby and a game room) without one silently evicting the
+    /// other. Within a single room, a reconnect from the same identity still
+    /// replaces the prior entry.
+    pub peers: Arc<DashMap<(String, String), PeerEntry>>,
     /// Whether authentication is mandatory for new connections.
     pub auth_required: bool,
     /// Maximum concurrent peers (`0` = unlimited).

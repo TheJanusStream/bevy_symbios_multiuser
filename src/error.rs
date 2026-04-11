@@ -12,10 +12,6 @@ pub enum SymbiosError {
     #[error("serialization failed: {0}")]
     Serialization(#[from] bincode::Error),
 
-    /// Failed to send a message because the network channel is closed.
-    #[error("network channel closed")]
-    ChannelClosed,
-
     /// Failed to connect to the signaling server.
     #[error("signaling connection failed: {0}")]
     SignalingFailed(String),
