@@ -120,5 +120,5 @@ pub mod prelude {
     pub use crate::auth::{AtprotoCredentials, AtprotoSession};
 
     #[cfg(feature = "client")]
-    pub use crate::signaller::SymbiosSignallerBuilder;
+    pub use crate::signaller::{PeerSessionMap, PeerSessionMapRes, SymbiosSignallerBuilder};
 }

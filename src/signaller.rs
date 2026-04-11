@@ -84,6 +84,72 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
     }
 }
 
+// ── Peer session map (PeerId → authenticated session_id / DID) ───────────────
+
+/// Shared map from [`PeerId`] to the relay session identifier (typically the
+/// authenticated DID) that the relay assigned to that peer.
+///
+/// The [`SymbiosSignaller`] mints a fresh random [`PeerId`] for every remote
+/// peer it sees so that matchbox's per-peer WebRTC state machine cannot confuse
+/// a reconnecting peer with stale state from the previous connection. That
+/// choice breaks any attempt by the application to recover the real DID of a
+/// peer directly from its `PeerId`, which in turn blocks DID-based identity
+/// verification over the (unauthenticated) WebRTC data channel.
+///
+/// This map restores that binding: the signaller writes `(PeerId, session_id)`
+/// pairs as peers join and removes them as peers leave, and the application
+/// reads from it through [`PeerSessionMapRes`] to verify that a self-reported
+/// identity payload really belongs to the peer the relay authenticated.
+pub type PeerSessionMap = Arc<std::sync::RwLock<HashMap<PeerId, String>>>;
+
+/// Bevy [`Resource`](bevy::prelude::Resource) wrapper around a
+/// [`PeerSessionMap`].
+///
+/// The [`crate::plugin::SymbiosMultiuserPlugin`] inserts this resource
+/// automatically and passes the inner [`PeerSessionMap`] to the signaller
+/// builder so that the application and the signaller observe the same
+/// `PeerId → session_id` view.
+///
+/// # Example — verifying a peer's DID claim
+///
+/// ```rust,ignore
+/// use bevy::prelude::*;
+/// use bevy_symbios_multiuser::prelude::*;
+///
+/// fn verify_identity(
+///     map: Res<PeerSessionMapRes>,
+///     peer_id: PeerId,
+///     claimed_did: &str,
+/// ) -> bool {
+///     map.session_id(&peer_id).as_deref() == Some(claimed_did)
+/// }
+/// ```
+#[derive(bevy::prelude::Resource, Clone)]
+pub struct PeerSessionMapRes(pub PeerSessionMap);
+
+impl Default for PeerSessionMapRes {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::RwLock::new(HashMap::new())))
+    }
+}
+
+impl PeerSessionMapRes {
+    /// Look up the session ID (typically the authenticated DID) that the relay
+    /// assigned to `peer_id`, if the signaller currently knows that peer.
+    ///
+    /// Returns `None` for unknown peers, and for the brief window between
+    /// matchbox surfacing a [`PeerState::Connected`] event and the signaller
+    /// recording the underlying session ID. Callers that need a strict check
+    /// should treat `None` as "not yet verified" rather than "verified absent".
+    pub fn session_id(&self, peer_id: &matchbox_socket::PeerId) -> Option<String> {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer_id)
+            .cloned()
+    }
+}
+
 // ── SignallerBuilder ─────────────────────────────────────────────────────────
 
 /// Bevy [`Resource`](bevy::prelude::Resource) wrapper around a [`TokenSource`].
@@ -156,6 +222,10 @@ pub struct SymbiosSignallerBuilder {
     /// Shared, externally-refreshable token. When present, takes priority
     /// over `access_jwt` so reconnects use the latest refreshed token.
     token_source: Option<TokenSource>,
+    /// Shared `PeerId → session_id` map updated by the signaller as peers
+    /// join and leave. When present, the application can resolve the real
+    /// (relay-authenticated) DID for any active peer.
+    session_map: Option<PeerSessionMap>,
 }
 
 impl SymbiosSignallerBuilder {
@@ -212,6 +282,7 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                 session_to_peer: HashMap::new(),
                 peer_to_session: HashMap::new(),
                 pending_events: VecDeque::new(),
+                session_map: self.session_map.clone(),
             };
 
             // Read the relay's welcome messages (session_id + peer_list).
@@ -364,6 +435,30 @@ pub struct SymbiosSignaller {
     session_to_peer: HashMap<String, PeerId>,
     peer_to_session: HashMap<PeerId, String>,
     pending_events: VecDeque<PeerEvent>,
+    /// Shared `PeerId → session_id` view that the application reads through
+    /// [`PeerSessionMapRes`]. `None` if no map was threaded through the
+    /// builder (e.g. crate consumers that never need DID verification).
+    session_map: Option<PeerSessionMap>,
+}
+
+impl SymbiosSignaller {
+    /// Publish a peer → session binding to the shared map, if the application
+    /// provided one. Called whenever the signaller learns a new peer.
+    fn publish_peer(&self, peer: PeerId, session_id: &str) {
+        if let Some(map) = &self.session_map {
+            map.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(peer, session_id.to_owned());
+        }
+    }
+
+    /// Remove a peer binding from the shared map when the relay reports the
+    /// peer has left.
+    fn unpublish_peer(&self, peer: &PeerId) {
+        if let Some(map) = &self.session_map {
+            map.write().unwrap_or_else(|e| e.into_inner()).remove(peer);
+        }
+    }
 }
 
 impl SymbiosSignaller {
@@ -423,9 +518,19 @@ impl SymbiosSignaller {
     }
 
     /// Insert a bidirectional mapping between session ID and PeerId.
+    ///
+    /// Also publishes the mapping to the shared [`PeerSessionMap`] (if
+    /// present) so the host application can verify identity claims from this
+    /// peer. The only entry that is *not* exposed via the map is the local
+    /// peer — the map is intended for identifying *remote* peers that signed
+    /// messages over the data channel, which the local peer never needs to do
+    /// against itself.
     fn track_session(&mut self, session_id: String, peer_id: PeerId) {
         self.session_to_peer.insert(session_id.clone(), peer_id);
-        self.peer_to_session.insert(peer_id, session_id);
+        self.peer_to_session.insert(peer_id, session_id.clone());
+        if peer_id != self.local_peer_id {
+            self.publish_peer(peer_id, &session_id);
+        }
     }
 
     /// Remove a peer from the ID maps and return its `PeerId`.
@@ -435,6 +540,7 @@ impl SymbiosSignaller {
             .remove(session_id)
             .unwrap_or_else(|| session_id_to_peer_id(session_id));
         self.peer_to_session.remove(&pid);
+        self.unpublish_peer(&pid);
         pid
     }
 }
@@ -614,6 +720,7 @@ pub fn signaller_for_session(session: &crate::auth::AtprotoSession) -> Arc<dyn S
     Arc::new(SymbiosSignallerBuilder {
         access_jwt: Some(session.access_jwt.clone()),
         token_source: None,
+        session_map: None,
     })
 }
 
@@ -646,6 +753,7 @@ pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuil
     Arc::new(SymbiosSignallerBuilder {
         access_jwt: None,
         token_source: Some(source),
+        session_map: None,
     })
 }
 
@@ -659,5 +767,47 @@ pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
         access_jwt: None,
         token_source: None,
+        session_map: None,
+    })
+}
+
+/// Create a [`SymbiosSignallerBuilder`] with a shared [`PeerSessionMap`].
+///
+/// The builder carries `session_map` forward to every [`SymbiosSignaller`] it
+/// produces, so reconnects keep populating the same map and the application's
+/// [`PeerSessionMapRes`] view stays consistent.
+///
+/// Anonymous (no-JWT) variant. For authenticated variants, prefer
+/// [`signaller_for_session_with_map`] or
+/// [`signaller_with_token_source_and_map`].
+pub fn signaller_anonymous_with_map(session_map: PeerSessionMap) -> Arc<dyn SignallerBuilder> {
+    Arc::new(SymbiosSignallerBuilder {
+        access_jwt: None,
+        token_source: None,
+        session_map: Some(session_map),
+    })
+}
+
+/// Authenticated static-JWT variant of [`signaller_anonymous_with_map`].
+pub fn signaller_for_session_with_map(
+    session: &crate::auth::AtprotoSession,
+    session_map: PeerSessionMap,
+) -> Arc<dyn SignallerBuilder> {
+    Arc::new(SymbiosSignallerBuilder {
+        access_jwt: Some(session.access_jwt.clone()),
+        token_source: None,
+        session_map: Some(session_map),
+    })
+}
+
+/// Refreshable-token variant of [`signaller_anonymous_with_map`].
+pub fn signaller_with_token_source_and_map(
+    source: TokenSource,
+    session_map: PeerSessionMap,
+) -> Arc<dyn SignallerBuilder> {
+    Arc::new(SymbiosSignallerBuilder {
+        access_jwt: None,
+        token_source: Some(source),
+        session_map: Some(session_map),
     })
 }

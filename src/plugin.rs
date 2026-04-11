@@ -132,6 +132,7 @@ where
     fn build(&self, app: &mut App) {
         app.init_resource::<NetworkQueue<T>>()
             .init_resource::<PeerStateQueue<T>>()
+            .init_resource::<crate::signaller::PeerSessionMapRes>()
             .add_message::<Broadcast<T>>()
             .add_systems(
                 Update,
@@ -161,6 +162,7 @@ fn open_socket<T: Send + Sync + 'static>(
     opened: Option<Res<SocketOpened<T>>>,
     socket: Option<Res<MatchboxSocket>>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
+    #[cfg(feature = "client")] session_map: Res<crate::signaller::PeerSessionMapRes>,
 ) {
     // Teardown: if the socket was opened but the config was removed or the
     // room URL changed, close the existing socket so a new one can be opened.
@@ -210,10 +212,14 @@ fn open_socket<T: Send + Sync + 'static>(
     // silently transmitting it would cause unexpected 401 rejections.
     #[cfg(feature = "client")]
     {
+        // Thread the shared `PeerSessionMap` through whichever signaller
+        // variant we pick so the application can resolve peer DIDs via
+        // `PeerSessionMapRes` regardless of the auth mode.
+        let map = session_map.0.clone();
         let signaller = if let Some(ts) = token_source {
-            crate::signaller::signaller_with_token_source(ts.0.clone())
+            crate::signaller::signaller_with_token_source_and_map(ts.0.clone(), map)
         } else {
-            crate::signaller::signaller_anonymous()
+            crate::signaller::signaller_anonymous_with_map(map)
         };
         builder = builder.signaller_builder(signaller);
     }
