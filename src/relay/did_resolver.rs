@@ -190,7 +190,7 @@ fn split_did_web_domain_path(raw: &str) -> Result<(&str, Option<&str>), String> 
             &raw[bracket_end + 1..]
         };
         if rest.is_empty() {
-            Ok((&raw[..], None))
+            Ok((raw, None))
         } else {
             Err(format!(
                 "unexpected characters after IPv6 bracket in did:web: '{raw}'"
@@ -284,6 +284,7 @@ fn did_document_url(did: &str, plc_directory: &str) -> Result<String, String> {
 /// removing a replacement entry that a concurrent request may have inserted
 /// between our `fetch_sub` and the `remove_if`.
 #[derive(Debug)]
+#[allow(clippy::type_complexity)]
 struct ConcurrencyGuard {
     counter: Arc<AtomicU64>,
     /// If set, remove the map entry on drop when `counter` reaches zero.
@@ -610,13 +611,11 @@ impl DidResolver {
         let did_owned = did.to_string();
         self.cache
             .try_get_with(did.to_string(), async {
-                let doc = self.fetch_did_document(&did_owned).await.map_err(|e| {
+                let doc = self.fetch_did_document(&did_owned).await.inspect_err(|e| {
                     negative_cache.insert(did_owned.clone(), e.clone());
-                    e
                 })?;
-                extract_signing_key(&doc).map_err(|e| {
+                extract_signing_key(&doc).inspect_err(|e| {
                     negative_cache.insert(did_owned.clone(), e.clone());
-                    e
                 })
             })
             .await
@@ -758,12 +757,12 @@ impl DidResolver {
         }
 
         // Check Content-Length hint if present (not authoritative, but fast).
-        if let Some(len) = resp.content_length() {
-            if len as usize > MAX_DID_DOCUMENT_SIZE {
-                return Err(format!(
-                    "DID document response too large ({len} bytes, max {MAX_DID_DOCUMENT_SIZE})"
-                ));
-            }
+        if let Some(len) = resp.content_length()
+            && len as usize > MAX_DID_DOCUMENT_SIZE
+        {
+            return Err(format!(
+                "DID document response too large ({len} bytes, max {MAX_DID_DOCUMENT_SIZE})"
+            ));
         }
 
         // Stream the body with a hard size limit to prevent memory exhaustion.

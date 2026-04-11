@@ -354,7 +354,7 @@ async fn extract_identity(
         return Ok(None);
     };
 
-    match auth::validate_atproto_jwt(token, &resolver, service_did).await {
+    match auth::validate_atproto_jwt(token, resolver, service_did).await {
         Ok(identity) => Ok(Some(identity)),
         Err(auth::AuthError::Transient(e)) => {
             // DID resolver is overloaded or the DID hosting server is

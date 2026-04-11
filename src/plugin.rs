@@ -198,8 +198,7 @@ fn open_socket<T: Send + Sync + 'static>(
         let needs_teardown = match config.as_ref() {
             None => true,
             Some(cfg) => {
-                cfg.room_url != marker.room_url
-                    || !ice_unchanged(&cfg.ice_servers, &marker.ice)
+                cfg.room_url != marker.room_url || !ice_unchanged(&cfg.ice_servers, &marker.ice)
             }
         };
         if needs_teardown {

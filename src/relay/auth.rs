@@ -306,10 +306,10 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
     if claims.exp.saturating_add(LEEWAY_SECS) < now {
         return Err("JWT has expired".to_string());
     }
-    if let Some(nbf) = claims.nbf {
-        if now + LEEWAY_SECS < nbf {
-            return Err("JWT not yet valid (nbf)".to_string());
-        }
+    if let Some(nbf) = claims.nbf
+        && now + LEEWAY_SECS < nbf
+    {
+        return Err("JWT not yet valid (nbf)".to_string());
     }
 
     Ok(())
