@@ -124,12 +124,29 @@ impl<T> SymbiosMultiuserPlugin<T> {
 /// ```
 ///
 /// Enable the `client` feature (included in `default`) to resolve this.
+/// Non-generic sentinel that structurally enforces single-installation of
+/// [`SymbiosMultiuserPlugin`]. `MatchboxSocket` is not generic, so two
+/// concurrent instances would share and corrupt the same socket.
+#[cfg(feature = "client")]
+#[derive(Resource)]
+struct SymbiosPluginInstalled;
+
 #[cfg(feature = "client")]
 impl<T> Plugin for SymbiosMultiuserPlugin<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
 {
     fn build(&self, app: &mut App) {
+        if app.world().contains_resource::<SymbiosPluginInstalled>() {
+            panic!(
+                "SymbiosMultiuserPlugin can only be added once per App. \
+                 MatchboxSocket is a single global resource and cannot be \
+                 shared across multiple plugin instances (even with different \
+                 message type parameters)."
+            );
+        }
+        app.insert_resource(SymbiosPluginInstalled);
+
         app.init_resource::<NetworkQueue<T>>()
             .init_resource::<PeerStateQueue<T>>()
             .init_resource::<crate::signaller::PeerSessionMapRes>()

@@ -649,8 +649,12 @@ impl Signaller for SymbiosSignaller {
                         })
                     }
                     SignalPayload::PeerJoined(ref id) => {
-                        let _pid = self.get_or_create_peer_id(id);
-                        continue;
+                        // Matchbox tracks remote peers via `NewPeer` events; if we
+                        // swallow this, an incoming SDP offer from the new peer will
+                        // be dropped as "signal for unknown peer" and the mesh will
+                        // fail to negotiate.
+                        let pid = self.get_or_create_peer_id(id);
+                        Ok(PeerEvent::NewPeer(pid))
                     }
                     SignalPayload::PeerLeft(ref id) => {
                         let pid = self.remove_peer(id);

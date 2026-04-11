@@ -510,10 +510,21 @@ fn is_link_local(ip: &std::net::IpAddr) -> bool {
 /// - Bracketed IPv6 without port: `[2001:db8::1]` → `[2001:db8::1]`
 fn extract_hostname(domain: &str) -> String {
     if domain.starts_with('[') {
-        // Bracketed IPv6 — take everything up to and including `]`.
+        // Bracketed IPv6 — `]` must be the end of the string or immediately
+        // followed by `:<port>`. Anything else (e.g. `[::1]GARBAGE`) is
+        // malformed; returning the whole string propagates the garbage to the
+        // URL parser, which will reject it instead of silently pinning a
+        // truncated hostname.
         match domain.find(']') {
-            Some(idx) => domain[..=idx].to_string(),
-            None => domain.to_string(), // malformed, pass through
+            Some(idx) => {
+                let after = &domain[idx + 1..];
+                if after.is_empty() || after.starts_with(':') {
+                    domain[..=idx].to_string()
+                } else {
+                    domain.to_string()
+                }
+            }
+            None => domain.to_string(),
         }
     } else {
         // IPv4 or hostname — take everything before the first colon (port).

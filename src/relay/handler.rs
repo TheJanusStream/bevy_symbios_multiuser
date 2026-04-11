@@ -645,7 +645,10 @@ async fn handle_socket(
             // Per-sender token-bucket rate limiting: refill proportionally
             // to elapsed time, capped at RATE_BURST_CAPACITY.
             let now = tokio::time::Instant::now();
-            let elapsed = now.duration_since(rate_last_refill);
+            // `saturating_duration_since` avoids panicking on rare clock
+            // anomalies (OS suspend, VM clock adjustment) where
+            // `rate_last_refill` could marginally overtake `now`.
+            let elapsed = now.saturating_duration_since(rate_last_refill);
             if elapsed >= Duration::from_millis(50) {
                 // Cap elapsed milliseconds to avoid u32 overflow on long-idle
                 // connections (Ping/Pong keep-alive resets WS_IDLE_TIMEOUT but
@@ -656,9 +659,9 @@ async fn handle_socket(
                 // When integer division truncates to 0 (refill rate is low and
                 // insufficient time has accumulated), skip the update entirely.
                 // Advancing the timestamp without minting tokens would push
-                // `rate_last_refill` into the future, causing
-                // `now.duration_since(rate_last_refill)` to panic on the next
-                // packet. The check fires again once enough time has elapsed.
+                // `rate_last_refill` into the future and silently discard the
+                // sub-interval. The check fires again once enough time has
+                // elapsed.
                 if refill > 0 {
                     let new_tokens = (rate_tokens + refill).min(RATE_BURST_CAPACITY);
                     rate_tokens = new_tokens;
@@ -682,7 +685,7 @@ async fn handle_socket(
             // decoupled from the token bucket. This prevents an attacker
             // from suppressing the clear by keeping the bucket below capacity
             // while inserting unbounded unique target keys.
-            if now.duration_since(per_target_last_reset) >= PER_TARGET_WINDOW {
+            if now.saturating_duration_since(per_target_last_reset) >= PER_TARGET_WINDOW {
                 per_target_counts.clear();
                 per_target_last_reset = now;
             }
