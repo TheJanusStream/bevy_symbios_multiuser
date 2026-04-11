@@ -42,17 +42,43 @@ const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 /// from alternating valid/invalid messages to avoid the limit.
 const MAX_INVALID_MESSAGES: usize = 10;
 
-/// Number of consecutive channel-full (`TrySendError::Full`) drops on the same
-/// target before further failures are silently discarded (no more log output).
-/// The send is still attempted on every message so the channel can recover:
-/// a successful send resets the counter back to zero. Only channel-full errors
-/// accumulate strikes; closed channels (disconnected peers) are skipped
-/// per-message without accumulating strikes, so reconnected peers can
-/// immediately receive signals again. Truly stalled peers are reaped by
-/// [`WS_IDLE_TIMEOUT`] rather than by sender-driven eviction, which would
-/// allow a malicious sender to kick arbitrary targets by flooding their
-/// channel.
+/// Cumulative channel-full (`TrySendError::Full`) drops on the same target
+/// after which further channel-full warnings are silenced for that target
+/// (the silencer "arms"). The send is still attempted on every message so
+/// the channel can recover: each successful send is treated as a leaky-bucket
+/// drip that decrements the strike count by one. Once the counter reaches
+/// [`SILENCER_REARM_THRESHOLD`] the silencer disarms again.
+///
+/// Reset-on-success was deliberately replaced with leaky decrement to defeat
+/// a log-amplification attack where the attacker oscillates around the
+/// channel-full boundary: at the old behavior, draining a single message
+/// would zero the counter and re-arm the per-strike logging path, letting
+/// the attacker emit a fresh batch of warnings on every cycle. The leaky
+/// bucket plus a `silenced` flag bound the worst case to two log lines per
+/// (silencer-disarm → silencer-rearm) cycle, regardless of how the attacker
+/// times the flood.
+///
+/// Only channel-full errors accumulate strikes; closed channels (disconnected
+/// peers) are skipped per-message without accumulating strikes, so reconnected
+/// peers can immediately receive signals again. Truly stalled peers are reaped
+/// by [`WS_IDLE_TIMEOUT`] rather than by sender-driven eviction, which would
+/// allow a malicious sender to kick arbitrary targets by flooding their channel.
 const MAX_BACKPRESSURE_STRIKES: usize = 50;
+
+/// Hard cap on the per-target leaky-bucket strike counter. Once the silencer
+/// is armed, further channel-full events keep incrementing the counter (so
+/// that recovery requires a sustained drain rather than a single success),
+/// but capping at this value bounds the number of subsequent successful
+/// sends required to disarm the silencer. Set to twice [`MAX_BACKPRESSURE_STRIKES`]
+/// so a sustained flood is bounded but recovery is still possible without
+/// the connection lingering in a perpetually-silenced state.
+const MAX_BACKPRESSURE_STRIKE_CAP: usize = MAX_BACKPRESSURE_STRIKES * 2;
+
+/// Strike count at which a previously-armed silencer disarms. Set to zero
+/// so the silencer only resets after a full drain, preventing the attacker
+/// from maintaining a steady-state strike count just below
+/// [`MAX_BACKPRESSURE_STRIKES`] that triggers fresh logging on every dip.
+const SILENCER_REARM_THRESHOLD: usize = 0;
 
 /// Maximum time a WebSocket connection may be idle (no messages received)
 /// before the server disconnects it. Prevents Slowloris-style attacks where
@@ -162,13 +188,18 @@ pub async fn ws_handler(
     // the same default room, and strip trailing slashes for consistency.
     // Percent-decode the path so that `/my%20room` and `/my room` (which an
     // overly-permissive client might transmit) resolve to the same room rather
-    // than splitting peers across two parallel rooms by accident. Invalid UTF-8
-    // sequences are replaced with U+FFFD so the room name remains a valid
-    // String key.
+    // than splitting peers across two parallel rooms by accident. Reject any
+    // path that decodes to non-UTF-8 bytes outright: a lossy decode would
+    // collapse all distinct invalid sequences (`%FE`, `%FF`, …) onto the same
+    // U+FFFD-bearing string, silently merging unrelated client requests into
+    // the same WebRTC mesh.
     let raw_room = uri.path().trim_matches('/');
-    let room = percent_encoding::percent_decode_str(raw_room)
-        .decode_utf8_lossy()
-        .into_owned();
+    let room = match percent_encoding::percent_decode_str(raw_room).decode_utf8() {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "room path is not valid UTF-8").into_response();
+        }
+    };
     let room = if room.is_empty() {
         "default".to_string()
     } else {
@@ -534,12 +565,19 @@ async fn handle_socket(
     // that hold a slot without sending any data.
     let read_task = async {
         let mut invalid_count: usize = 0;
-        // Per-target backpressure strike counters. When a target's channel is
-        // full across many consecutive routing attempts, we stop trying to
-        // deliver to that target from this sender. Stalled peers are reaped
+        // Per-target backpressure state. When a target's channel is full across
+        // many consecutive routing attempts, log emission for that target is
+        // silenced (`silenced = true`). Successful sends drip the strike
+        // counter back down via leaky-bucket decrement; the silencer only
+        // disarms when the counter returns to zero. Stalled peers are reaped
         // by WS_IDLE_TIMEOUT instead of sender-driven eviction, preventing
         // a malicious sender from kicking arbitrary targets.
-        let mut backpressure_strikes: std::collections::HashMap<String, usize> =
+        #[derive(Default)]
+        struct BackpressureState {
+            strikes: usize,
+            silenced: bool,
+        }
+        let mut backpressure_strikes: std::collections::HashMap<String, BackpressureState> =
             std::collections::HashMap::new();
         // Per-target message counters within the current per-target window.
         // Prevents a single sender from filling one target's relay channel
@@ -754,13 +792,10 @@ async fn handle_socket(
                 signal: envelope.signal,
             };
 
-            // Check strike count but do NOT skip the send: we always probe
-            // try_send so that a recovered (drained) channel resets the counter
-            // via the Ok(()) arm. Skipping the send permanently blackholes the
-            // target for the lifetime of the connection even after recovery.
-            let at_strike_limit = backpressure_strikes
-                .get(&target_id)
-                .is_some_and(|s| *s >= MAX_BACKPRESSURE_STRIKES);
+            // We always probe try_send so a recovered (drained) channel can
+            // drip the leaky-bucket counter back down via the Ok(()) arm.
+            // Skipping the send permanently blackholes the target for the
+            // lifetime of the connection even after recovery.
 
             // Look up the target by `(room, target_id)` so cross-room
             // forwarding is impossible by construction: a peer in room A
@@ -769,31 +804,49 @@ async fn handle_socket(
             if let Some(entry) = state_write.peers.get(&target_key) {
                 match entry.value().tx.try_send(forwarded) {
                     Ok(()) => {
-                        // Successful send — reset strike counter for this target.
-                        backpressure_strikes.remove(&target_id);
+                        // Successful send — drip the leaky bucket by one strike
+                        // (instead of resetting to zero, which would let an
+                        // attacker oscillate around the channel boundary to
+                        // re-trigger logging on every cycle). Disarm the
+                        // silencer only when the counter has fully drained.
+                        if let Some(state) = backpressure_strikes.get_mut(&target_id) {
+                            state.strikes = state.strikes.saturating_sub(1);
+                            if state.strikes == SILENCER_REARM_THRESHOLD {
+                                backpressure_strikes.remove(&target_id);
+                            }
+                        }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        if !at_strike_limit {
-                            let strikes =
-                                backpressure_strikes.entry(target_id.clone()).or_insert(0);
-                            *strikes += 1;
+                        let state = backpressure_strikes.entry(target_id.clone()).or_default();
+                        let was_clean = state.strikes == 0;
+                        // Cap the strike count so a sustained flood doesn't
+                        // accumulate an unbounded number of successful drips
+                        // before the silencer can disarm.
+                        state.strikes = state
+                            .strikes
+                            .saturating_add(1)
+                            .min(MAX_BACKPRESSURE_STRIKE_CAP);
+                        // Emit at most two log lines per silencer arm cycle:
+                        // one on the very first strike (to surface the issue)
+                        // and one when the silencer arms. Per-strike logs were
+                        // removed because they let an attacker amplify a single
+                        // attack burst into MAX_BACKPRESSURE_STRIKES log writes.
+                        if was_clean && !state.silenced {
                             tracing::warn!(
                                 target = %target_id,
                                 sender = %session_id,
-                                strikes = *strikes,
                                 "relay channel full for target, dropping signal (backpressure)"
                             );
-                            if *strikes >= MAX_BACKPRESSURE_STRIKES {
-                                tracing::warn!(
-                                    target = %target_id,
-                                    sender = %session_id,
-                                    "target hit {MAX_BACKPRESSURE_STRIKES} backpressure \
-                                     strikes; silencing logs until channel drains"
-                                );
-                            }
                         }
-                        // If already at limit, drop silently — the send was
-                        // still attempted above so Ok(()) can still fire.
+                        if !state.silenced && state.strikes >= MAX_BACKPRESSURE_STRIKES {
+                            state.silenced = true;
+                            tracing::warn!(
+                                target = %target_id,
+                                sender = %session_id,
+                                "target hit {MAX_BACKPRESSURE_STRIKES} backpressure \
+                                 strikes; silencing logs until channel drains"
+                            );
+                        }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         // Target peer disconnected but hasn't been cleaned

@@ -43,11 +43,29 @@ pub struct NetworkReceived<T: Serialize + DeserializeOwned + Send + Sync + 'stat
 /// floods the WebRTC data channel faster than the application drains it.
 const MAX_NETWORK_QUEUE_LEN: usize = 4096;
 
-/// Maximum total estimated byte size of all messages in the queue (64 MiB).
+/// Maximum total estimated byte size of all messages in the queue (16 MiB).
 /// This complements the count-based [`MAX_NETWORK_QUEUE_LEN`] limit to prevent
 /// a scenario where an attacker sends a small number of maximum-sized (1 MiB)
 /// messages that individually pass the count check but collectively exhaust RAM.
-const MAX_NETWORK_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+///
+/// # Wire vs heap accounting
+///
+/// `packet_size` is the length of the *raw bincode byte slice* off the wire,
+/// not the heap footprint of the deserialised `T`. For tightly-packed structs
+/// these are very close (bincode skips Rust struct padding and uses varints
+/// where applicable), but a `T` that decompresses into many separate heap
+/// allocations — large `Vec<Vec<…>>`, `String`-heavy enums, sparse structs
+/// with `Vec` capacity slack, etc. — can have a real RAM footprint that is
+/// 1.5–2× the wire footprint.
+///
+/// The 16 MiB cap is therefore deliberately set well below the actual RAM
+/// ceiling we are willing to spend, leaving headroom for that amplification
+/// factor and for the per-message `NetworkReceived<T>` wrapper overhead.
+/// Application authors that build very heap-amplified message types should
+/// keep the per-message wire size compact (or shrink the type) so that the
+/// wire-budget stays a meaningful proxy for the heap budget; the count limit
+/// in [`MAX_NETWORK_QUEUE_LEN`] still bounds the worst-case in either dimension.
+const MAX_NETWORK_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Bounded queue for incoming network messages.
 ///
@@ -57,9 +75,10 @@ const MAX_NETWORK_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// framerate. The host application must drain the queue manually.
 ///
 /// The queue is bounded by both a count limit ([`MAX_NETWORK_QUEUE_LEN`] = 4,096
-/// entries) and a total byte budget ([`MAX_NETWORK_QUEUE_BYTES`] = 64 MiB). When
-/// either limit is reached, new messages are dropped and a warning is logged,
-/// preventing an out-of-memory condition from a malicious flood.
+/// entries) and a total byte budget ([`MAX_NETWORK_QUEUE_BYTES`] = 16 MiB of
+/// raw wire bytes). When either limit is reached, new messages are dropped and
+/// a warning is logged, preventing an out-of-memory condition from a malicious
+/// flood. See [`MAX_NETWORK_QUEUE_BYTES`] for the wire-vs-heap caveats.
 ///
 /// # Example
 ///

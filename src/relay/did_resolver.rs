@@ -31,10 +31,11 @@
 //!   a connection pool and spawns background workers, so the lower cap prevents
 //!   resource exhaustion from an attacker feeding unique `did:web` domains.
 
+use base64::Engine;
 use dashmap::DashMap;
 use jsonwebtoken::DecodingKey;
 use moka::sync::Cache;
-use p256::pkcs8::{EncodePublicKey, LineEnding};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serde::Deserialize;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -891,16 +892,35 @@ fn extract_signing_key(doc: &DidDocument) -> Result<ResolvedKey, String> {
 }
 
 /// Decode a compressed P-256 public key into a [`ResolvedKey`] for ES256.
+///
+/// `jsonwebtoken` 9.x intentionally hides the `DecodingKeyKind::SecretOrDer`
+/// constructor for ECDSA keys, so the only zero-allocation routes are
+/// `from_ec_pem` (PKCS#8 SPKI) and `from_ec_components` (URL-safe base64
+/// `(x, y)` JWK coordinates). PEM forces a full ASN.1 round-trip on every
+/// DID resolution; the JWK-component path only walks a fixed-size base64
+/// pair, so we use it instead.
 fn decode_p256_key(compressed: &[u8]) -> Result<ResolvedKey, String> {
     let public_key = p256::PublicKey::from_sec1_bytes(compressed)
         .map_err(|e| format!("invalid P-256 public key: {e}"))?;
 
-    let pem = public_key
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| format!("P-256 PEM encoding failed: {e}"))?;
+    // Decompress the curve point to its uncompressed (x, y) form. The
+    // `false` flag selects the SEC1 uncompressed encoding (`0x04 || x || y`).
+    let encoded = public_key.to_encoded_point(false);
+    let x_bytes = encoded
+        .x()
+        .ok_or("P-256 public key missing x coordinate after decompression")?;
+    let y_bytes = encoded
+        .y()
+        .ok_or("P-256 public key missing y coordinate after decompression")?;
 
-    let key = DecodingKey::from_ec_pem(pem.as_bytes())
-        .map_err(|e| format!("failed to create DecodingKey from P-256 PEM: {e}"))?;
+    // `from_ec_components` expects URL-safe base64 (no padding) — the same
+    // encoding used by JWK. We hand it back the very bytes it would have
+    // recovered from a PEM/DER round-trip, skipping ASN.1 parsing entirely.
+    let x_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x_bytes);
+    let y_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(y_bytes);
+
+    let key = DecodingKey::from_ec_components(&x_b64, &y_b64)
+        .map_err(|e| format!("failed to create DecodingKey from P-256 components: {e}"))?;
 
     Ok(ResolvedKey::P256(key))
 }

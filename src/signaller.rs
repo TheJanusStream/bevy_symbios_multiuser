@@ -236,7 +236,41 @@ impl SymbiosSignallerBuilder {
             .as_ref()
             .and_then(|s| s.read().unwrap_or_else(|e| e.into_inner()).clone())
     }
+
+    /// Stable, non-cryptographic 64-bit fingerprint of the current token used
+    /// only by the WASM retry loop to detect "same token failed again". A hash
+    /// is used so the token bytes themselves never sit in retained memory
+    /// across reconnect attempts; the absence of a token hashes to a fixed
+    /// value distinct from any real token.
+    #[cfg(target_arch = "wasm32")]
+    fn current_token_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.current_token().hash(&mut h);
+        h.finish()
+    }
 }
+
+/// Maximum number of consecutive WASM connection failures with the same auth
+/// token before [`new_signaller`](SymbiosSignallerBuilder::new_signaller)
+/// gives up.
+///
+/// On native targets, `try_connect` can read the HTTP status code from the
+/// failed upgrade and immediately bail on 4xx (see [`is_http_client_error`]).
+/// The browser `WebSocket` API deliberately hides HTTP status codes from
+/// failed handshakes, so on WASM a 401 Unauthorized is indistinguishable from
+/// a TCP reset, and an unbounded retry loop with an expired or invalid JWT
+/// would burn client battery and relay bandwidth indefinitely.
+///
+/// As a substitute, the WASM path tracks the fingerprint of the token used
+/// for each failed attempt. If the *same* token fails this many times in a
+/// row the loop bails out, on the assumption that the relay is rejecting
+/// the credential rather than dropping packets. A token rotation between
+/// failed attempts (e.g. the host application called `get_service_auth`
+/// again and swapped the [`TokenSource`]) resets the counter, so legitimate
+/// refresh-and-retry flows are not penalised.
+#[cfg(target_arch = "wasm32")]
+const WASM_MAX_BLIND_RETRIES: u32 = 5;
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -246,6 +280,18 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
         mut attempts: Option<u16>,
         room_url: String,
     ) -> Result<Box<dyn Signaller>, SignalingError> {
+        // WASM-only state for the blind-retry guard. The browser WebSocket
+        // API hides HTTP status codes from failed handshakes, so we cannot
+        // fast-fail on a 401 the way the native path does. Instead, we
+        // count consecutive failures that occurred under the *same* token
+        // fingerprint and bail once that count crosses [`WASM_MAX_BLIND_RETRIES`].
+        // A token rotation between failures resets the counter so legitimate
+        // refresh-and-retry flows are not penalised.
+        #[cfg(target_arch = "wasm32")]
+        let mut wasm_blind_failures: u32 = 0;
+        #[cfg(target_arch = "wasm32")]
+        let mut wasm_last_failed_token: Option<u64> = None;
+
         let signaller = 'connect: loop {
             let ws = match self.try_connect(&room_url).await {
                 Ok(stream) => stream,
@@ -254,6 +300,30 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                     // Invalid JWT). Retrying won't help — surface them immediately.
                     if is_http_client_error(&e) {
                         return Err(e);
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let token_fp = self.current_token_fingerprint();
+                        if wasm_last_failed_token == Some(token_fp) {
+                            wasm_blind_failures = wasm_blind_failures.saturating_add(1);
+                        } else {
+                            wasm_blind_failures = 1;
+                            wasm_last_failed_token = Some(token_fp);
+                        }
+                        if wasm_blind_failures >= WASM_MAX_BLIND_RETRIES {
+                            tracing::error!(
+                                attempts = wasm_blind_failures,
+                                "WASM relay connection failed {WASM_MAX_BLIND_RETRIES} times in \
+                                 a row with the same token; aborting (browser WebSocket API \
+                                 hides HTTP status codes, so we cannot tell auth failures \
+                                 apart from network errors — refresh the auth token to retry)"
+                            );
+                            return Err(SignalingError::UserImplementationError(
+                                "wasm_blind_retry_exhausted: relay rejected the same token \
+                                 repeatedly; refresh the auth token before reconnecting"
+                                    .to_string(),
+                            ));
+                        }
                     }
                     if let Some(ref mut remaining) = attempts {
                         if *remaining <= 1 {
