@@ -591,7 +591,7 @@ impl SymbiosSignaller {
         {
             return self.local_peer_id;
         }
-        let pid = PeerId(Uuid::new_v4());
+        let pid = session_id_to_peer_id(session_id);
         self.track_session(session_id.to_owned(), pid);
         pid
     }
