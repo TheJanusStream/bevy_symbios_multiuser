@@ -580,18 +580,7 @@ impl SymbiosSignaller {
         if let Some(&pid) = self.session_to_peer.get(session_id) {
             return pid;
         }
-        // Guard: if the relay reflects the local peer's session ID (possible
-        // with a non-Symbios-compliant Matchbox relay that doesn't block
-        // self-targeting), return the known local PeerId rather than minting
-        // a phantom random one that would never correlate with local state.
-        if self
-            .peer_to_session
-            .get(&self.local_peer_id)
-            .is_some_and(|s| s == session_id)
-        {
-            return self.local_peer_id;
-        }
-        let pid = session_id_to_peer_id(session_id);
+        let pid = PeerId(Uuid::new_v4());
         self.track_session(session_id.to_owned(), pid);
         pid
     }
