@@ -572,15 +572,15 @@ impl SymbiosSignaller {
 
     /// Look up or create a `PeerId` for the given session ID string.
     ///
-    /// A fresh random UUID is assigned to each new mapping so that reconnecting
-    /// peers (same session ID after `PeerLeft`) receive a distinct `PeerId`.
-    /// This prevents matchbox's per-peer WebRTC state machine from confusing a
-    /// new connection attempt with the stale state left by the previous one.
+    /// Uses a deterministic UUID so that both sides independently compute
+    /// the exact same `PeerId` for each other. Matchbox relies on symmetric
+    /// `PeerId`s to deterministically select the offerer; a random UUID would
+    /// cause a 50% connection failure rate (glare).
     fn get_or_create_peer_id(&mut self, session_id: &str) -> PeerId {
         if let Some(&pid) = self.session_to_peer.get(session_id) {
             return pid;
         }
-        let pid = PeerId(Uuid::new_v4());
+        let pid = session_id_to_peer_id(session_id);
         self.track_session(session_id.to_owned(), pid);
         pid
     }
