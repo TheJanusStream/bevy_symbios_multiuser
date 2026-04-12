@@ -673,7 +673,11 @@ struct BskyProfile {
 }
 
 async fn fetch_avatar_bytes(did: String) -> Option<Vec<u8>> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
 
     // 1. Ask the public ATProto network for their profile
     let profile_url = format!(

@@ -80,6 +80,15 @@ const MAX_BACKPRESSURE_STRIKE_CAP: usize = MAX_BACKPRESSURE_STRIKES * 2;
 /// [`MAX_BACKPRESSURE_STRIKES`] that triggers fresh logging on every dip.
 const SILENCER_REARM_THRESHOLD: usize = 0;
 
+/// Minimum time between successive "channel full" warnings for the same
+/// target. Entries in the backpressure map are retained for at least this
+/// long after the strike counter drains to zero, preventing an attacker from
+/// bypassing the silencer by draining a single message (strikes = 1 → 0 →
+/// entry removed → fresh entry → `was_clean` → log). With this hysteresis,
+/// the worst case is one warning per target per cooldown window regardless
+/// of how the attacker times the flood.
+const BACKPRESSURE_LOG_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Maximum time a WebSocket connection may be idle (no messages received)
 /// before the server disconnects it. Prevents Slowloris-style attacks where
 /// an attacker opens `max_peers` connections and sends nothing, holding
@@ -619,6 +628,7 @@ async fn handle_socket(
         struct BackpressureState {
             strikes: usize,
             silenced: bool,
+            last_warning_at: Option<tokio::time::Instant>,
         }
         let mut backpressure_strikes: std::collections::HashMap<String, BackpressureState> =
             std::collections::HashMap::new();
@@ -865,39 +875,39 @@ async fn handle_socket(
             if let Some(entry) = state_write.peers.get(&target_key) {
                 match entry.value().tx.try_send(forwarded) {
                     Ok(()) => {
-                        // Successful send — drip the leaky bucket by one strike
-                        // (instead of resetting to zero, which would let an
-                        // attacker oscillate around the channel boundary to
-                        // re-trigger logging on every cycle). Disarm the
-                        // silencer only when the counter has fully drained.
                         if let Some(state) = backpressure_strikes.get_mut(&target_id) {
                             state.strikes = state.strikes.saturating_sub(1);
                             if state.strikes == SILENCER_REARM_THRESHOLD {
-                                backpressure_strikes.remove(&target_id);
+                                let cooldown_expired = state
+                                    .last_warning_at
+                                    .map(|t| {
+                                        now.saturating_duration_since(t)
+                                            >= BACKPRESSURE_LOG_COOLDOWN
+                                    })
+                                    .unwrap_or(true);
+                                if cooldown_expired {
+                                    backpressure_strikes.remove(&target_id);
+                                }
                             }
                         }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         let state = backpressure_strikes.entry(target_id.clone()).or_default();
-                        let was_clean = state.strikes == 0;
-                        // Cap the strike count so a sustained flood doesn't
-                        // accumulate an unbounded number of successful drips
-                        // before the silencer can disarm.
                         state.strikes = state
                             .strikes
                             .saturating_add(1)
                             .min(MAX_BACKPRESSURE_STRIKE_CAP);
-                        // Emit at most two log lines per silencer arm cycle:
-                        // one on the very first strike (to surface the issue)
-                        // and one when the silencer arms. Per-strike logs were
-                        // removed because they let an attacker amplify a single
-                        // attack burst into MAX_BACKPRESSURE_STRIKES log writes.
-                        if was_clean && !state.silenced {
+                        let cooldown_elapsed = state
+                            .last_warning_at
+                            .map(|t| now.saturating_duration_since(t) >= BACKPRESSURE_LOG_COOLDOWN)
+                            .unwrap_or(true);
+                        if cooldown_elapsed && !state.silenced {
                             tracing::warn!(
                                 target = %target_id,
                                 sender = %session_id,
                                 "relay channel full for target, dropping signal (backpressure)"
                             );
+                            state.last_warning_at = Some(now);
                         }
                         if !state.silenced && state.strikes >= MAX_BACKPRESSURE_STRIKES {
                             state.silenced = true;

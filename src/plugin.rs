@@ -5,6 +5,7 @@ use bevy_matchbox::prelude::*;
 use matchbox_socket::RtcIceServerConfig;
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
+use std::time::Duration;
 
 /// Configuration for the symbios multiuser plugin.
 ///
@@ -40,6 +41,43 @@ struct SocketOpened<T> {
     ice: Option<RtcIceServerConfig>,
     _marker: PhantomData<T>,
 }
+
+/// Exponential backoff state for socket respawn after a dead-message-loop
+/// teardown. Without this, `open_socket` would spawn a fresh `WebRtcSocket`
+/// on the very next frame every time the background task dies — including
+/// permanent rejections like HTTP 401, which the signaller fast-fails on
+/// before `futures_timer::Delay` can throttle anything. At 60+ FPS that
+/// floods the relay with Upgrade requests until the user kills the client.
+///
+/// The cooldown is only inserted on the dead-socket teardown path; intentional
+/// config-change teardowns clear it so the user can reconfigure and reconnect
+/// immediately. Delay starts at [`INITIAL_RECONNECT_DELAY`] and doubles on
+/// each subsequent dead-socket teardown up to [`MAX_RECONNECT_DELAY`].
+#[cfg(feature = "client")]
+#[derive(Resource)]
+struct ReconnectCooldown<T> {
+    /// `Time::elapsed()` value before which no new socket may be opened.
+    /// Stored as a duration-from-startup rather than `Instant` so the resource
+    /// works identically on native and wasm without pulling in `web_time`.
+    next_allowed_at: Duration,
+    /// Delay to apply on the next dead-socket teardown. Doubles on each
+    /// consecutive failure, capped at [`MAX_RECONNECT_DELAY`].
+    next_delay: Duration,
+    _marker: PhantomData<T>,
+}
+
+/// Initial cooldown between the first dead-socket teardown and the next
+/// respawn attempt. Chosen to match the in-signaller retry delay so the
+/// retry cadence is consistent between ECS-level respawns and builder-level
+/// reconnects.
+#[cfg(feature = "client")]
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Cap on the exponential backoff delay. Beyond this point further failures
+/// do not slow the retry rate any more, but still bound the respawn rate at
+/// one attempt per minute.
+#[cfg(feature = "client")]
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
 /// Return `true` if the live [`RtcIceServerConfig`] matches the one recorded
 /// in the [`SocketOpened`] marker. Compares field-by-field by reference to
@@ -182,11 +220,14 @@ where
 }
 
 #[cfg(feature = "client")]
+#[allow(clippy::too_many_arguments)]
 fn open_socket<T: Send + Sync + 'static>(
     mut commands: Commands,
+    time: Res<Time>,
     config: Option<Res<SymbiosMultiuserConfig<T>>>,
     opened: Option<Res<SocketOpened<T>>>,
     socket: Option<Res<MatchboxSocket>>,
+    cooldown: Option<Res<ReconnectCooldown<T>>>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
     #[cfg(feature = "client")] session_map: Res<crate::signaller::PeerSessionMapRes>,
 ) {
@@ -206,6 +247,12 @@ fn open_socket<T: Send + Sync + 'static>(
             commands.remove_resource::<SocketOpened<T>>();
             if socket.is_some() {
                 commands.remove_resource::<MatchboxSocket>();
+            }
+            // Intentional reconfigure — clear the reconnect backoff so the
+            // user's new config takes effect on the very next frame without
+            // waiting out a stale cooldown from a previous failure.
+            if cooldown.is_some() {
+                commands.remove_resource::<ReconnectCooldown<T>>();
             }
             // Return early — the new socket (if any) will be opened next frame
             // after the deferred commands are applied.
@@ -245,12 +292,37 @@ fn open_socket<T: Send + Sync + 'static>(
                 );
             }
             commands.remove_resource::<SocketOpened<T>>();
+            // Arm the reconnect cooldown so the fresh-open path below does
+            // not respawn until the backoff window elapses. Without this,
+            // a permanent rejection (HTTP 401) causes `open_socket` to spin
+            // at framerate: signaller fast-fails → message loop dies →
+            // channels close → teardown here → next frame respawns → loop.
+            let current_delay = cooldown
+                .as_ref()
+                .map(|cd| cd.next_delay)
+                .unwrap_or(INITIAL_RECONNECT_DELAY);
+            let next_allowed_at = time.elapsed() + current_delay;
+            let next_delay = (current_delay * 2).min(MAX_RECONNECT_DELAY);
+            commands.insert_resource(ReconnectCooldown::<T> {
+                next_allowed_at,
+                next_delay,
+                _marker: PhantomData,
+            });
         }
         return;
     }
     let Some(config) = config else {
         return;
     };
+
+    // Respect the exponential backoff cooldown set by the dead-socket
+    // teardown branch above. Prevents ECS-level respawn storms when the
+    // relay is permanently rejecting the current credential.
+    if let Some(cd) = cooldown.as_ref()
+        && time.elapsed() < cd.next_allowed_at
+    {
+        return;
+    }
 
     let mut builder = WebRtcSocketBuilder::new(&config.room_url)
         .add_channel(ChannelConfig::reliable())
