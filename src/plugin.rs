@@ -280,6 +280,11 @@ fn open_socket<T: Send + Sync + 'static>(
         //    healthy steady-state operation.
         // 3. Neither (1) nor (2) — socket is healthy, leave everything alone.
         let socket_dead = socket.as_ref().is_some_and(|s| s.any_channel_closed());
+        tracing::trace!(
+            socket_present = socket.is_some(),
+            socket_dead,
+            "open_socket health check",
+        );
         if socket.is_none() || socket_dead {
             if socket_dead {
                 tracing::info!(
@@ -324,11 +329,18 @@ fn open_socket<T: Send + Sync + 'static>(
         return;
     }
 
+    tracing::debug!(
+        room_url = %config.room_url,
+        has_ice_servers = config.ice_servers.is_some(),
+        "opening WebRTC socket",
+    );
+
     let mut builder = WebRtcSocketBuilder::new(&config.room_url)
         .add_channel(ChannelConfig::reliable())
         .add_channel(ChannelConfig::unreliable());
 
     if let Some(ref ice) = config.ice_servers {
+        tracing::debug!(?ice, "configuring ICE servers");
         builder = builder.ice_server(ice.clone());
     }
 

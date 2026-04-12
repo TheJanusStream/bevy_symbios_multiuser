@@ -13,6 +13,16 @@ fn main() {
     {
         use bevy_symbios_multiuser::relay::{RelayConfig, run_relay};
 
+        // Initialise tracing so `tracing::info!` / `debug!` etc. are written
+        // to stderr (picked up by journald when running as a systemd service).
+        // Log level is controlled by the RUST_LOG env var; defaults to `info`.
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
             let config = RelayConfig {
@@ -22,9 +32,9 @@ fn main() {
                 service_did: None,
             };
 
-            println!("Starting relay server on {}", config.bind_addr);
+            tracing::info!("Starting relay server on {}", config.bind_addr);
             if let Err(e) = run_relay(config).await {
-                eprintln!("Relay server error: {e}");
+                tracing::error!("Relay server error: {e}");
             }
         });
     }

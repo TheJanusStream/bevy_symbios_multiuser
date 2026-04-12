@@ -574,6 +574,11 @@ impl SymbiosSignaller {
     fn get_or_create_peer_id(&mut self, session_id: &str) -> PeerId {
         // If we already know this exact session string (from the current connection instance), reuse it.
         if let Some(&pid) = self.session_to_peer.get(session_id) {
+            tracing::debug!(
+                session = %session_id,
+                peer = %pid,
+                "peer ID lookup: reusing existing mapping",
+            );
             return pid;
         }
 
@@ -581,6 +586,12 @@ impl SymbiosSignaller {
         // This entirely sidesteps the WebRTC glare on rapid reconnects because Matchbox
         // will see the reconnecting peer as a completely new, distinct `PeerId`.
         let pid = PeerId(uuid::Uuid::new_v4());
+        tracing::debug!(
+            session = %session_id,
+            peer = %pid,
+            known_peers = self.session_to_peer.len(),
+            "peer ID lookup: minted new PeerId (first time seeing this session)",
+        );
 
         self.track_session(session_id.to_owned(), pid);
         pid
@@ -682,6 +693,19 @@ impl Signaller for SymbiosSignaller {
                     }
                 };
 
+                let signal_kind = match &data {
+                    PeerSignal::Offer(_) => "Offer",
+                    PeerSignal::Answer(_) => "Answer",
+                    PeerSignal::IceCandidate(_) => "IceCandidate",
+                };
+                tracing::debug!(
+                    local = %self.local_peer_id,
+                    %receiver,
+                    target = %target_session,
+                    signal = signal_kind,
+                    "signaller TX",
+                );
+
                 let signal = match data {
                     PeerSignal::Offer(sdp) => SignalPayload::Offer(sdp),
                     PeerSignal::Answer(sdp) => SignalPayload::Answer(sdp),
@@ -714,9 +738,29 @@ impl Signaller for SymbiosSignaller {
             if let Ok(envelope) = serde_json::from_str::<SignalEnvelope>(&text) {
                 let sender_id = &envelope.peer_id;
 
+                let signal_kind = match &envelope.signal {
+                    SignalPayload::Offer(_) => "Offer",
+                    SignalPayload::Answer(_) => "Answer",
+                    SignalPayload::IceCandidate(_) => "IceCandidate",
+                    SignalPayload::PeerJoined(_) => "PeerJoined",
+                    SignalPayload::PeerLeft(_) => "PeerLeft",
+                };
+                tracing::debug!(
+                    local = %self.local_peer_id,
+                    sender_session = %sender_id,
+                    signal = signal_kind,
+                    "signaller RX",
+                );
+
                 return match envelope.signal {
                     SignalPayload::Offer(sdp) => {
                         let pid = self.get_or_create_peer_id(sender_id);
+                        tracing::debug!(
+                            local = %self.local_peer_id,
+                            sender_session = %sender_id,
+                            mapped_peer = %pid,
+                            "RX Offer → forwarding to matchbox as PeerSignal::Offer",
+                        );
                         Ok(PeerEvent::Signal {
                             sender: pid,
                             data: PeerSignal::Offer(sdp),
@@ -724,6 +768,12 @@ impl Signaller for SymbiosSignaller {
                     }
                     SignalPayload::Answer(sdp) => {
                         let pid = self.get_or_create_peer_id(sender_id);
+                        tracing::debug!(
+                            local = %self.local_peer_id,
+                            sender_session = %sender_id,
+                            mapped_peer = %pid,
+                            "RX Answer → forwarding to matchbox as PeerSignal::Answer",
+                        );
                         Ok(PeerEvent::Signal {
                             sender: pid,
                             data: PeerSignal::Answer(sdp),
@@ -737,15 +787,37 @@ impl Signaller for SymbiosSignaller {
                         })
                     }
                     SignalPayload::PeerJoined(ref id) => {
-                        // Matchbox tracks remote peers via `NewPeer` events; if we
-                        // swallow this, an incoming SDP offer from the new peer will
-                        // be dropped as "signal for unknown peer" and the mesh will
-                        // fail to negotiate.
+                        // Register the session→PeerId mapping so subsequent
+                        // signals from this peer resolve correctly, but do NOT
+                        // emit `NewPeer`.  Matchbox treats `NewPeer` as "you
+                        // are the Offerer" and immediately creates an SDP offer.
+                        // The joining peer already received us in its peer_list
+                        // and will send its own Offer; emitting `NewPeer` here
+                        // would make both sides offer simultaneously (WebRTC
+                        // "glare"), which matchbox does not recover from.
+                        //
+                        // When the joiner's Offer arrives as a `PeerEvent::Signal`
+                        // from an unknown PeerId, matchbox lazily creates the
+                        // peer via `accept_handshake` (the `or_insert_with` path
+                        // in `message_loop`).
                         let pid = self.get_or_create_peer_id(id);
-                        Ok(PeerEvent::NewPeer(pid))
+                        tracing::debug!(
+                            local = %self.local_peer_id,
+                            joined_session = %id,
+                            mapped_peer = %pid,
+                            "RX PeerJoined → registered mapping (not emitting NewPeer \
+                             to avoid offer glare; will accept incoming Offer lazily)",
+                        );
+                        continue;
                     }
                     SignalPayload::PeerLeft(ref id) => {
                         let pid = self.remove_peer(id);
+                        tracing::debug!(
+                            local = %self.local_peer_id,
+                            left_session = %id,
+                            mapped_peer = %pid,
+                            "RX PeerLeft → emitting PeerLeft",
+                        );
                         Ok(PeerEvent::PeerLeft(pid))
                     }
                 };

@@ -536,6 +536,13 @@ async fn handle_socket(
         .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
         .map(|entry| entry.key().1.clone())
         .collect();
+    tracing::debug!(
+        session = %session_id,
+        room = %room,
+        peer_count = existing_peers.len(),
+        peers = ?existing_peers,
+        "sending peer_list to new peer",
+    );
     let peer_list = serde_json::json!({ "type": "peer_list", "peers": existing_peers });
     if !matches!(
         tokio::time::timeout(
@@ -559,6 +566,12 @@ async fn handle_socket(
         .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
         .map(|entry| entry.value().tx.clone())
         .collect();
+    tracing::debug!(
+        session = %session_id,
+        room = %room,
+        notify_count = peer_senders.len(),
+        "broadcasting PeerJoined to room",
+    );
     for sender in peer_senders {
         let envelope = SignalEnvelope {
             peer_id: session_id.clone(),
@@ -857,6 +870,21 @@ async fn handle_socket(
                 continue;
             }
             *target_count += 1;
+
+            let signal_kind = match &envelope.signal {
+                SignalPayload::Offer(_) => "Offer",
+                SignalPayload::Answer(_) => "Answer",
+                SignalPayload::IceCandidate(_) => "IceCandidate",
+                SignalPayload::PeerJoined(_) => "PeerJoined",
+                SignalPayload::PeerLeft(_) => "PeerLeft",
+            };
+            tracing::debug!(
+                sender = %session_id,
+                target = %target_id,
+                room = %room,
+                signal = signal_kind,
+                "relay forwarding signal",
+            );
 
             let forwarded = SignalEnvelope {
                 peer_id: session_id.clone(),

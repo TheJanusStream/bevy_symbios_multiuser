@@ -33,6 +33,7 @@ pub fn poll_peers<T: Send + Sync + 'static>(
     mut peer_queue: ResMut<PeerStateQueue<T>>,
 ) {
     let Ok(changes) = socket.try_update_peers() else {
+        tracing::debug!("try_update_peers returned Err (socket channel closed)");
         return;
     };
 
