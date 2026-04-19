@@ -80,10 +80,7 @@ impl AtprotoSession {
 /// # Arguments
 ///
 /// - `aud` — The DID of the target service (e.g. `"did:web:relay.example.com"`).
-pub async fn get_service_auth(
-    session: &AtprotoSession,
-    aud: &str,
-) -> Result<String, SymbiosError> {
+pub async fn get_service_auth(session: &AtprotoSession, aud: &str) -> Result<String, SymbiosError> {
     let url = format!(
         "{}?aud={}",
         session.xrpc_url("com.atproto.server.getServiceAuth"),
