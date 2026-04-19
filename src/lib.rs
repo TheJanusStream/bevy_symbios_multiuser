@@ -14,15 +14,25 @@
 //!
 //! Authentication flows through a **Sovereign Broker** pattern:
 //!
-//! 1. The client authenticates with an ATProto PDS via OAuth 2.0 + DPoP
-//!    (using `proto_blue_oauth`), producing an [`auth::AtprotoSession`]. For
-//!    relay authentication with `auth_required = true`, the client must then
-//!    call [`auth::get_service_auth`] to obtain a *service auth token* — a
+//! 1. The host application drives an OAuth 2.0 + DPoP authorization-code
+//!    exchange (via [`proto_blue_oauth`]), yielding an
+//!    [`proto_blue_oauth::OAuthSession`]. The host wraps that session in an
+//!    [`auth::AtprotoSession`] alongside the resolved DID, handle, and PDS
+//!    base URL. This crate does **not** ship login UI or credentials helpers;
+//!    the legacy App-Password flow (`create_session` / `AtprotoCredentials`)
+//!    was removed in 0.3.
+//!
+//!    For relay authentication with `auth_required = true`, the client then
+//!    calls [`auth::get_service_auth`] to obtain a *service auth token* — a
 //!    JWT signed by the user's `#atproto` key that third-party relays can
 //!    verify via DID document resolution. The OAuth access token is
-//!    DPoP-bound and cannot be handed off. Wrap the service token in a
-//!    [`signaller::TokenSourceRes`] resource so the signaller uses it on
-//!    each connection attempt.
+//!    DPoP-bound to a private key held only by the client and cannot be
+//!    handed off to the relay. Wrap the service token in a
+//!    [`signaller::TokenSourceRes`] resource; the plugin reads the current
+//!    token from this resource on every (re)connect attempt. Inserting an
+//!    [`auth::AtprotoSession`] resource is optional and is only needed if
+//!    the application wants the user's identity available to its own
+//!    systems — the plugin itself never reads it.
 //! 2. The [`signaller::SymbiosSignallerBuilder`] passes this token to the
 //!    relay during the WebSocket handshake. On native targets, the token is
 //!    sent as an `Authorization: Bearer` header. On WASM targets, the token

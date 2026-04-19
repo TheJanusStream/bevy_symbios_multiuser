@@ -13,12 +13,12 @@ The architecture follows a **Sovereign Broker** pattern: clients authenticate wi
 
 - **Generic Message Bus** — Define your own domain-specific protocol type `T: Serialize + Deserialize`, and the plugin handles serialization (via `bincode`) and transport.
 - **Dual Channels** — Reliable (ordered, guaranteed) for state mutations and Unreliable (best-effort) for ephemeral presence data.
-- **ATProto Authentication** — Federated identity via `com.atproto.server.createSession` for Bluesky/ATProto-based auth. The JWT is passed to the relay via the `Authorization` header (native) or `Sec-WebSocket-Protocol` subprotocol trick (WASM).
+- **ATProto Authentication** — Federated identity via OAuth 2.0 + DPoP (using [`proto-blue-oauth`](https://crates.io/crates/proto-blue-oauth)). The host app drives the authorization-code exchange to produce an [`auth::AtprotoSession`] and then calls [`auth::get_service_auth`] to mint a relay-bound service auth token. The token is passed to the relay via the `Authorization` header (native) or `Sec-WebSocket-Protocol` subprotocol trick (WASM).
 - **Sovereign Broker Relay** — Optional signaling server (Axum + Tokio) with ATProto JWT verification, room-based peer isolation, and defense-in-depth hardening. When `auth_required` is enabled, the relay resolves the signer's DID document (via `plc.directory` for `did:plc`, or HTTPS for `did:web` — domain-only DIDs use `/.well-known/did.json`, path-based DIDs use `/{path}/did.json`), extracts the `#atproto` signing key (P-256/ES256 or secp256k1/ES256K), and cryptographically verifies the JWT signature. The URL path determines the room — peers in different rooms are fully isolated and cannot exchange signals. See [Relay Hardening](#relay-hardening) for the full security inventory.
 - **Custom Signaller** — A `matchbox_socket::Signaller` implementation (`SymbiosSignallerBuilder`) that bridges between the matchbox protocol and the relay's wire format, injecting the JWT during WebSocket upgrade. Supports a refreshable `TokenSource` (`signaller_with_token_source`) for long-lived applications where service auth tokens expire between reconnects, and anonymous mode (`signaller_anonymous`) for unauthenticated connections. The `TokenSource` must wrap a service auth token from `get_service_auth`, not `access_jwt` — the latter is signed by the PDS service key and cannot be verified by a third-party relay that resolves DID documents.
 - **Cross-Platform** — Runs on native targets (via `async-tungstenite`) and in the browser (via `ws_stream_wasm` on WASM).
 - **Bevy-Native** — Outbound messages use Bevy's `MessageWriter<Broadcast<T>>`. Inbound messages are delivered via `NetworkQueue<T>` and `PeerStateQueue<T>` resources, which are safe to drain from any schedule (`Update`, `FixedUpdate`, etc.) without risk of silent message loss. The queues are bounded (4,096 messages and 16 MiB total wire-byte budget for `NetworkQueue`) to prevent memory exhaustion from a malicious flood — excess messages are dropped with a warning. The byte cap measures raw bincode bytes off the wire, not the deserialised heap footprint of `T`, so it is set well below the actual RAM ceiling to leave headroom for types whose heap layout is larger than their wire layout.
-- **Single Plugin Per App** — Only one `SymbiosMultiuserPlugin<T>` instance should be added per Bevy app. `SymbiosMultiuserConfig<T>`, `NetworkQueue<T>`, and `PeerStateQueue<T>` are generic over `T`, but the underlying `MatchboxSocket` resource is not — adding two plugin instances would cause them to share and overwrite the same socket, resulting in message theft and connection instability.
+- **Single Plugin Per App** — Only one `SymbiosMultiuserPlugin<T>` instance may be added per Bevy app. `SymbiosMultiuserConfig<T>`, `NetworkQueue<T>`, and `PeerStateQueue<T>` are generic over `T`, but the underlying `MatchboxSocket` resource is not, so a second instance (even with a different `T`) would share and corrupt the same socket. The plugin detects this at `build()` time and **panics** rather than silently allowing two owners of the socket.
 - **Deferred Connections** — Use `SymbiosMultiuserPlugin::<T>::deferred()` to register systems without opening a socket. The socket opens automatically on the first frame after a `SymbiosMultiuserConfig<T>` resource is inserted, letting developers connect after login or menu screens instead of at app launch. For full control (e.g. custom ICE servers for NAT traversal), use `SymbiosMultiuserPlugin::<T>::with_config(config)` to pass a complete `SymbiosMultiuserConfig<T>` at plugin registration time.
 - **Dynamic Room Switching** — Changing `room_url` in the `SymbiosMultiuserConfig<T>` resource (or removing the resource entirely) automatically tears down the existing socket and opens a new connection to the updated room on the next frame, without restarting the app.
 - **Size-Limited Messages** — All network payloads are capped at 1 MiB to prevent OOM from malicious length-prefixed data. Unreliable-channel messages are additionally capped at 1200 bytes (a conservative WebRTC MTU-safe limit) and silently dropped if oversized.
@@ -80,7 +80,7 @@ fn send_movement(mut writer: MessageWriter<Broadcast<GameMessage>>) {
                             WebRTC P2P Data
 ```
 
-1. **Authentication** — Each peer authenticates with their ATProto PDS to obtain a JWT access token.
+1. **Authentication** — Each peer authenticates with their ATProto PDS via OAuth 2.0 + DPoP to obtain an [`auth::AtprotoSession`], then calls [`auth::get_service_auth`] to mint a *service auth token* scoped to the relay's DID. The OAuth access token itself is DPoP-bound and cannot be handed to a third-party relay.
 2. **Signaling** — Peers connect to the relay via a room-specific URL (e.g. `wss://relay/my_room`) and present the JWT during the WebSocket handshake. The URL path determines the **room** — peers only see and communicate with other peers in the same room. On native targets, the token is sent as an `Authorization: Bearer` header. On WASM targets, the token is sent via the `Sec-WebSocket-Protocol` subprotocol trick (the browser `WebSocket` API does not support custom headers; the relay echoes the selected subprotocol back per RFC 6455). Bearer tokens are intentionally **not** accepted via query string — query parameters are routinely captured in plaintext by reverse proxy and load balancer access logs, which would leak ATProto session credentials into operator-side logs the user never consented to share. When `auth_required` is enabled, the relay resolves the issuer's DID document (via `plc.directory` for `did:plc`, or HTTPS for `did:web`), extracts the `#atproto` signing key, and cryptographically verifies the JWT signature (ES256/P-256 or ES256K/secp256k1). When `service_did` is configured, the JWT `aud` claim is also validated to prevent cross-service token replay. The authenticated DID becomes the peer's session identity. SDP offers/answers and ICE candidates are exchanged via the relay's `SignalEnvelope` wire format.
 3. **P2P Transport** — Once signaling completes, data flows directly between peers over WebRTC data channels.
 4. **Message Bus** — The `SymbiosMultiuserPlugin<T>` serializes/deserializes `T` via bincode (with a 1 MiB size limit). Outbound messages are sent via `MessageWriter<Broadcast<T>>`. Inbound messages accumulate in a `NetworkQueue<T>` resource that the host app drains at its own pace.
@@ -149,66 +149,67 @@ cargo run --example basic_chat
 
 ### Running the Oasis Example
 
-A multiplayer sandbox that demonstrates the full authentication flow: ATProto login, service token acquisition, `TokenSourceRes` setup, deferred plugin connection, and in-game identity display.
+> **Note:** the `oasis` example predates the 0.3 OAuth refactor and is disabled by default. It is retained under the `legacy_oasis_example` Cargo feature until it has been ported to the new OAuth-driven flow; do not use it as a reference for the current API. The downstream `symbios-overlands` client carries the canonical OAuth wiring in the meantime.
 
 ```sh
-cargo run --example oasis
+cargo run --example oasis --features legacy_oasis_example   # legacy, will not compile against 0.3 API
 ```
 
 ## ATProto Authentication
 
-The `auth` module provides functions to create and refresh ATProto sessions, and to obtain service auth tokens for relay authentication.
+As of 0.3, this crate no longer offers App-Password login helpers. The host application is responsible for driving the OAuth 2.0 + DPoP authorization-code flow (via [`proto-blue-oauth`](https://crates.io/crates/proto-blue-oauth)) and building an [`AtprotoSession`] from the resulting `OAuthSession`. The `auth` module then exposes one helper — [`get_service_auth`] — that mints a relay-bound service auth token from the authenticated session.
 
 ```rust
-use bevy_symbios_multiuser::auth::{AtprotoCredentials, create_session, get_service_auth};
+use bevy_symbios_multiuser::auth::{AtprotoSession, get_service_auth};
+use proto_blue_oauth::OAuthSession;
+use std::sync::Arc;
 
-let client = reqwest::Client::new();
-let credentials = AtprotoCredentials {
+// `oauth_session` is produced by the host app's OAuth flow (see
+// `proto-blue-oauth` for authorization-code exchange + DPoP setup).
+let session = AtprotoSession {
+    did: "did:plc:abc123...".to_string(),
+    handle: "alice.bsky.social".to_string(),
     pds_url: "https://bsky.social".to_string(),
-    identifier: "alice.bsky.social".to_string(),
-    password: "app-password-here".to_string(),
+    session: Arc::new(oauth_session),
 };
-
-let session = create_session(&client, &credentials).await?;
 println!("Authenticated as DID: {}", session.did);
 ```
 
-**Important:** The `access_jwt` from `create_session` is signed by the PDS's own service key, which third-party relays cannot verify. When connecting to a relay with `auth_required = true`, use `get_service_auth` to obtain a *service auth token* — this JWT is signed by the user's `#atproto` key (held by the PDS on their behalf) and can be verified by any relay that resolves the user's DID document:
+**Important:** The OAuth access token inside `AtprotoSession::session` is DPoP-bound to the user's private key and cannot be presented to a third-party relay (the relay has no way to verify the DPoP proof). Use [`get_service_auth`] to obtain a *service auth token* — a JWT signed by the user's `#atproto` key (held by the PDS on their behalf) that any relay can verify by resolving the user's DID document:
 
 ```rust
 // Obtain a service auth token for relay authentication.
 // `aud` must match the relay's `service_did` if audience validation is enabled.
 let service_token = get_service_auth(
-    &client,
     &session,
-    "https://bsky.social",        // pds_url
     "did:web:relay.example.com",  // aud: the relay's service DID
 ).await?;
 ```
 
-Wrap the service token in a `TokenSourceRes` resource. The plugin prefers this over `AtprotoSession` and reads the latest token on each reconnect:
+Wrap the service token in a `TokenSourceRes` resource. The plugin reads the current token from this resource on every connection/reconnect attempt, so swapping the inner value is enough to roll over to a fresh token:
 
 ```rust
 use std::sync::{Arc, RwLock};
 use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 
 let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
-app.insert_resource(session);                          // used for identity (DID, handle)
-app.insert_resource(TokenSourceRes(token_source));     // used for relay authentication
+app.insert_resource(session);                          // optional — for UI-level identity (DID, handle)
+app.insert_resource(TokenSourceRes(token_source));     // required for authenticated relay connection
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
     "wss://relay.example.com/ws",
 ));
 ```
 
-For games with a login screen, use the deferred constructor to register systems without opening a socket. Insert all resources later when ready:
+> **Note:** the plugin never reads `AtprotoSession` for authentication — only `TokenSourceRes`. Inserting `AtprotoSession` is optional and is purely for application-level use (displaying the user's handle in UI, verifying peer identity via `PeerSessionMapRes`, etc.).
+
+For games with a login screen, use the deferred constructor to register systems without opening a socket. Insert the resources later (e.g. from a system that polls the completion of the host's OAuth task) to open the connection:
 
 ```rust
 // Deferred connection (session obtained after login):
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::deferred());
 
-// Later, after login completes (e.g. polled from an async task result in an
-// Update system — see examples/oasis.rs for a full implementation), insert
-// these resources to open the connection:
+// Later, once the OAuth flow has returned an `AtprotoSession` and a service
+// auth token has been issued, insert these resources to open the connection:
 let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
 commands.insert_resource(session);
 commands.insert_resource(TokenSourceRes(source));
@@ -221,26 +222,22 @@ commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
 
 ### Token Refresh for Long-Lived Apps
 
-Both ATProto access tokens and service auth tokens are short-lived. For long-lived applications, refresh both when they expire and update the `TokenSource` with a new service auth token:
+Service auth tokens are short-lived (minutes). The OAuth access token inside `AtprotoSession::session` is refreshed transparently by `proto-blue-oauth` whenever the inner `OAuthSession` makes a request, so the only thing the host needs to rotate manually is the service auth token handed to the relay. Re-issue it periodically (or on 401 from the relay) and swap the value inside `TokenSource`:
 
 ```rust
 use std::sync::{Arc, RwLock};
-use bevy_symbios_multiuser::auth::{refresh_session, get_service_auth};
+use bevy_symbios_multiuser::auth::get_service_auth;
 use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 
 let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
 app.insert_resource(TokenSourceRes(token_source.clone()));
 
-// Later, when tokens are near expiry:
-let new_session = refresh_session(&client, &session, "https://bsky.social").await?;
-let new_service_token = get_service_auth(
-    &client,
-    &new_session,
-    "https://bsky.social",
-    "did:web:relay.example.com",
-).await?;
+// Later, when the service auth token is near expiry:
+let new_service_token = get_service_auth(&session, "did:web:relay.example.com").await?;
 *token_source.write().unwrap() = Some(new_service_token);
 ```
+
+> **Warning:** Complete the `get_service_auth` await *before* acquiring the `RwLock` write guard. Holding the write guard across an `.await` would block every reconnect attempt that tries to read the current token for the duration of the HTTP request.
 
 ## Modules
 
@@ -250,8 +247,8 @@ let new_service_token = get_service_auth(
 | `messages` | `Broadcast<T>`, `NetworkReceived<T>`, `NetworkQueue<T>`, `ChannelKind`, `PeerConnectionState`, `PeerStateChanged`, `PeerStateQueue<T>` |
 | `systems` | ECS systems for transmit, receive, and peer state polling; `bincode_options()` for serialization compatibility |
 | `protocol` | Shared signaling wire format (`SignalEnvelope`, `SignalPayload`) |
-| `auth` | ATProto session creation (`create_session`), refresh (`refresh_session`), and service auth token acquisition for relay authentication (`get_service_auth`) (feature: `client`) |
-| `signaller` | Custom `matchbox_socket::Signaller` with JWT injection, refreshable `TokenSource`/`TokenSourceRes` for reconnects, and anonymous mode (feature: `client`) |
+| `auth` | OAuth-backed `AtprotoSession` (host-constructed from a `proto_blue_oauth::OAuthSession`) and `get_service_auth` for minting relay-bound service auth tokens (feature: `client`) |
+| `signaller` | Custom `matchbox_socket::Signaller` with JWT injection, refreshable `TokenSource`/`TokenSourceRes` for reconnects, anonymous mode, and `PeerSessionMapRes` for DID verification of remote peers (feature: `client`) |
 | `relay` | Sovereign Broker relay server with DID-based JWT verification (feature: `relay`) |
 | `error` | `SymbiosError` error types |
 
