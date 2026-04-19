@@ -14,14 +14,13 @@
 //!
 //! Authentication flows through a **Sovereign Broker** pattern:
 //!
-//! 1. The client authenticates with an ATProto PDS via
-//!    [`auth::create_session`], obtaining an [`auth::AtprotoSession`]. For
+//! 1. The client authenticates with an ATProto PDS via OAuth 2.0 + DPoP
+//!    (using `proto_blue_oauth`), producing an [`auth::AtprotoSession`]. For
 //!    relay authentication with `auth_required = true`, the client must then
 //!    call [`auth::get_service_auth`] to obtain a *service auth token* — a
 //!    JWT signed by the user's `#atproto` key that third-party relays can
-//!    verify via DID document resolution. The `access_jwt` from
-//!    `create_session` is signed by the PDS service key and cannot be
-//!    verified this way. Wrap the service token in a
+//!    verify via DID document resolution. The OAuth access token is
+//!    DPoP-bound and cannot be handed off. Wrap the service token in a
 //!    [`signaller::TokenSourceRes`] resource so the signaller uses it on
 //!    each connection attempt.
 //! 2. The [`signaller::SymbiosSignallerBuilder`] passes this token to the
@@ -117,7 +116,7 @@ pub mod prelude {
     pub use bevy_matchbox::prelude::{ChannelConfig, PeerId, PeerState};
 
     #[cfg(feature = "client")]
-    pub use crate::auth::{AtprotoCredentials, AtprotoSession};
+    pub use crate::auth::AtprotoSession;
 
     #[cfg(feature = "client")]
     pub use crate::signaller::{PeerSessionMap, PeerSessionMapRes, SymbiosSignallerBuilder};

@@ -1,5 +1,12 @@
 //! The Symbios Oasis - Multiplayer Sandbox with ATProto Identity
 //! Run with: cargo run --example oasis
+//!
+//! NOTE: This example predates the 0.3 OAuth refactor and still targets the
+//! removed App-Password `create_session` / `AtprotoCredentials` API. It is
+//! disabled via `#![cfg(any())]` until it has been ported to the new
+//! OAuth-driven flow. The downstream `symbios-overlands` client carries the
+//! canonical OAuth wiring in the meantime.
+#![cfg(any())]
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};

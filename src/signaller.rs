@@ -34,11 +34,11 @@
 //! refreshed session), ensuring the signaller always uses the latest token
 //! on reconnect.
 //!
-//! Note that the ATProto `access_jwt` from [`crate::auth::create_session`]
-//! is signed by the PDS service key and **cannot** be verified by a
-//! third-party relay that resolves DID documents. Always wrap a service auth
-//! token from [`crate::auth::get_service_auth`], not `access_jwt`, in the
-//! [`TokenSource`].
+//! Note that the OAuth access token is DPoP-bound and **cannot** be verified
+//! by a third-party relay that resolves DID documents. Always wrap a service
+//! auth token from [`crate::auth::get_service_auth`] in the [`TokenSource`];
+//! that token is signed by the user's `#atproto` key and verifies against
+//! their published DID document.
 
 use crate::protocol::{SignalEnvelope, SignalPayload};
 #[allow(unused_imports)] // SinkExt is used by .send() inside async_trait impls
@@ -869,24 +869,27 @@ impl SymbiosSignaller {
 ///
 /// On each reconnect attempt, the builder reads the latest token from the
 /// source. The host application is responsible for updating the source when
-/// tokens are refreshed (e.g. via [`crate::auth::refresh_session`]).
+/// tokens are refreshed (re-issue a service auth token via
+/// [`crate::auth::get_service_auth`] after the underlying OAuth session
+/// rotates its access token).
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use std::sync::{Arc, RwLock};
 /// use bevy_symbios_multiuser::signaller::{signaller_with_token_source, TokenSource};
-/// use bevy_symbios_multiuser::auth::{get_service_auth, refresh_session};
+/// use bevy_symbios_multiuser::auth::get_service_auth;
 ///
-/// // Use the service auth token from `get_service_auth`, not `access_jwt`.
-/// // The Symbios relay verifies tokens via DID document resolution; `access_jwt`
-/// // is signed by the PDS service key and cannot be verified that way.
-/// let service_token = get_service_auth(&client, &session, pds_url, relay_did).await?;
+/// // `get_service_auth` returns a JWT signed by the user's `#atproto` key,
+/// // which the relay can verify by resolving the user's DID document. This
+/// // is the only safe token for third-party services — the OAuth access
+/// // token is DPoP-bound and cannot be handed off.
+/// let service_token = get_service_auth(&session, relay_did).await?;
 /// let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
 /// let builder = signaller_with_token_source(token_source.clone());
 ///
-/// // Later, when the service token is near expiry, refresh both tokens and update:
-/// let new_session = refresh_session(&client, &session, pds_url).await?;
+/// // Later, when the service token is near expiry, re-issue it:
+/// let new_service_token = get_service_auth(&session, relay_did).await?;
 /// let new_token = get_service_auth(&client, &new_session, pds_url, relay_did).await?;
 /// *token_source.write().unwrap() = Some(new_token);
 /// ```
