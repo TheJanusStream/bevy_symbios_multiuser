@@ -228,13 +228,22 @@ pub struct PeerEntry {
 /// Shared server state holding the map of connected peers.
 #[derive(Clone)]
 pub struct RelayState {
-    /// Maps `(room, session_id)` pairs to their WebSocket message senders.
-    /// Keying by `(room, session_id)` rather than `session_id` alone allows the
-    /// same authenticated identity to hold concurrent connections in different
-    /// rooms (e.g. a lobby and a game room) without one silently evicting the
-    /// other. Within a single room, a reconnect from the same identity still
+    /// Two-level map: `room -> session_id -> PeerEntry`. Keying rooms at the
+    /// outer level (instead of using a flat `(room, session_id)` tuple map)
+    /// turns per-room broadcasts on `PeerJoined`/`PeerLeft` from an
+    /// O(N_total_peers) scan into an O(K_peers_in_room) iteration, which is
+    /// the primary scaling knob for a relay hosting thousands of rooms.
+    ///
+    /// Nesting still allows the same authenticated identity to hold concurrent
+    /// connections in different rooms (each lives under a different outer
+    /// key); within a single room, a reconnect from the same identity still
     /// replaces the prior entry.
-    pub peers: Arc<DashMap<(String, String), PeerEntry>>,
+    ///
+    /// The inner map is wrapped in `Arc` so that a brief outer-shard read lock
+    /// can be dropped immediately after cloning the handle — iteration,
+    /// lookups, and per-target sends then hold only the inner shard locks,
+    /// which is what keeps unrelated rooms from serialising on each other.
+    pub peers: Arc<DashMap<String, Arc<DashMap<String, PeerEntry>>>>,
     /// Whether authentication is mandatory for new connections.
     pub auth_required: bool,
     /// Maximum concurrent peers (`0` = unlimited).

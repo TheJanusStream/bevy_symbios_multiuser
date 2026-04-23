@@ -201,6 +201,72 @@ const UNLIMITED_HANDSHAKE_BUDGET: usize = 256;
 /// timeout from firing — permanently holding a connection slot.
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Remove this connection's entry from the room's inner map if it still
+/// belongs to `conn_id` (i.e. a reconnect has not already replaced us) and
+/// GC the room itself when the removal leaves it empty.
+///
+/// The room GC uses [`DashMap::remove_if`] with an `is_empty()` predicate so
+/// that the outer shard write lock is held across the empty check and the
+/// removal, preventing a concurrent join from dropping a new session into
+/// the inner map between those two steps (which would then be silently
+/// dropped along with the map).
+///
+/// Returns `true` iff this call removed our entry — callers use this to
+/// decide whether to broadcast `PeerLeft` (a caller that lost the race has
+/// nothing to clean up and nothing to announce).
+fn remove_own_entry(state: &RelayState, room: &str, session_id: &str, conn_id: Uuid) -> bool {
+    let removed = state
+        .peers
+        .get(room)
+        .and_then(|inner| inner.remove_if(session_id, |_, entry| entry.conn_id == conn_id))
+        .is_some();
+    if removed {
+        state.peers.remove_if(room, |_, inner| inner.is_empty());
+    }
+    removed
+}
+
+/// Clone the outbound senders of every peer currently in `room` except the
+/// one identified by `exclude_session`.
+///
+/// Briefly holds the outer shard read lock to clone the inner `Arc` handle,
+/// then releases it before iterating the inner map. This keeps broadcasts
+/// against one room from serialising against inserts or lookups targeting
+/// unrelated rooms on the same outer shard.
+fn collect_same_room_senders(
+    state: &RelayState,
+    room: &str,
+    exclude_session: &str,
+) -> Vec<mpsc::Sender<SignalEnvelope>> {
+    let inner = match state.peers.get(room) {
+        Some(r) => Arc::clone(r.value()),
+        None => return Vec::new(),
+    };
+    inner
+        .iter()
+        .filter(|e| e.key() != exclude_session)
+        .map(|e| e.value().tx.clone())
+        .collect()
+}
+
+/// Session IDs of every peer currently in `room` except `exclude_session`.
+/// Same locking discipline as [`collect_same_room_senders`].
+fn collect_same_room_session_ids(
+    state: &RelayState,
+    room: &str,
+    exclude_session: &str,
+) -> Vec<String> {
+    let inner = match state.peers.get(room) {
+        Some(r) => Arc::clone(r.value()),
+        None => return Vec::new(),
+    };
+    inner
+        .iter()
+        .filter(|e| e.key() != exclude_session)
+        .map(|e| e.key().clone())
+        .collect()
+}
+
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
 ///
 /// The URL path determines the peer's **room** — e.g. `wss://relay/game_A`
@@ -457,23 +523,30 @@ async fn handle_socket(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
 
-    // Atomically replace any existing connection for this (room, session_id).
-    // Using the `entry` API avoids a TOCTOU race where two concurrent
-    // reconnects could both see `None` from `get()` and both `insert()`,
-    // orphaning the first connection's write task.
+    // Atomically get-or-create the room's inner map and replace any existing
+    // connection for this `session_id` within it.
     //
-    // The map is keyed by `(room, session_id)` so the same authenticated
-    // identity may legitimately hold concurrent connections in different
-    // rooms; only a same-room reconnect from the same identity replaces the
-    // prior entry.
-    let peer_key = (room.clone(), session_id.clone());
+    // The outer shard write lock is deliberately held across the inner
+    // `entry` call: if we cloned the inner `Arc` and released the outer lock
+    // first, a concurrent same-room departure could GC the (then-empty) room
+    // via [`try_remove_empty_room`] and we would insert into an orphaned
+    // inner map that no other thread can find.
+    //
+    // Using the nested `entry` API also avoids the classic TOCTOU where two
+    // concurrent reconnects with the same `session_id` both observe `None`
+    // from `get()` and both `insert()`, orphaning the first one's write task.
     let old_entry_info = {
         use dashmap::mapref::entry::Entry;
         let new_peer = PeerEntry {
             tx: relay_tx,
             conn_id,
         };
-        match state.peers.entry(peer_key.clone()) {
+        let room_ref = state
+            .peers
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(dashmap::DashMap::new()));
+        let inner = room_ref.value();
+        match inner.entry(session_id.clone()) {
             Entry::Occupied(mut occ) => {
                 let old = occ.insert(new_peer);
                 Some(old.tx)
@@ -483,6 +556,7 @@ async fn handle_socket(
                 None
             }
         }
+        // `room_ref` drops here, releasing the outer shard write lock.
     };
 
     // If we replaced an old connection (same identity reconnecting to the
@@ -491,12 +565,7 @@ async fn handle_socket(
     // Peers in *other* rooms are unaffected because the old connection there
     // (if any) lives under a different (room, session_id) key.
     if let Some(_old_tx) = old_entry_info {
-        let leave_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
-            .peers
-            .iter()
-            .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
-            .map(|entry| entry.value().tx.clone())
-            .collect();
+        let leave_senders = collect_same_room_senders(&state, &room, &session_id);
         for sender in leave_senders {
             let envelope = SignalEnvelope {
                 peer_id: session_id.clone(),
@@ -522,20 +591,13 @@ async fn handle_socket(
         .await,
         Ok(Ok(()))
     ) {
-        state
-            .peers
-            .remove_if(&peer_key, |_, entry| entry.conn_id == conn_id);
+        remove_own_entry(&state, &room, &session_id, conn_id);
         // _conn_guard drops here, decrementing the counter.
         return;
     }
 
     // Broadcast peer list to the new peer (same room only).
-    let existing_peers: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
-        .map(|entry| entry.key().1.clone())
-        .collect();
+    let existing_peers = collect_same_room_session_ids(&state, &room, &session_id);
     tracing::debug!(
         session = %session_id,
         room = %room,
@@ -552,20 +614,13 @@ async fn handle_socket(
         .await,
         Ok(Ok(()))
     ) {
-        state
-            .peers
-            .remove_if(&peer_key, |_, entry| entry.conn_id == conn_id);
+        remove_own_entry(&state, &room, &session_id, conn_id);
         return;
     }
 
     // Notify existing peers in the same room about the new peer.
     // Collect senders first to avoid holding DashMap read locks across channel sends.
-    let peer_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
-        .peers
-        .iter()
-        .filter(|entry| entry.key().0 == room && entry.key().1 != session_id)
-        .map(|entry| entry.value().tx.clone())
-        .collect();
+    let peer_senders = collect_same_room_senders(&state, &room, &session_id);
     tracing::debug!(
         session = %session_id,
         room = %room,
@@ -896,12 +951,15 @@ async fn handle_socket(
             // Skipping the send permanently blackholes the target for the
             // lifetime of the connection even after recovery.
 
-            // Look up the target by `(room, target_id)` so cross-room
-            // forwarding is impossible by construction: a peer in room A
-            // cannot synthesise a key into room B.
-            let target_key = (room.clone(), target_id.clone());
-            if let Some(entry) = state_write.peers.get(&target_key) {
-                match entry.value().tx.try_send(forwarded) {
+            // Look up the target by room first, then session_id, so
+            // cross-room forwarding is impossible by construction: a peer in
+            // room A cannot synthesise a key into room B.
+            let target_entry = state_write
+                .peers
+                .get(&room)
+                .and_then(|inner| inner.get(&target_id).map(|e| e.value().tx.clone()));
+            if let Some(target_tx) = target_entry {
+                match target_tx.try_send(forwarded) {
                     Ok(()) => {
                         if let Some(state) = backpressure_strikes.get_mut(&target_id) {
                             state.strikes = state.strikes.saturating_sub(1);
@@ -989,11 +1047,11 @@ async fn handle_socket(
 
     // Cleanup: only remove the peer entry if it still belongs to *this*
     // connection. A reconnect may have already replaced it with a new sender.
-    let cleanup_key = (room_write.clone(), session_id_write.clone());
-    let was_removed = state
-        .peers
-        .remove_if(&cleanup_key, |_, entry| entry.conn_id == conn_id);
-    if was_removed.is_none() {
+    // `remove_own_entry` also GCs the room's inner map when the removal
+    // leaves it empty, so that long-lived relays hosting many short-lived
+    // rooms do not accumulate empty inner maps indefinitely.
+    let was_removed = remove_own_entry(&state, &room_write, &session_id_write, conn_id);
+    if !was_removed {
         // Another connection owns this (room, session_id) now — skip broadcast.
         // _conn_guard drops here, decrementing the counter.
         tracing::debug!(
@@ -1003,12 +1061,11 @@ async fn handle_socket(
         );
         return;
     }
-    let remaining_senders: Vec<mpsc::Sender<SignalEnvelope>> = state
-        .peers
-        .iter()
-        .filter(|entry| entry.key().0 == room_write)
-        .map(|entry| entry.value().tx.clone())
-        .collect();
+    // The room may have just been GC'd by `remove_own_entry`; if so, there
+    // are no remaining peers to notify. A new peer that joins the same room
+    // after GC will land in a freshly-created inner map and therefore
+    // correctly not receive a stale `PeerLeft` from our departure.
+    let remaining_senders = collect_same_room_senders(&state, &room_write, &session_id_write);
     for sender in remaining_senders {
         let envelope = SignalEnvelope {
             peer_id: session_id_write.clone(),
