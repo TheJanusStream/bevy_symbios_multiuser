@@ -27,8 +27,8 @@ fn main() {
         rt.block_on(async {
             let config = RelayConfig {
                 bind_addr: "0.0.0.0:3536".to_string(),
-                auth_required: false,
-                max_peers: 512,
+                auth_required: true,
+                max_peers: 2048,
                 service_did: None,
             };
 
