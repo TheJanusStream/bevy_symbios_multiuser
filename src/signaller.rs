@@ -262,6 +262,15 @@ pub struct SymbiosSignallerBuilder {
     /// join and leave. When present, the application can resolve the real
     /// (relay-authenticated) DID for any active peer.
     session_map: Option<PeerSessionMap>,
+    /// Persistent WASM blind-retry state. Shared across every builder the
+    /// plugin constructs so the failure count is not re-zeroed on ECS-level
+    /// socket respawn. `None` falls back to per-builder local state, which
+    /// is sufficient for one-shot programmatic use but not for the plugin's
+    /// respawn loop. Native builds carry the field (gated with
+    /// `#[allow(dead_code)]`) so the struct layout and public constructors
+    /// stay uniform across targets — the field is simply never read.
+    #[cfg(target_arch = "wasm32")]
+    wasm_retry_state: Option<WasmBlindRetryStateHandle>,
 }
 
 impl SymbiosSignallerBuilder {
@@ -305,6 +314,49 @@ impl SymbiosSignallerBuilder {
 #[cfg(target_arch = "wasm32")]
 const WASM_MAX_BLIND_RETRIES: u32 = 5;
 
+/// Persistent state for the WASM blind-retry guard.
+///
+/// This state must outlive any single [`SymbiosSignallerBuilder`] — the Bevy
+/// plugin constructs a fresh builder on every reconnect, so state kept in a
+/// local variable inside [`SymbiosSignallerBuilder::new_signaller`] (or in a
+/// non-`Arc` field on the builder) would be re-zeroed each time. That would
+/// let an expired token retry 5 times, bail with `Err`, be respawned by the
+/// ECS after the backoff window, and retry 5 times *again* — indefinitely.
+///
+/// Sharing an `Arc<Mutex<WasmBlindRetryState>>` across builder instances
+/// (via [`WasmBlindRetryStateRes`]) threads the failure count through every
+/// reconnect attempt so the guard can bail permanently once the same token
+/// has actually exhausted its budget.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Default)]
+pub struct WasmBlindRetryState {
+    /// Number of consecutive failed connection attempts made with the same
+    /// token fingerprint. Reset to 1 whenever the fingerprint changes
+    /// (i.e. the host application refreshed the auth token between attempts).
+    failures: u32,
+    /// Fingerprint of the token used on the most recent failure, or `None`
+    /// if no attempt has failed yet.
+    last_failed_token: Option<u64>,
+}
+
+#[cfg(target_arch = "wasm32")]
+/// Shared handle to the WASM blind-retry state, cheap to clone.
+pub type WasmBlindRetryStateHandle = Arc<std::sync::Mutex<WasmBlindRetryState>>;
+
+/// Bevy [`Resource`](bevy::prelude::Resource) that persists the WASM
+/// blind-retry counter across reconnect attempts.
+///
+/// The plugin inserts this resource once at startup and passes the inner
+/// handle to every signaller builder it constructs, ensuring the guard's
+/// failure count is not reset each time the ECS respawns the socket after a
+/// dead-message-loop teardown.
+///
+/// Only meaningful on `wasm32` targets; the native path fast-fails on HTTP
+/// 4xx directly.
+#[cfg(target_arch = "wasm32")]
+#[derive(bevy::prelude::Resource, Clone, Default)]
+pub struct WasmBlindRetryStateRes(pub WasmBlindRetryStateHandle);
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignallerBuilder for SymbiosSignallerBuilder {
@@ -320,10 +372,18 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
         // fingerprint and bail once that count crosses [`WASM_MAX_BLIND_RETRIES`].
         // A token rotation between failures resets the counter so legitimate
         // refresh-and-retry flows are not penalised.
+        //
+        // The state lives behind `wasm_retry_state` when the plugin threaded
+        // one in — that shared handle outlives a single `new_signaller` call,
+        // so a doomed token that exhausts its budget stays exhausted across
+        // ECS-level respawns. Callers constructing a one-shot builder without
+        // a shared handle fall back to a local state that only guards within
+        // this single `new_signaller` invocation.
         #[cfg(target_arch = "wasm32")]
-        let mut wasm_blind_failures: u32 = 0;
-        #[cfg(target_arch = "wasm32")]
-        let mut wasm_last_failed_token: Option<u64> = None;
+        let wasm_state: WasmBlindRetryStateHandle = self
+            .wasm_retry_state
+            .clone()
+            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(WasmBlindRetryState::default())));
 
         let signaller = 'connect: loop {
             let ws = match self.try_connect(&room_url).await {
@@ -337,15 +397,19 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                     #[cfg(target_arch = "wasm32")]
                     {
                         let token_fp = self.current_token_fingerprint();
-                        if wasm_last_failed_token == Some(token_fp) {
-                            wasm_blind_failures = wasm_blind_failures.saturating_add(1);
-                        } else {
-                            wasm_blind_failures = 1;
-                            wasm_last_failed_token = Some(token_fp);
-                        }
-                        if wasm_blind_failures >= WASM_MAX_BLIND_RETRIES {
+                        let failures = {
+                            let mut guard = wasm_state.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.last_failed_token == Some(token_fp) {
+                                guard.failures = guard.failures.saturating_add(1);
+                            } else {
+                                guard.failures = 1;
+                                guard.last_failed_token = Some(token_fp);
+                            }
+                            guard.failures
+                        };
+                        if failures >= WASM_MAX_BLIND_RETRIES {
                             tracing::error!(
-                                attempts = wasm_blind_failures,
+                                attempts = failures,
                                 "WASM relay connection failed {WASM_MAX_BLIND_RETRIES} times in \
                                  a row with the same token; aborting (browser WebSocket API \
                                  hides HTTP status codes, so we cannot tell auth failures \
@@ -389,7 +453,19 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
             // Read the relay's welcome messages (session_id + peer_list).
             // If this fails, treat it like a connection failure and retry.
             match signaller.read_welcome().await {
-                Ok(()) => break signaller,
+                Ok(()) => {
+                    // Welcome handshake succeeded — the relay accepted the
+                    // current token. Clear the blind-retry state so a future
+                    // doomed token gets a fresh budget instead of inheriting
+                    // leftover failures from an earlier flaky session.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let mut guard = wasm_state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.failures = 0;
+                        guard.last_failed_token = None;
+                    }
+                    break signaller;
+                }
                 Err(e) => {
                     if let Some(ref mut remaining) = attempts {
                         if *remaining <= 1 {
@@ -685,7 +761,21 @@ impl SymbiosSignaller {
     async fn read_text(&mut self) -> Result<String, SignalingError> {
         loop {
             match self.ws.next().await {
-                Some(Ok(tungstenite::Message::Text(t))) => return Ok(t.to_string()),
+                Some(Ok(tungstenite::Message::Text(t))) => {
+                    // `Utf8Bytes` wraps `tungstenite::Bytes` with a UTF-8
+                    // invariant that tungstenite already validated when it
+                    // constructed the frame. Go through `Bytes -> Vec<u8>`:
+                    // for the usual case where the `Bytes` view has a unique
+                    // owner (just handed to us from the frame reader) this
+                    // reuses the existing allocation, avoiding the alloc +
+                    // memcpy that `.to_string()` would force on every
+                    // signaling message. When the view is shared, `From<Bytes>`
+                    // falls back to a copy — same cost as before.
+                    let bytes: tungstenite::Bytes = t.into();
+                    let vec: Vec<u8> = bytes.into();
+                    // SAFETY: `Utf8Bytes` guarantees `vec` is valid UTF-8.
+                    return Ok(unsafe { String::from_utf8_unchecked(vec) });
+                }
                 Some(Ok(tungstenite::Message::Close(_))) | None => {
                     return Err(SignalingError::StreamExhausted);
                 }
@@ -928,6 +1018,8 @@ pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuil
     Arc::new(SymbiosSignallerBuilder {
         token_source: Some(source),
         session_map: None,
+        #[cfg(target_arch = "wasm32")]
+        wasm_retry_state: None,
     })
 }
 
@@ -941,6 +1033,8 @@ pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
         token_source: None,
         session_map: None,
+        #[cfg(target_arch = "wasm32")]
+        wasm_retry_state: None,
     })
 }
 
@@ -957,6 +1051,8 @@ pub fn signaller_anonymous_with_map(session_map: PeerSessionMap) -> Arc<dyn Sign
     Arc::new(SymbiosSignallerBuilder {
         token_source: None,
         session_map: Some(session_map),
+        #[cfg(target_arch = "wasm32")]
+        wasm_retry_state: None,
     })
 }
 
@@ -968,5 +1064,35 @@ pub fn signaller_with_token_source_and_map(
     Arc::new(SymbiosSignallerBuilder {
         token_source: Some(source),
         session_map: Some(session_map),
+        #[cfg(target_arch = "wasm32")]
+        wasm_retry_state: None,
+    })
+}
+
+/// Fully-specified constructor used by the Bevy plugin's `open_socket` path.
+///
+/// The plugin manages three pieces of cross-reconnect state and needs to thread
+/// them all through every signaller it builds:
+/// - [`TokenSource`] for auth-token refresh on reconnect,
+/// - [`PeerSessionMap`] so the DID ↔ `PeerId` binding survives the short window
+///   where the old signaller is dropped and the new one has not yet replayed
+///   `peer_list`,
+/// - [`WasmBlindRetryStateHandle`] (wasm only) so the blind-retry counter is
+///   not re-zeroed on every ECS respawn.
+///
+/// Callers outside the plugin should prefer [`signaller_with_token_source_and_map`]
+/// or [`signaller_anonymous_with_map`] — they produce a builder whose WASM
+/// retry state is local to a single `new_signaller` call, which is the correct
+/// scope for one-shot programmatic use.
+pub fn signaller_full(
+    token_source: Option<TokenSource>,
+    session_map: Option<PeerSessionMap>,
+    #[cfg(target_arch = "wasm32")] wasm_retry_state: Option<WasmBlindRetryStateHandle>,
+) -> Arc<dyn SignallerBuilder> {
+    Arc::new(SymbiosSignallerBuilder {
+        token_source,
+        session_map,
+        #[cfg(target_arch = "wasm32")]
+        wasm_retry_state,
     })
 }

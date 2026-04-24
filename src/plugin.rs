@@ -39,6 +39,14 @@ struct SocketOpened<T> {
     /// comparing individual fields by reference — this avoids cloning the
     /// URL vector on every frame just to answer a boolean equality check.
     ice: Option<RtcIceServerConfig>,
+    /// `Time::elapsed()` value captured at the moment this marker was
+    /// inserted. Used by the health check to decide when a socket has been
+    /// continuously healthy for long enough to count as stable, at which
+    /// point any dormant [`ReconnectCooldown`] from an earlier flaky period
+    /// is cleared so a later disconnect restarts backoff from
+    /// [`INITIAL_RECONNECT_DELAY`] rather than inheriting a stale 60-second
+    /// ceiling.
+    opened_at: Duration,
     _marker: PhantomData<T>,
 }
 
@@ -78,6 +86,17 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// one attempt per minute.
 #[cfg(feature = "client")]
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// How long a socket must remain continuously healthy after opening before
+/// the reconnect cooldown is considered stale and cleared. Set longer than
+/// the fast-fail window for HTTP 4xx handshake rejections (sub-second on
+/// native, bounded by [`WASM_MAX_BLIND_RETRIES`] × retry delay on wasm) so
+/// that a doomed handshake cannot transiently look healthy long enough to
+/// zero out accumulated backoff. After this window elapses with the socket
+/// still alive, a later disconnect restarts backoff from
+/// [`INITIAL_RECONNECT_DELAY`] instead of inheriting a stale 60-second cap.
+#[cfg(feature = "client")]
+const SOCKET_STABILITY_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Return `true` if the live [`RtcIceServerConfig`] matches the one recorded
 /// in the [`SocketOpened`] marker. Compares field-by-field by reference to
@@ -197,21 +216,31 @@ where
         app.init_resource::<NetworkQueue<T>>()
             .init_resource::<PeerStateQueue<T>>()
             .init_resource::<crate::signaller::PeerSessionMapRes>()
-            .add_message::<Broadcast<T>>()
-            .add_systems(
-                Update,
+            .add_message::<Broadcast<T>>();
+
+        // On wasm the signaller's blind-retry counter must persist across
+        // ECS-level socket respawns, otherwise a permanently-expired token
+        // would retry 5 times inside the builder, fail, get respawned by the
+        // backoff loop, retry 5 more times, and so on forever. The state is
+        // keyed on the plugin instance via a Bevy resource so every future
+        // builder the plugin constructs shares the same counter.
+        #[cfg(target_arch = "wasm32")]
+        app.init_resource::<crate::signaller::WasmBlindRetryStateRes>();
+
+        app.add_systems(
+            Update,
+            (
+                open_socket::<T>,
                 (
-                    open_socket::<T>,
-                    (
-                        systems::poll_peers::<T>,
-                        systems::receive_messages::<T>,
-                        systems::transmit_messages::<T>,
-                    )
-                        .chain()
-                        .run_if(resource_exists::<MatchboxSocket>),
+                    systems::poll_peers::<T>,
+                    systems::receive_messages::<T>,
+                    systems::transmit_messages::<T>,
                 )
-                    .chain(),
-            );
+                    .chain()
+                    .run_if(resource_exists::<MatchboxSocket>),
+            )
+                .chain(),
+        );
 
         if let Some(ref config) = self.config {
             app.insert_resource(config.clone());
@@ -230,6 +259,9 @@ fn open_socket<T: Send + Sync + 'static>(
     cooldown: Option<Res<ReconnectCooldown<T>>>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
     #[cfg(feature = "client")] session_map: Res<crate::signaller::PeerSessionMapRes>,
+    #[cfg(all(feature = "client", target_arch = "wasm32"))] wasm_retry: Res<
+        crate::signaller::WasmBlindRetryStateRes,
+    >,
 ) {
     // Teardown: if the socket was opened but the config was removed or the
     // room URL changed, close the existing socket so a new one can be opened.
@@ -313,6 +345,20 @@ fn open_socket<T: Send + Sync + 'static>(
                 next_delay,
                 _marker: PhantomData,
             });
+        } else if cooldown.is_some() {
+            // Healthy socket that has been alive long enough for any handshake
+            // rejection (HTTP 4xx or the wasm blind-retry cap) to have
+            // manifested — safe to retire a cooldown carried over from an
+            // earlier flaky period so a later disconnect starts backoff from
+            // scratch instead of inheriting a stale 60-second ceiling.
+            let elapsed_since_opened = time.elapsed().saturating_sub(marker.opened_at);
+            if elapsed_since_opened >= SOCKET_STABILITY_THRESHOLD {
+                tracing::debug!(
+                    elapsed_since_opened_secs = elapsed_since_opened.as_secs(),
+                    "socket stable — clearing stale reconnect cooldown"
+                );
+                commands.remove_resource::<ReconnectCooldown<T>>();
+            }
         }
         return;
     }
@@ -353,13 +399,16 @@ fn open_socket<T: Send + Sync + 'static>(
     {
         // Thread the shared `PeerSessionMap` through whichever signaller
         // variant we pick so the application can resolve peer DIDs via
-        // `PeerSessionMapRes` regardless of the auth mode.
-        let map = session_map.0.clone();
-        let signaller = if let Some(ts) = token_source {
-            crate::signaller::signaller_with_token_source_and_map(ts.0.clone(), map)
-        } else {
-            crate::signaller::signaller_anonymous_with_map(map)
-        };
+        // `PeerSessionMapRes` regardless of the auth mode. On wasm, also
+        // thread the persistent blind-retry state so a doomed token stays
+        // doomed across respawns instead of refreshing its budget every
+        // time the plugin spawns a new builder.
+        let signaller = crate::signaller::signaller_full(
+            token_source.map(|ts| ts.0.clone()),
+            Some(session_map.0.clone()),
+            #[cfg(target_arch = "wasm32")]
+            Some(wasm_retry.0.clone()),
+        );
         builder = builder.signaller_builder(signaller);
     }
 
@@ -367,6 +416,7 @@ fn open_socket<T: Send + Sync + 'static>(
     commands.insert_resource(SocketOpened::<T> {
         room_url: config.room_url.clone(),
         ice: config.ice_servers.clone(),
+        opened_at: time.elapsed(),
         _marker: PhantomData,
     });
 }

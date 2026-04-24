@@ -322,6 +322,16 @@ fn canonicalize_did_web_domain(domain: &str) -> Result<String, String> {
                 "unexpected characters after IPv6 bracket in did:web: '{domain}'"
             ));
         }
+        // If a port suffix is present, validate it here so downstream DNS
+        // and pinning code can rely on the port being a parseable u16. See
+        // the rationale in the non-IPv6 branch below.
+        if let Some(port_str) = after.strip_prefix(':')
+            && port_str.parse::<u16>().is_err()
+        {
+            return Err(format!(
+                "did:web port '{port_str}' is not a valid 1–65535 u16"
+            ));
+        }
         return Ok(domain.to_string());
     }
 
@@ -333,6 +343,20 @@ fn canonicalize_did_web_domain(domain: &str) -> Result<String, String> {
         Some((h, p)) if !h.is_empty() && !p.is_empty() => (h, Some(p)),
         _ => (domain, None),
     };
+
+    // Reject unparseable ports here so split_host_port (rsplit_once + parse)
+    // and extract_hostname (split-at-first-colon) cannot disagree on what
+    // the hostname is. Before this check, a string like `attacker.com:abcd`
+    // would canonicalize successfully, making the DNS side see
+    // `attacker.com:abcd` (which falls back to "whole string, port 443"
+    // when split_host_port's u16 parse fails) while the pinning side sees
+    // `attacker.com` — the request would fail at reqwest's URL parse, but
+    // the divergence is avoidable and better caught at the earliest layer.
+    if let Some(p) = port_part
+        && p.parse::<u16>().is_err()
+    {
+        return Err(format!("did:web port '{p}' is not a valid 1–65535 u16"));
+    }
 
     // `url::Host::parse` runs the WHATWG URL host parser, which applies IDNA
     // (`domain_to_ascii`) for DNS-style names and parses literal IPv4
@@ -1390,6 +1414,37 @@ mod tests {
         let result = canonicalize_did_web_domain("[2001:db8::1");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing closing"));
+    }
+
+    #[test]
+    fn canonicalize_rejects_non_numeric_port() {
+        // Guards against a parsing-divergence bug: `split_host_port` uses
+        // rsplit_once + u16::parse (falls back to "whole domain, port 443"
+        // on failure) while `extract_hostname` splits at the first colon.
+        // Without validation at canonicalization time, `attacker.com:abcd`
+        // would reach the DNS and pinning layers with different hostnames
+        // ("attacker.com:abcd" vs "attacker.com"). Rejecting here makes the
+        // two helpers provably agree on every canonicalized string.
+        let result = canonicalize_did_web_domain("attacker.com:abcd");
+        assert!(result.is_err(), "expected non-numeric port to be rejected");
+        assert!(result.unwrap_err().contains("not a valid"));
+    }
+
+    #[test]
+    fn canonicalize_rejects_out_of_range_port() {
+        // 99999 parses as an integer but not as a u16. The same divergence
+        // would apply — reject at canonicalization.
+        let result = canonicalize_did_web_domain("example.com:99999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn canonicalize_rejects_non_numeric_port_with_ipv6() {
+        // IPv6 path has its own port branch in canonicalization; ensure the
+        // same validation applies there.
+        let result = canonicalize_did_web_domain("[2001:db8::1]:abcd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not a valid"));
     }
 
     #[test]

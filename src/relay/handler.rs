@@ -237,6 +237,35 @@ const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the inner map between those two steps (which would then be silently
 /// dropped along with the map).
 ///
+/// Return `(total authenticated peers across all rooms, active room count)`.
+///
+/// Aggregates the two-level `peers` map at the moment of the call. The outer
+/// length is the room count; summing inner lengths gives peers. The walk is
+/// O(rooms) so this is only appropriate for sporadic observability logs, not
+/// a per-signal hot path.
+///
+/// This deliberately does *not* use `state.active_connections`: that counter
+/// also tracks TCP connections still in the authentication phase which have
+/// not yet joined a room. Aggregating over `peers` keeps the "peers" number
+/// aligned with the "rooms" number (both enumerate the same structure at the
+/// same instant), so the two never drift apart in the suffix we emit.
+fn capacity_snapshot(state: &RelayState) -> (usize, usize) {
+    let rooms = state.peers.len();
+    let peers = state.peers.iter().map(|r| r.value().len()).sum::<usize>();
+    (peers, rooms)
+}
+
+/// Format the per-event capacity suffix that trailing observability log lines
+/// append to their message. `max_peers == 0` is the relay's "unlimited" flag
+/// and is rendered as the word rather than a literal zero.
+fn format_capacity_suffix(peers: usize, rooms: usize, max_peers: usize) -> String {
+    if max_peers == 0 {
+        format!("({peers} / unlimited peers connected in {rooms} active rooms)")
+    } else {
+        format!("({peers} / {max_peers} peers connected in {rooms} active rooms)")
+    }
+}
+
 /// Returns `true` iff this call removed our entry — callers use this to
 /// decide whether to broadcast `PeerLeft` (a caller that lost the race has
 /// nothing to clean up and nothing to announce).
@@ -442,6 +471,25 @@ pub async fn ws_handler(
             rejection.into_response()
         }
         Ok(id) => {
+            // JWT was successfully verified (if one was presented). Log the
+            // verification here rather than inside `validate_atproto_jwt` so
+            // the log line can carry a relay-capacity snapshot — this is a
+            // natural observability checkpoint and the auth module has no
+            // business pulling in `RelayState` just to annotate its logs.
+            // The snapshot reflects the state *before* this peer joins a
+            // room, which is still meaningful: it is the headroom they found
+            // when they connected.
+            if let Some(ref validated) = id {
+                let (peers, rooms) = capacity_snapshot(&state);
+                let suffix = format_capacity_suffix(peers, rooms, state.max_peers);
+                tracing::debug!(
+                    did = %validated.did,
+                    peers_connected = peers,
+                    active_rooms = rooms,
+                    max_peers = state.max_peers,
+                    "JWT signature verified via DID document {suffix}"
+                );
+            }
             let upgrade = ws.max_message_size(MAX_WS_MESSAGE_SIZE);
             let upgrade = if used_subprotocol {
                 upgrade.protocols(["access_token"])
@@ -1156,8 +1204,27 @@ async fn handle_socket(
         let _ = sender.try_send(envelope);
     }
 
-    // _conn_guard drops here, decrementing the counter.
-    tracing::info!(session = %session_id_write, "peer disconnected");
+    // The peer was removed from `state.peers` back at `remove_own_entry`, so
+    // `capacity_snapshot` already reflects the post-disconnect counts — the
+    // suffix reads "after this departure, N peers remain in R rooms".
+    //
+    // `_conn_guard` (which decrements `state.active_connections`) is dropped
+    // explicitly here so the counter decrement is fully ordered before the
+    // log emits. We don't surface that counter in the suffix (it includes
+    // handshakes-in-progress and would disagree with the room-aggregated
+    // `peers` figure), but dropping deterministically keeps any out-of-band
+    // observer who reads `active_connections` right after this log from
+    // seeing a phantom extra connection that has already "said goodbye".
+    drop(_conn_guard);
+    let (peers, rooms) = capacity_snapshot(&state);
+    let suffix = format_capacity_suffix(peers, rooms, state.max_peers);
+    tracing::info!(
+        session = %session_id_write,
+        peers_connected = peers,
+        active_rooms = rooms,
+        max_peers = state.max_peers,
+        "peer disconnected {suffix}"
+    );
 }
 
 #[cfg(test)]

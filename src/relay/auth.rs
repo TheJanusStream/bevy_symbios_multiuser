@@ -171,10 +171,17 @@ pub async fn validate_atproto_jwt(
 
     // Step 3: Verify the JWT signature on a blocking thread (ECDSA is CPU-bound;
     // running it on the async executor starves other tasks under connection floods).
+    //
+    // Note: the "JWT signature verified" log deliberately lives at the handler
+    // call site rather than here. The handler has access to `RelayState`, which
+    // lets it append a relay-capacity snapshot (peers connected / max, active
+    // rooms) to the log line — useful operational context at a natural
+    // observability checkpoint. Emitting it here would require plumbing
+    // state-shaped dependencies into the auth layer, which has no business
+    // knowing about the relay's runtime shape.
     verify_signature(token, &resolved)
         .await
         .map_err(AuthError::InvalidToken)?;
-    tracing::debug!(did = %did, "JWT signature verified via DID document");
 
     Ok(ValidatedIdentity { did: did.clone() })
 }
