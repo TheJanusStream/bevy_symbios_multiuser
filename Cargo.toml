@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_multiuser"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 authors = ["Janus"]
 description = "Multi-user networking for Bevy via ATProto auth with WebRTC p2p messaging."
@@ -44,7 +44,23 @@ moka = { version = "0.12", default-features = false, features = ["sync", "future
 percent-encoding = { version = "2", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 
-# Native-only signaller transport
+# Native-only signaller transport.
+#
+# The `async-std-runtime` feature is intentional (not a fallback from
+# `tokio-runtime`). The `matchbox_socket::SignallerBuilder::new_signaller`
+# future is driven inside Bevy's `IoTaskPool`, which is powered by
+# `async-executor` — **not** Tokio. A `tokio-runtime` build would panic on
+# `connect_async` because there is no thread-local Tokio reactor on the
+# IoTaskPool worker threads. `async-std-runtime` sidesteps this by spinning up
+# its own lazy reactor on first use and accepting work from any async runtime.
+#
+# The cost is a second async runtime in the process (on top of whatever Tokio
+# runtime the host application runs for `reqwest`). A cleaner fix would be to
+# port the native transport to `tokio-tungstenite` and bridge the signaller
+# through a captured `tokio::runtime::Handle`, but that hardens the Tokio
+# dependency (the plugin would panic at first connect without a live Tokio
+# runtime) and adds an mpsc-bridge failure mode. The extra binary size and
+# background thread are a worthwhile trade for keeping Tokio a soft dependency.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-tungstenite = { version = "0.32", default-features = false, features = ["async-std-runtime"], optional = true }
 
@@ -57,11 +73,6 @@ default = ["client", "tls"]
 client = ["dep:reqwest", "dep:proto-blue-oauth", "dep:async-tungstenite", "dep:ws_stream_wasm", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
 tls = ["reqwest/rustls-tls", "async-tungstenite/async-tls"]
 relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "dep:p256", "dep:k256", "dep:bs58", "dep:base64", "dep:moka", "dep:tower-http", "dep:percent-encoding", "dep:tracing-subscriber"]
-# The `oasis` example predates the 0.3 OAuth refactor (it drives the removed
-# `create_session` / `AtprotoCredentials` API). Hide it behind this feature
-# so `cargo test`/`cargo check` don't try to build the stale sources until
-# the port to the new OAuth flow lands.
-legacy_oasis_example = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -74,11 +85,3 @@ bevy_asset = "0.18.1"
 [[bench]]
 name = "message_serialization"
 harness = false
-
-# The `oasis` example predates the 0.3 OAuth refactor (it drives the removed
-# `create_session` / `AtprotoCredentials` API). Hide it behind a feature flag
-# nobody enables by default so `cargo test`/`cargo check` don't try to build
-# the stale sources while the port is pending.
-[[example]]
-name = "oasis"
-required-features = ["legacy_oasis_example"]

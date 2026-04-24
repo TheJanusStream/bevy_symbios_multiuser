@@ -157,32 +157,6 @@ impl PeerSessionMapRes {
 
 // ── SignallerBuilder ─────────────────────────────────────────────────────────
 
-/// Bevy [`Resource`](bevy::prelude::Resource) wrapper around a [`TokenSource`].
-///
-/// Insert this resource into the Bevy world to enable automatic token refresh
-/// when using [`SymbiosMultiuserPlugin`](crate::plugin::SymbiosMultiuserPlugin).
-/// The plugin prefers this over a static [`AtprotoSession`](crate::auth::AtprotoSession)
-/// clone, so reconnects after token expiry use the latest refreshed JWT.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::sync::{Arc, RwLock};
-/// use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
-///
-/// // Use the service auth token from `get_service_auth`, not `access_jwt`.
-/// // Relay servers verify service auth tokens via DID document resolution;
-/// // `access_jwt` is signed by the PDS service key and cannot be verified
-/// // by a third-party relay.
-/// let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
-/// app.insert_resource(TokenSourceRes(source.clone()));
-///
-/// // Later, after refreshing the session and calling get_service_auth again:
-/// *source.write().unwrap() = Some(new_service_token);
-/// ```
-#[derive(bevy::prelude::Resource, Clone)]
-pub struct TokenSourceRes(pub TokenSource);
-
 /// A shared, externally-refreshable token source.
 ///
 /// The host application updates this (e.g. after an ATProto token refresh)
@@ -190,25 +164,86 @@ pub struct TokenSourceRes(pub TokenSource);
 /// avoiding stale-JWT failures when short-lived access tokens expire
 /// between the initial connection and a later reconnect.
 ///
-/// # Safety note on `std::sync::RwLock` in async code
+/// # Safe-by-construction
 ///
-/// This intentionally uses `std::sync::RwLock` rather than `tokio::sync::RwLock`
-/// because the lock is only held for a brief `.clone()` (never across `.await`
-/// points). Do **not** hold a guard from this lock across an `.await` — if you
-/// need longer-lived access, clone the inner value first and release the guard.
+/// The inner `RwLock` is **not** exposed. Callers can only observe the current
+/// token via [`get`](Self::get) (which clones the inner `Option<String>` and
+/// releases the guard) and replace it via [`set`](Self::set) (which acquires
+/// the write guard only long enough to swap the value in place).
 ///
-/// In particular, **never hold the write guard while awaiting a network call**
-/// (e.g. `get_service_auth`). The signaller's `new_signaller` task acquires the
-/// read lock on every reconnect attempt; if the write lock is held for the
-/// duration of an async HTTP request, that reconnect will block indefinitely.
-/// The correct pattern is to complete the async call first, then acquire the
-/// write lock only for the instant needed to swap the value:
+/// This structurally prevents the deadlock hazard of holding a lock guard
+/// across an `.await`: since the guard never leaves the method body, a caller
+/// refreshing the token over an async network request cannot accidentally
+/// starve the signaller's reconnect path.
 ///
 /// ```rust,ignore
-/// let new_token = get_service_auth(...).await?;   // network call — no lock held
-/// *token_source.write().unwrap() = Some(new_token); // lock held only for swap
+/// let new_token = get_service_auth(...).await?;   // network call
+/// token_source.set(Some(new_token));              // lock held only for swap
 /// ```
-pub type TokenSource = Arc<std::sync::RwLock<Option<String>>>;
+#[derive(Clone, Default)]
+pub struct TokenSource {
+    inner: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl TokenSource {
+    /// Create a new token source with an optional initial value.
+    pub fn new(initial: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(initial)),
+        }
+    }
+
+    /// Return a clone of the currently stored token, if any.
+    ///
+    /// The lock is released before this function returns, so the caller is
+    /// free to `.await` on the result without blocking the signaller.
+    pub fn get(&self) -> Option<String> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Atomically replace the stored token.
+    ///
+    /// The write guard is acquired only for the duration of the swap; passing
+    /// `None` clears the token (useful on logout).
+    pub fn set(&self, token: Option<String>) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = token;
+    }
+}
+
+impl std::fmt::Debug for TokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately do not render the token bytes — JWTs are sensitive and
+        // often end up in tracing output by accident.
+        f.debug_struct("TokenSource")
+            .field("set", &self.get().is_some())
+            .finish()
+    }
+}
+
+/// Bevy [`Resource`](bevy::prelude::Resource) wrapper around a [`TokenSource`].
+///
+/// Insert this resource into the Bevy world to enable automatic token refresh
+/// when using [`SymbiosMultiuserPlugin`](crate::plugin::SymbiosMultiuserPlugin).
+/// The plugin reads the current token from this resource on every (re)connect
+/// attempt, so reconnects after token expiry use the latest refreshed JWT.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
+///
+/// // Use the service auth token from `get_service_auth`, not `access_jwt`.
+/// // Relay servers verify service auth tokens via DID document resolution;
+/// // `access_jwt` is signed by the PDS service key and cannot be verified
+/// // by a third-party relay.
+/// let source = TokenSource::new(Some(service_token));
+/// app.insert_resource(TokenSourceRes(source.clone()));
+///
+/// // Later, after refreshing the session and calling get_service_auth again:
+/// source.set(Some(new_service_token));
+/// ```
+#[derive(bevy::prelude::Resource, Clone, Debug, Default)]
+pub struct TokenSourceRes(pub TokenSource);
 
 /// A [`SignallerBuilder`] that injects a service auth JWT into the WebSocket
 /// upgrade request's `Authorization` header.
@@ -232,9 +267,7 @@ pub struct SymbiosSignallerBuilder {
 impl SymbiosSignallerBuilder {
     /// Return the current JWT from the refreshable [`TokenSource`], if any.
     fn current_token(&self) -> Option<String> {
-        self.token_source
-            .as_ref()
-            .and_then(|s| s.read().unwrap_or_else(|e| e.into_inner()).clone())
+        self.token_source.as_ref().and_then(|s| s.get())
     }
 
     /// Stable, non-cryptographic 64-bit fingerprint of the current token used

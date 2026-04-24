@@ -109,13 +109,18 @@ pub async fn get_service_auth(session: &AtprotoSession, aud: &str) -> Result<Str
 /// contain `:` which is reserved in a query value (RFC 3986 §3.4); encoding it
 /// keeps the URL well-formed.
 fn urlencode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{:02X}", b)),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
         }
     }
     out

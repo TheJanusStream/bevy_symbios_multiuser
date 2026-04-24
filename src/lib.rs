@@ -112,7 +112,14 @@ pub mod auth;
 #[cfg(feature = "client")]
 pub mod signaller;
 
-#[cfg(feature = "relay")]
+// The relay server depends on `axum`, `tokio::net::TcpListener`, and
+// `reqwest`'s native DNS/TLS stack — none of which build on wasm. Without
+// this target gate, `cargo build --target wasm32-unknown-unknown --all-features`
+// (a common pattern in full-stack workspaces that unify client and server
+// crates) would fail deep inside the relay's transitive dependencies.
+// Everyone actually running a relay uses native targets anyway, so gating
+// this off on wasm is free.
+#[cfg(all(feature = "relay", not(target_arch = "wasm32")))]
 pub mod relay;
 
 /// Re-exports for convenient use.

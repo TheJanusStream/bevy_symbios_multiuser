@@ -291,6 +291,17 @@ fn verify_es256k(token: &str, public_key: &k256::PublicKey) -> Result<(), String
     let signature =
         Signature::from_slice(&sig_bytes).map_err(|e| format!("invalid ES256K signature: {e}"))?;
 
+    // Reject high-S signatures. ECDSA over secp256k1 admits two valid
+    // signatures per message (one low-S, one high-S); accepting both would
+    // let an attacker intercept a token, flip S, and present the malleated
+    // form as a "different" valid token. BIP-66 (which ES256K inherits from)
+    // and every modern secp256k1 signing library canonicalise to low-S, so a
+    // high-S signature here is always either deliberately malleated or from
+    // a buggy signer — neither case should pass verification.
+    if signature.normalize_s().is_some() {
+        return Err("ES256K signature rejected: high-S (non-canonical) form".to_string());
+    }
+
     let verifying_key = VerifyingKey::from(public_key);
     verifying_key
         .verify(signing_input.as_bytes(), &signature)
@@ -422,6 +433,54 @@ mod tests {
                 .unwrap_err()
                 .contains("signature verification failed"),
             "should report signature failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_es256k_rejects_high_s_malleated_signature() {
+        // An attacker intercepting a valid ES256K JWT can flip the `s`
+        // component to `n - s` and the signature is still mathematically
+        // valid under the same public key. Our verifier must reject this
+        // non-canonical form; otherwise the malleated token is indistinguishable
+        // from the original and our issued-token registry cannot dedupe them.
+        use base64::Engine;
+        use k256::ecdsa::{Signature as K256Sig, SigningKey, signature::Signer};
+
+        let sk_bytes = [0x01u8; 32];
+        let secret = k256::SecretKey::from_slice(&sk_bytes).expect("valid test key");
+        let public = secret.public_key();
+        let signing_key = SigningKey::from(&secret);
+
+        let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"ES256K","typ":"JWT"}"#);
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"did:plc:test","exp":9999999999}"#);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+
+        // k256's default signer emits low-S (RFC 6979 + normalisation).
+        let sig: K256Sig = signing_key.sign(signing_input.as_bytes());
+        let low_sig_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes().as_slice());
+        let low_token = format!("{signing_input}.{low_sig_b64}");
+        assert!(
+            verify_es256k(&low_token, &public).is_ok(),
+            "canonical low-S signature must verify"
+        );
+
+        // Manufacture the malleated high-S form: (r, n - s) is also a valid
+        // ECDSA signature of the same message under the same key.
+        let (r, s) = sig.split_scalars();
+        let high_s = -*s;
+        let high_sig = K256Sig::from_scalars(r.to_bytes(), high_s.to_bytes())
+            .expect("negated s is a valid scalar");
+        let high_sig_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(high_sig.to_bytes().as_slice());
+        let high_token = format!("{signing_input}.{high_sig_b64}");
+
+        let err = verify_es256k(&high_token, &public).expect_err("high-S must be rejected");
+        assert!(
+            err.contains("high-S"),
+            "expected high-S rejection, got: {err}"
         );
     }
 
