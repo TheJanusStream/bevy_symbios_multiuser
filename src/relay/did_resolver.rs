@@ -836,7 +836,8 @@ impl DidResolver {
             let raw = did
                 .strip_prefix("did:web:")
                 .ok_or_else(|| DidError::Authoritative("invalid did:web".to_string()))?;
-            let (domain_raw, _) = split_did_web_domain_path(raw).map_err(DidError::Authoritative)?;
+            let (domain_raw, _) =
+                split_did_web_domain_path(raw).map_err(DidError::Authoritative)?;
             // Only %3A/%3a (port separator) is decoded — see did_document_url
             // for the rationale on intentionally skipping full RFC 3986 decode.
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
@@ -971,8 +972,9 @@ impl DidResolver {
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| DidError::Transient(format!("failed to read DID document body: {e}")))?;
+            let chunk = chunk.map_err(|e| {
+                DidError::Transient(format!("failed to read DID document body: {e}"))
+            })?;
             if body.len() + chunk.len() > MAX_DID_DOCUMENT_SIZE {
                 return Err(DidError::Authoritative(format!(
                     "DID document response too large (>{MAX_DID_DOCUMENT_SIZE} bytes), aborting"

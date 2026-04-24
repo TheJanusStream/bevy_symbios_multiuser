@@ -134,10 +134,10 @@ The relay applies multiple independent layers of defense:
 - **Control signal filtering** — Clients cannot forge `PeerJoined`/`PeerLeft` events; only the relay originates these.
 - **Invalid message disconnect (10 cumulative)** — Peers that send 10 cumulative invalid messages (malformed JSON, binary frames, forged control signals) are disconnected.
 - **Peer ID length cap (512 bytes)** — `peer_id` fields in `SignalEnvelope` are validated after deserialization.
-- **Per-target backpressure (50 strikes)** — When a target's relay channel (256 slots) is full, delivery silently stops after 50 consecutive channel-full strikes. Successful sends reset the counter; closed channels do not accumulate strikes so reconnected peers recover immediately.
-- **Per-target burst limit (64 msg/window)** — Each sender may route at most 64 messages to the same target per rate window, preventing one sender from monopolising a target's relay channel and starving signals from other peers.
-- **Per-sender token-bucket rate limit (burst 500, refill 20/s)** — Messages are dropped when the token budget is exhausted; the peer remains connected so that ICE/SDP retry logic can recover.
-- **Unique target cap (256/window)** — Each sender may address at most 256 distinct targets per window; senders that exceed this are disconnected.
+- **Per-target backpressure (log silencer at 50, kick at 256)** — When a target's relay channel (256 slots) is full, the sender's per-target strike counter is incremented and per-sender log emission is silenced after 50 strikes. An **aggregate** counter per target (shared across all senders) also accumulates strikes; once it crosses 256 (matching `RELAY_CHANNEL_CAPACITY`), the target's write task is shut down and the WebSocket is closed with code 1013 ("Try Again Later") so the client's reconnect logic can rebuild the mesh instead of stalling on silently dropped signals.
+- **Per-target burst limit (16 msg/window)** — Each sender may route at most 16 messages to the same target per 1-second window. A single sender can therefore contribute at most ~6% of `RELAY_CHANNEL_CAPACITY`, so kicking a target via the aggregate backpressure threshold requires ~16 coordinated attackers.
+- **Per-sender token-bucket rate limit (burst scaled to `max_peers`, refill 20/s)** — Burst capacity is `max(1024, max_peers × 16)`, capped at 16,384 (default relay with `max_peers=512` → 8,192). Enough headroom to absorb a full-mesh WebRTC init without dropping legitimate SDP offers or ICE candidates. A peer that still exhausts the budget is **disconnected** — the signaling channel does not retransmit, so surfacing a hard error lets the client's reconnect logic recover instead of leaving the mesh silently stalled.
+- **Unique target cap (`clamp(max_peers, 256, 4096)` per window)** — Each sender may address at most this many distinct targets per 1-second window (4,096 when `max_peers = 0`/unlimited). Senders that exceed the cap are disconnected to prevent per-target counter-map bloat from forged random target IDs.
 - **JWT audience validation** — When `service_did` is set, the relay validates the JWT `aud` claim to prevent cross-service token replay.
 - **Room isolation** — Cross-room signals are dropped; peers only see events from peers in the same room.
 
@@ -186,15 +186,14 @@ let service_token = get_service_auth(
 ).await?;
 ```
 
-Wrap the service token in a `TokenSourceRes` resource. The plugin reads the current token from this resource on every connection/reconnect attempt, so swapping the inner value is enough to roll over to a fresh token:
+Wrap the service token in a `TokenSourceRes` resource. The plugin reads the current token from this resource on every connection/reconnect attempt, so swapping the inner value via [`TokenSource::set`] is enough to roll over to a fresh token:
 
 ```rust
-use std::sync::{Arc, RwLock};
 use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 
-let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
-app.insert_resource(session);                          // optional — for UI-level identity (DID, handle)
-app.insert_resource(TokenSourceRes(token_source));     // required for authenticated relay connection
+let token_source = TokenSource::new(Some(service_token));
+app.insert_resource(session);                                    // optional — for UI-level identity (DID, handle)
+app.insert_resource(TokenSourceRes(token_source.clone()));       // required for authenticated relay connection
 app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::new(
     "wss://relay.example.com/ws",
 ));
@@ -210,7 +209,7 @@ app.add_plugins(SymbiosMultiuserPlugin::<GameMessage>::deferred());
 
 // Later, once the OAuth flow has returned an `AtprotoSession` and a service
 // auth token has been issued, insert these resources to open the connection:
-let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+let source = TokenSource::new(Some(service_token));
 commands.insert_resource(session);
 commands.insert_resource(TokenSourceRes(source));
 commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
@@ -222,22 +221,21 @@ commands.insert_resource(SymbiosMultiuserConfig::<GameMessage> {
 
 ### Token Refresh for Long-Lived Apps
 
-Service auth tokens are short-lived (minutes). The OAuth access token inside `AtprotoSession::session` is refreshed transparently by `proto-blue-oauth` whenever the inner `OAuthSession` makes a request, so the only thing the host needs to rotate manually is the service auth token handed to the relay. Re-issue it periodically (or on 401 from the relay) and swap the value inside `TokenSource`:
+Service auth tokens are short-lived (minutes). The OAuth access token inside `AtprotoSession::session` is refreshed transparently by `proto-blue-oauth` whenever the inner `OAuthSession` makes a request, so the only thing the host needs to rotate manually is the service auth token handed to the relay. Re-issue it periodically (or on 401 from the relay) and swap the value inside `TokenSource` via [`TokenSource::set`]:
 
 ```rust
-use std::sync::{Arc, RwLock};
 use bevy_symbios_multiuser::auth::get_service_auth;
 use bevy_symbios_multiuser::signaller::{TokenSource, TokenSourceRes};
 
-let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+let token_source = TokenSource::new(Some(service_token));
 app.insert_resource(TokenSourceRes(token_source.clone()));
 
 // Later, when the service auth token is near expiry:
 let new_service_token = get_service_auth(&session, "did:web:relay.example.com").await?;
-*token_source.write().unwrap() = Some(new_service_token);
+token_source.set(Some(new_service_token));
 ```
 
-> **Warning:** Complete the `get_service_auth` await *before* acquiring the `RwLock` write guard. Holding the write guard across an `.await` would block every reconnect attempt that tries to read the current token for the duration of the HTTP request.
+`TokenSource::get` clones the inner value and releases the read guard before returning, and `TokenSource::set` acquires the write guard only for the duration of the swap — the lock is never held across an `.await`, so the signaller's reconnect path cannot deadlock against a host refreshing tokens over the network.
 
 ## Modules
 

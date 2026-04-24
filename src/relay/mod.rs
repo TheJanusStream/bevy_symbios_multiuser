@@ -140,12 +140,15 @@
 //!   a single sender's contribution to ~6% of channel capacity, raising the
 //!   coordination cost of stuffing a victim's channel to 16 attackers.
 //! - **Per-sender rate limiting** — Each peer is rate-limited via a token bucket
-//!   with a burst capacity of 500 messages and a steady-state refill of 20
-//!   tokens per second. The high burst accommodates WebRTC mesh initialization
-//!   (joining a room with N peers generates N SDP offers + multiple ICE
-//!   candidates each), while the low refill rate caps sustained throughput.
-//!   Messages are dropped when the token budget is exhausted; the peer
-//!   remains connected so that ICE/SDP retry logic can recover.
+//!   with a burst capacity of `max(1024, max_peers × 16)`, capped at 16,384,
+//!   and a steady-state refill of 20 tokens per second. The burst scales with
+//!   the operator's configured room size so a full-mesh WebRTC init (N SDP
+//!   offers + multiple ICE candidates each) never trips the limiter on
+//!   legitimate traffic, while the low refill rate caps sustained throughput.
+//!   A peer that still exhausts the budget is **disconnected**: the signaling
+//!   channel does not retransmit, so silently dropping signals would leave
+//!   the mesh stalled — surfacing a hard error lets the client's reconnect
+//!   logic rebuild the mesh cleanly.
 //! - **Per-domain DID fetch concurrency limit** — Each `did:web` domain is
 //!   limited to 10 concurrent in-flight fetches. Slots are released as soon as
 //!   each fetch completes (via RAII guard), so attacker requests that fail
@@ -163,11 +166,12 @@
 //!   DIDs and UUIDs are well under this limit; oversized values are rejected
 //!   as invalid messages to prevent per-target map bloat and log-output
 //!   amplification.
-//! - **Unique target cap** — Each sender may address at most 256 unique targets
-//!   within a single per-target rate window. Legitimate peers target at most
-//!   the number of peers in their room; an attacker forging random target IDs
-//!   to bloat the per-target counter map is disconnected when the cap is
-//!   exceeded.
+//! - **Unique target cap** — Each sender may address at most
+//!   `clamp(max_peers, 256, 4096)` unique targets within a single per-target
+//!   rate window (4,096 when `max_peers = 0`/unlimited). Legitimate peers
+//!   target at most the number of peers in their room; an attacker forging
+//!   random target IDs to bloat the per-target counter map is disconnected
+//!   when the cap is exceeded.
 //! - **JWT audience validation** — When [`RelayConfig::service_did`] is set,
 //!   the relay validates the JWT `aud` claim against the configured value.
 //!   This prevents cross-service token replay attacks where a JWT issued for
@@ -208,9 +212,12 @@ pub struct RelayConfig {
     /// The address to bind the server to (e.g. `"0.0.0.0:3536"`).
     pub bind_addr: String,
     /// If `true`, reject WebSocket connections that do not present a valid
-    /// ATProto JWT (via header, subprotocol, or query param). When `false`,
-    /// authentication is opportunistic: valid tokens are used for identity while
-    /// clients that present no token receive a random UUID.
+    /// ATProto JWT. The token is accepted via the `Authorization: Bearer`
+    /// header (native clients) or the `Sec-WebSocket-Protocol: access_token,
+    /// <jwt>` subprotocol trick (WASM clients); it is **not** accepted via
+    /// query string (query parameters leak into reverse-proxy access logs).
+    /// When `false`, authentication is opportunistic: valid tokens are used
+    /// for identity while clients that present no token receive a random UUID.
     pub auth_required: bool,
     /// Maximum number of concurrent peer connections. New connections are
     /// rejected with HTTP 503 once this limit is reached. `0` means unlimited.

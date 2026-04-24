@@ -909,7 +909,6 @@ impl SymbiosSignaller {
 /// # Example
 ///
 /// ```rust,ignore
-/// use std::sync::{Arc, RwLock};
 /// use bevy_symbios_multiuser::signaller::{signaller_with_token_source, TokenSource};
 /// use bevy_symbios_multiuser::auth::get_service_auth;
 ///
@@ -918,13 +917,12 @@ impl SymbiosSignaller {
 /// // is the only safe token for third-party services — the OAuth access
 /// // token is DPoP-bound and cannot be handed off.
 /// let service_token = get_service_auth(&session, relay_did).await?;
-/// let token_source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+/// let token_source = TokenSource::new(Some(service_token));
 /// let builder = signaller_with_token_source(token_source.clone());
 ///
 /// // Later, when the service token is near expiry, re-issue it:
 /// let new_service_token = get_service_auth(&session, relay_did).await?;
-/// let new_token = get_service_auth(&client, &new_session, pds_url, relay_did).await?;
-/// *token_source.write().unwrap() = Some(new_token);
+/// token_source.set(Some(new_service_token));
 /// ```
 pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
