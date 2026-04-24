@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_multiuser"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Janus"]
 description = "Multi-user networking for Bevy via ATProto auth with WebRTC p2p messaging."
@@ -43,6 +43,13 @@ base64 = { version = "0.22", optional = true }
 moka = { version = "0.12", default-features = false, features = ["sync", "future"], optional = true }
 percent-encoding = { version = "2", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+# Pure-Rust async DNS resolver. Replaces `std::net::ToSocketAddrs` in the
+# did:web SSRF validation path: the blocking `getaddrinfo` path could not be
+# cancelled when the enclosing Future was dropped, letting an attacker with a
+# tarpit nameserver hold the did:web concurrency budget long after the relay
+# had given up on the client (cancellable async sockets release the guard
+# immediately on Drop).
+hickory-resolver = { version = "0.26", optional = true }
 
 # Native-only signaller transport.
 #
@@ -72,7 +79,7 @@ ws_stream_wasm = { version = "0.7", optional = true }
 default = ["client", "tls"]
 client = ["dep:reqwest", "dep:proto-blue-oauth", "dep:async-tungstenite", "dep:ws_stream_wasm", "dep:futures-util", "dep:futures-timer", "dep:uuid"]
 tls = ["reqwest/rustls-tls", "async-tungstenite/async-tls"]
-relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "dep:p256", "dep:k256", "dep:bs58", "dep:base64", "dep:moka", "dep:tower-http", "dep:percent-encoding", "dep:tracing-subscriber"]
+relay = ["dep:axum", "dep:tokio", "dep:dashmap", "dep:futures-util", "dep:uuid", "dep:jsonwebtoken", "dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "dep:p256", "dep:k256", "dep:bs58", "dep:base64", "dep:moka", "dep:tower-http", "dep:percent-encoding", "dep:tracing-subscriber", "dep:hickory-resolver"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

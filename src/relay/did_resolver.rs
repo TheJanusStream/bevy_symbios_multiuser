@@ -33,14 +33,56 @@
 
 use base64::Engine;
 use dashmap::DashMap;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::ResolverOpts;
 use jsonwebtoken::DecodingKey;
 use moka::sync::Cache;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serde::Deserialize;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// A resolver-level error distinguishing transient infrastructure failures
+/// from authoritative remote failures.
+///
+/// Only [`DidError::Authoritative`] errors are stored in the negative cache.
+/// Caching a [`DidError::Transient`] would amplify a local bottleneck (DNS
+/// timeout, concurrency-limit rejection, TCP connect refused) into a hard
+/// 60-second outage for a DID that is still perfectly valid — the legitimate
+/// user would be locked out by the relay's own cache well after the transient
+/// condition has cleared.
+#[derive(Clone, Debug)]
+pub enum DidError {
+    /// Remote server gave a deterministic failure (404, malformed JSON,
+    /// unsupported key type, SSRF-blocked address). Repeated fetches would
+    /// fail the same way, so the result is safe to negative-cache.
+    Authoritative(String),
+    /// Local or network-level failure (DNS timeout, concurrency limit
+    /// exhausted, connection refused, 5xx from origin). A retry may succeed
+    /// once the transient condition clears; must NOT be negative-cached.
+    Transient(String),
+}
+
+impl DidError {
+    /// Return the human-readable error message.
+    pub fn message(&self) -> &str {
+        match self {
+            DidError::Authoritative(s) | DidError::Transient(s) => s,
+        }
+    }
+
+    /// Return `true` if this is a transient/retryable error.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, DidError::Transient(_))
+    }
+}
+
+impl std::fmt::Display for DidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message().fmt(f)
+    }
+}
 
 /// Default cache TTL for resolved DID signing keys (5 minutes).
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -144,9 +186,19 @@ pub struct DidResolver {
     domain_fetch_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
     /// Global in-flight `did:web` fetch counter across all domains. Incremented
     /// before and decremented after each fetch (via RAII guard). Works alongside
-    /// the per-domain counter to cap concurrent outbound DNS + HTTP activity,
-    /// preventing subdomain spraying from exhausting the blocking thread pool.
+    /// the per-domain counter to cap concurrent outbound activity.
     global_didweb_fetch_count: Arc<AtomicU64>,
+    /// Pure-Rust async DNS resolver (hickory). Replaces the previous
+    /// `std::net::ToSocketAddrs`-in-`spawn_blocking` approach: the old path
+    /// used the OS's blocking `getaddrinfo`, which cannot be cancelled when
+    /// the enclosing future is dropped. An attacker with a tarpit nameserver
+    /// could exploit this by holding 50 OS threads (one per global concurrency
+    /// slot) for the OS's default DNS timeout (~120 s) long after the relay
+    /// had dropped their client connection at 15 s, permanently denying the
+    /// did:web auth path. Hickory speaks DNS over its own UDP/TCP sockets, so
+    /// dropping the future closes the socket and releases the concurrency
+    /// guard immediately.
+    async_resolver: TokioResolver,
     plc_directory: String,
 }
 
@@ -395,6 +447,32 @@ impl Drop for ConcurrencyGuard {
     }
 }
 
+/// Split a canonicalized did:web domain (host + optional port) into its
+/// hostname and port components. Assumes the input has already been through
+/// [`canonicalize_did_web_domain`] so IDN hosts are ASCII and IPv6 literals
+/// are bracketed.
+fn split_host_port(domain: &str) -> (String, u16) {
+    if domain.starts_with('[') {
+        if let Some(end) = domain.find(']') {
+            let host = domain[1..end].to_string();
+            let after = &domain[end + 1..];
+            if let Some(port_str) = after.strip_prefix(':') {
+                let port = port_str.parse().unwrap_or(443);
+                return (host, port);
+            }
+            return (host, 443);
+        }
+        return (domain.to_string(), 443);
+    }
+    match domain.rsplit_once(':') {
+        Some((host, port_str)) if !host.is_empty() => match port_str.parse() {
+            Ok(p) => (host.to_string(), p),
+            Err(_) => (domain.to_string(), 443),
+        },
+        _ => (domain.to_string(), 443),
+    }
+}
+
 /// Resolve a domain's DNS records, reject private/loopback IPs (SSRF protection),
 /// and return the first safe [`std::net::SocketAddr`] along with RAII concurrency
 /// guards.
@@ -404,111 +482,116 @@ impl Drop for ConcurrencyGuard {
 /// attacks where the domain resolves to a different (private) IP on the second
 /// lookup performed by reqwest.
 ///
-/// Concurrency guards are acquired **inside** the [`tokio::task::spawn_blocking`]
-/// closure so that if the async caller is dropped (e.g. client disconnects),
-/// the slot is not freed until the OS thread finishes `getaddrinfo`. Without
-/// this, an attacker could repeatedly connect/disconnect to queue un-cancellable
-/// blocking tasks while the concurrency counter stays at zero, exhausting the
-/// Tokio blocking thread pool (512 threads by default).
+/// DNS resolution runs through `hickory-resolver`'s async UDP/TCP sockets
+/// rather than the OS's blocking `getaddrinfo`, which is critical for
+/// cancellation. If the async caller is dropped (e.g. the client disconnects
+/// mid-handshake), the future is cancelled, the UDP socket is closed, and the
+/// RAII concurrency guards are dropped — all synchronously, in the calling
+/// task. The previous `spawn_blocking` + `std::net::ToSocketAddrs` design
+/// could not be cancelled: an attacker with a tarpit nameserver could hold
+/// the global concurrency slot for the OS's default DNS timeout (~120 s),
+/// permanently denying did:web authentication with minimal bandwidth.
 ///
-/// The per-domain counter is looked up **and incremented** inside `spawn_blocking`
-/// while holding the [`DashMap`] entry lock. This closes the TOCTOU race where
-/// [`ConcurrencyGuard::drop`] could call `remove_if` between the map lookup and
-/// the `fetch_add`, causing a new request to track state on a disconnected `Arc`.
+/// The per-domain counter is looked up **and incremented** while holding the
+/// [`DashMap`] entry lock, closing the TOCTOU race where
+/// [`ConcurrencyGuard::drop`] could call `remove_if` between the map lookup
+/// and the `fetch_add`, causing a new request to track state on a
+/// disconnected `Arc`.
 async fn validate_and_resolve_domain(
     domain: &str,
     global_counter: Arc<AtomicU64>,
     domain_fetch_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
-) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), String> {
-    // Add default HTTPS port if no port is present, so ToSocketAddrs works.
-    // Bracketed IPv6 addresses like [2001:db8::1] contain colons but have no
-    // port — detect them by the leading bracket rather than a naive colon check.
-    let host_port = if domain.starts_with('[') {
-        // Bracketed IPv6: [addr] or [addr]:port
-        if domain.contains("]:") {
-            domain.to_string()
-        } else {
-            format!("{domain}:443")
-        }
-    } else if domain.contains(':') {
-        // IPv4 or hostname with explicit port
-        domain.to_string()
-    } else {
-        format!("{domain}:443")
-    };
+    async_resolver: &TokioResolver,
+) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), DidError> {
+    // Acquire the global concurrency guard first. Because hickory resolution
+    // is fully async and cancellable, dropping this future releases the guard
+    // synchronously — no leak via detached OS thread is possible here.
+    let global_prev = global_counter.fetch_add(1, Ordering::Relaxed);
+    let global_guard = ConcurrencyGuard::new(global_counter);
+    if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
+        return Err(DidError::Transient(format!(
+            "global did:web concurrency limit exceeded \
+             ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
+        )));
+    }
 
-    // Everything below runs inside spawn_blocking: guard acquisition, DNS
-    // resolution, and IP validation. This ensures the concurrency guards
-    // are held by the OS thread and not freed if the async caller is dropped.
+    // Acquire the per-domain guard while holding the DashMap entry lock so
+    // that ConcurrencyGuard::drop cannot call remove_if between the map
+    // lookup and the increment (TOCTOU race fix).
     let domain_owned = domain.to_string();
-    tokio::task::spawn_blocking(move || {
-        // Acquire the global concurrency guard on the blocking thread.
-        let global_prev = global_counter.fetch_add(1, Ordering::Relaxed);
-        let global_guard = ConcurrencyGuard::new(global_counter);
-        if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
-            return Err(format!(
-                "global did:web concurrency limit exceeded \
-                 ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
-            ));
-        }
+    let domain_prev;
+    let domain_counter = {
+        let entry = domain_fetch_counts
+            .entry(domain_owned.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        domain_prev = entry.fetch_add(1, Ordering::Relaxed);
+        Arc::clone(&*entry)
+    };
+    let domain_guard = ConcurrencyGuard::new_domain(
+        domain_counter,
+        Arc::clone(&domain_fetch_counts),
+        domain_owned.clone(),
+    );
+    if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
+        return Err(DidError::Transient(format!(
+            "concurrency limit exceeded for did:web domain '{domain_owned}' \
+             ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
+        )));
+    }
 
-        // Acquire the per-domain concurrency guard on the blocking thread.
-        // The fetch_add is performed while holding the DashMap entry lock so
-        // that ConcurrencyGuard::drop cannot call remove_if between the map
-        // lookup and the increment (TOCTOU race fix).
-        let domain_prev;
-        let domain_counter = {
-            let entry = domain_fetch_counts
-                .entry(domain_owned.clone())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            domain_prev = entry.fetch_add(1, Ordering::Relaxed);
-            Arc::clone(&*entry)
+    let (host, port) = split_host_port(&domain_owned);
+
+    // Hickory accepts both IP literals and hostnames via `lookup_ip`. Its
+    // internal short-circuit recognises IPv4/IPv6 literals and returns them
+    // without issuing a DNS query, matching ToSocketAddrs semantics for the
+    // literal case while keeping the async/cancellable story for names.
+    let lookup = async_resolver.lookup_ip(host.as_str()).await.map_err(|e| {
+        // DNS failures are transient by definition: the target domain might
+        // be legitimately valid, and the failure is network-level.
+        DidError::Transient(format!("failed to resolve domain '{domain_owned}': {e}"))
+    })?;
+
+    let ips: Vec<std::net::IpAddr> = lookup.iter().collect();
+    if ips.is_empty() {
+        return Err(DidError::Transient(format!(
+            "domain '{domain_owned}' resolved to no addresses"
+        )));
+    }
+
+    for ip in &ips {
+        // Unmap any IPv6 that embeds an IPv4 address back to IPv4 before
+        // safety checks. `to_ipv4()` covers BOTH IPv4-mapped (::ffff:a.b.c.d)
+        // AND IPv4-compatible (::a.b.c.d) forms — using `to_ipv4_mapped()`
+        // would miss the compatible form, letting an attacker bypass the
+        // loopback check by resolving to e.g. `::127.0.0.1`, which dual-stack
+        // Linux silently routes to the v4 loopback interface.
+        let checked = match ip {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(*v6)),
+            std::net::IpAddr::V4(v4) => std::net::IpAddr::V4(*v4),
         };
-        let domain_guard =
-            ConcurrencyGuard::new_domain(domain_counter, domain_fetch_counts, domain_owned.clone());
-        if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
-            return Err(format!(
-                "concurrency limit exceeded for did:web domain '{domain_owned}' \
-                 ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
-            ));
+        if checked.is_loopback()
+            || checked.is_unspecified()
+            || is_private_ip(&checked)
+            || is_link_local(&checked)
+        {
+            // SSRF block is deterministic: the same domain resolving to the
+            // same private IP will always be rejected. Safe to treat as
+            // authoritative so the negative cache short-circuits the retry.
+            return Err(DidError::Authoritative(format!(
+                "did:web domain '{domain_owned}' resolves to private/loopback address {checked}, \
+                 request blocked (SSRF protection)"
+            )));
         }
+    }
 
-        // std::net::ToSocketAddrs delegates to the OS's blocking getaddrinfo.
-        let addrs: Vec<std::net::SocketAddr> = host_port
-            .to_socket_addrs()
-            .map(|iter| iter.collect::<Vec<_>>())
-            .map_err(|e| format!("failed to resolve domain '{domain_owned}': {e}"))?;
-
-        if addrs.is_empty() {
-            return Err(format!("domain '{domain_owned}' resolved to no addresses"));
-        }
-
-        for addr in &addrs {
-            // Unmap any IPv6 that embeds an IPv4 address back to IPv4 before
-            // safety checks. `to_ipv4()` covers BOTH IPv4-mapped (::ffff:a.b.c.d)
-            // AND IPv4-compatible (::a.b.c.d) forms — using `to_ipv4_mapped()`
-            // would miss the compatible form, letting an attacker bypass the
-            // loopback check by resolving to e.g. `::127.0.0.1`, which dual-stack
-            // Linux silently routes to the v4 loopback interface.
-            let ip = match addr.ip() {
-                std::net::IpAddr::V6(v6) => v6
-                    .to_ipv4()
-                    .map(std::net::IpAddr::V4)
-                    .unwrap_or(std::net::IpAddr::V6(v6)),
-                v4 => v4,
-            };
-            if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) || is_link_local(&ip) {
-                return Err(format!(
-                    "did:web domain '{domain_owned}' resolves to private/loopback address {ip}, \
-                     request blocked (SSRF protection)"
-                ));
-            }
-        }
-
-        Ok((addrs[0], global_guard, domain_guard))
-    })
-    .await
-    .map_err(|e| format!("DNS resolution task panicked: {e}"))?
+    Ok((
+        std::net::SocketAddr::new(ips[0], port),
+        global_guard,
+        domain_guard,
+    ))
 }
 
 /// Check if an IP address is in a private, reserved, or otherwise non-global range.
@@ -631,6 +714,20 @@ impl DidResolver {
 
         let global_didweb_fetch_count = Arc::new(AtomicU64::new(0));
 
+        // Build the pure-Rust async DNS resolver. The total worst-case DNS
+        // time is `timeout * attempts` — we keep the product (6 s) well below
+        // HANDSHAKE_TIMEOUT (15 s) so a slow DNS server cannot burn the whole
+        // handshake budget on name resolution alone, leaving no time for the
+        // subsequent HTTP DID-document fetch.
+        let mut opts = ResolverOpts::default();
+        opts.timeout = Duration::from_secs(3);
+        opts.attempts = 2;
+        let async_resolver = TokioResolver::builder_tokio()
+            .expect("failed to initialise DNS resolver (system config)")
+            .with_options(opts)
+            .build()
+            .expect("failed to build DNS resolver");
+
         Self {
             client,
             cache,
@@ -638,6 +735,7 @@ impl DidResolver {
             domain_clients,
             domain_fetch_counts,
             global_didweb_fetch_count,
+            async_resolver,
             plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
         }
     }
@@ -657,8 +755,15 @@ impl DidResolver {
     /// DID are coalesced via [`moka::future::Cache::try_get_with`] — only one
     /// outbound fetch is issued and all waiters share the result.
     ///
+    /// Only authoritative failures (404, malformed document, unsupported key
+    /// type, SSRF-blocked address) are stored in the negative cache.
+    /// Transient failures (DNS timeout, concurrency-limit rejection) are
+    /// returned unchanged but **not** cached, so a legitimate user whose
+    /// request races a bottleneck is not locked out for the cache TTL by the
+    /// relay's own amplification of its local load.
+    ///
     /// The moka cache handles TTL expiry and W-TinyLFU eviction automatically.
-    pub async fn resolve_key(&self, did: &str) -> Result<ResolvedKey, String> {
+    pub async fn resolve_key(&self, did: &str) -> Result<ResolvedKey, DidError> {
         // Normalize the DID for cache keying. DNS is case-insensitive, so
         // did:web:Example.com and did:web:example.com should share a cache
         // entry. Lowercase the domain portion of did:web DIDs to prevent
@@ -666,12 +771,13 @@ impl DidResolver {
         let normalized = normalize_did(did);
         let did = normalized.as_str();
 
-        // Reject DIDs that recently failed resolution to prevent repeated
-        // outbound requests (DDoS reflection / resource exhaustion).
+        // Reject DIDs that recently failed resolution with an AUTHORITATIVE
+        // error (the negative cache never stores transient errors, so reaching
+        // this branch means the remote server genuinely told us no).
         if let Some(cached_err) = self.negative_cache.get(did) {
-            return Err(format!(
+            return Err(DidError::Authoritative(format!(
                 "DID resolution recently failed (cached): {cached_err}"
-            ));
+            )));
         }
 
         // try_get_with coalesces concurrent lookups for the same key: if
@@ -682,14 +788,18 @@ impl DidResolver {
         self.cache
             .try_get_with(did.to_string(), async {
                 let doc = self.fetch_did_document(&did_owned).await.inspect_err(|e| {
-                    negative_cache.insert(did_owned.clone(), e.clone());
+                    if !e.is_transient() {
+                        negative_cache.insert(did_owned.clone(), e.message().to_string());
+                    }
                 })?;
-                extract_signing_key(&doc).inspect_err(|e| {
-                    negative_cache.insert(did_owned.clone(), e.clone());
-                })
+                extract_signing_key(&doc)
+                    .map_err(DidError::Authoritative)
+                    .inspect_err(|e| {
+                        negative_cache.insert(did_owned.clone(), e.message().to_string());
+                    })
             })
             .await
-            .map_err(|e: Arc<String>| (*e).clone())
+            .map_err(|e: Arc<DidError>| (*e).clone())
     }
 
     /// Fetch the DID document from the appropriate directory.
@@ -701,8 +811,8 @@ impl DidResolver {
     ///
     /// For `did:web`, the domain is resolved and validated against private/loopback
     /// IPs, and the validated address is pinned to prevent DNS rebinding (SSRF).
-    async fn fetch_did_document(&self, did: &str) -> Result<DidDocument, String> {
-        let url = did_document_url(did, &self.plc_directory)?;
+    async fn fetch_did_document(&self, did: &str) -> Result<DidDocument, DidError> {
+        let url = did_document_url(did, &self.plc_directory).map_err(DidError::Authoritative)?;
 
         // SSRF protection: for did:web, resolve DNS once, validate IPs, and
         // pin the validated address so reqwest cannot re-resolve to a different
@@ -723,8 +833,10 @@ impl DidResolver {
         let mut _domain_guard: Option<ConcurrencyGuard> = None;
 
         let pinned_client = if did.starts_with("did:web:") {
-            let raw = did.strip_prefix("did:web:").ok_or("invalid did:web")?;
-            let (domain_raw, _) = split_did_web_domain_path(raw)?;
+            let raw = did
+                .strip_prefix("did:web:")
+                .ok_or_else(|| DidError::Authoritative("invalid did:web".to_string()))?;
+            let (domain_raw, _) = split_did_web_domain_path(raw).map_err(DidError::Authoritative)?;
             // Only %3A/%3a (port separator) is decoded — see did_document_url
             // for the rationale on intentionally skipping full RFC 3986 decode.
             let domain = domain_raw.replace("%3A", ":").replace("%3a", ":");
@@ -735,23 +847,21 @@ impl DidResolver {
             // under the URL-canonicalized `xn--test-9ua.attacker.com`, missing
             // the pin and silently falling back to system DNS — re-opening the
             // SSRF/DNS-rebinding hole the pin was supposed to close.
-            let domain = canonicalize_did_web_domain(&domain)?;
+            let domain = canonicalize_did_web_domain(&domain).map_err(DidError::Authoritative)?;
 
             // Use the full domain (host + port) as the cache key so that
             // `did:web:example.com%3A80` and `did:web:example.com` don't
             // share a pinned client (which would poison TLS on port 80).
             let cache_key = domain.clone();
 
-            // Check the domain client cache BEFORE spawning a blocking DNS
-            // resolution task. Many unique DIDs sharing the same domain
-            // (e.g. `did:web:victim.com:u:1`, `did:web:victim.com:u:2`) would
-            // otherwise each block a Tokio thread on getaddrinfo only to
-            // discard the resolved address and reuse the cached client.
+            // Check the domain client cache before doing DNS work. Many unique
+            // DIDs sharing the same domain (e.g. `did:web:victim.com:u:1`,
+            // `did:web:victim.com:u:2`) would otherwise each issue a fresh DNS
+            // query only to discard the resolved address and reuse the cached
+            // client.
             let client = if let Some(cached) = self.domain_clients.get(&cache_key) {
                 // Acquire concurrency guards for the HTTP fetch even when DNS
                 // is skipped — the guards limit concurrent fetches per domain.
-                // Since there is no spawn_blocking here, acquiring in async
-                // context is correct (no blocking thread outlives the guard).
                 let global_prev = self
                     .global_didweb_fetch_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -759,10 +869,10 @@ impl DidResolver {
                     &self.global_didweb_fetch_count,
                 )));
                 if global_prev >= GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT {
-                    return Err(format!(
+                    return Err(DidError::Transient(format!(
                         "global did:web concurrency limit exceeded \
                          ({GLOBAL_DIDWEB_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
-                    ));
+                    )));
                 }
                 // Increment while holding the entry lock to close the TOCTOU
                 // race between fetch_add and remove_if in ConcurrencyGuard::drop.
@@ -781,21 +891,22 @@ impl DidResolver {
                     domain.clone(),
                 ));
                 if domain_prev >= DOMAIN_FETCH_CONCURRENCY_LIMIT {
-                    return Err(format!(
+                    return Err(DidError::Transient(format!(
                         "concurrency limit exceeded for did:web domain '{domain}' \
                          ({DOMAIN_FETCH_CONCURRENCY_LIMIT} concurrent fetches)"
-                    ));
+                    )));
                 }
                 cached
             } else {
-                // No cached client — resolve DNS, validate the IP, and build a
-                // pinned client. Guards (including the domain counter increment)
-                // are acquired inside spawn_blocking so they are not freed if
-                // the async caller is cancelled mid-DNS.
+                // No cached client — resolve DNS (async, cancellable), validate
+                // the IP, and build a pinned client. If this future is dropped
+                // while the DNS query is in flight, hickory closes its socket
+                // and the RAII guards release their slots synchronously.
                 let (validated_addr, global_guard, domain_guard) = validate_and_resolve_domain(
                     &domain,
                     Arc::clone(&self.global_didweb_fetch_count),
                     Arc::clone(&self.domain_fetch_counts),
+                    &self.async_resolver,
                 )
                 .await?;
                 _global_guard = Some(global_guard);
@@ -812,7 +923,9 @@ impl DidResolver {
                     .redirect(reqwest::redirect::Policy::none())
                     .resolve(&host_only, validated_addr)
                     .build()
-                    .map_err(|e| format!("failed to build pinned HTTP client: {e}"))?;
+                    .map_err(|e| {
+                        DidError::Transient(format!("failed to build pinned HTTP client: {e}"))
+                    })?;
                 self.domain_clients.insert(cache_key, pinned.clone());
                 pinned
             };
@@ -827,20 +940,28 @@ impl DidResolver {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| format!("DID document fetch failed: {e}"))?;
+            .map_err(|e| DidError::Transient(format!("DID document fetch failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("DID directory returned {status} for {did}"));
+            // Client errors (4xx) come from the origin and are authoritative:
+            // the server definitively told us the DID isn't there. Server
+            // errors (5xx) and anything else are transient — the origin may
+            // recover and the DID could then resolve.
+            let msg = format!("DID directory returned {status} for {did}");
+            if status.is_client_error() {
+                return Err(DidError::Authoritative(msg));
+            }
+            return Err(DidError::Transient(msg));
         }
 
         // Check Content-Length hint if present (not authoritative, but fast).
         if let Some(len) = resp.content_length()
             && len as usize > MAX_DID_DOCUMENT_SIZE
         {
-            return Err(format!(
+            return Err(DidError::Authoritative(format!(
                 "DID document response too large ({len} bytes, max {MAX_DID_DOCUMENT_SIZE})"
-            ));
+            )));
         }
 
         // Stream the body with a hard size limit to prevent memory exhaustion.
@@ -850,17 +971,18 @@ impl DidResolver {
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("failed to read DID document body: {e}"))?;
+            let chunk = chunk
+                .map_err(|e| DidError::Transient(format!("failed to read DID document body: {e}")))?;
             if body.len() + chunk.len() > MAX_DID_DOCUMENT_SIZE {
-                return Err(format!(
+                return Err(DidError::Authoritative(format!(
                     "DID document response too large (>{MAX_DID_DOCUMENT_SIZE} bytes), aborting"
-                ));
+                )));
             }
             body.extend_from_slice(&chunk);
         }
 
         serde_json::from_slice::<DidDocument>(&body)
-            .map_err(|e| format!("invalid DID document JSON: {e}"))
+            .map_err(|e| DidError::Authoritative(format!("invalid DID document JSON: {e}")))
     }
 }
 
@@ -1300,11 +1422,20 @@ mod tests {
     /// Helper: call `validate_and_resolve_domain` with fresh counters.
     async fn resolve_domain_for_test(
         domain: &str,
-    ) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), String> {
+    ) -> Result<(std::net::SocketAddr, ConcurrencyGuard, ConcurrencyGuard), DidError> {
+        let mut opts = ResolverOpts::default();
+        opts.timeout = Duration::from_secs(3);
+        opts.attempts = 2;
+        let resolver = TokioResolver::builder_tokio()
+            .expect("build resolver")
+            .with_options(opts)
+            .build()
+            .expect("build resolver");
         validate_and_resolve_domain(
             domain,
             Arc::new(AtomicU64::new(0)),
             Arc::new(DashMap::new()),
+            &resolver,
         )
         .await
     }
@@ -1312,10 +1443,14 @@ mod tests {
     #[tokio::test]
     async fn ssrf_rejects_loopback() {
         let result = resolve_domain_for_test("localhost").await;
-        assert!(result.is_err(), "expected loopback to be rejected");
+        let err = result.expect_err("expected loopback to be rejected");
         assert!(
-            result.unwrap_err().contains("SSRF protection"),
-            "error should mention SSRF"
+            err.message().contains("SSRF protection"),
+            "error should mention SSRF: {err}"
+        );
+        assert!(
+            !err.is_transient(),
+            "SSRF block must be authoritative so the negative cache short-circuits retries"
         );
     }
 
@@ -1419,6 +1554,58 @@ mod tests {
         assert!(
             err.contains('\u{1F680}'),
             "error should include the actual prefix char"
+        );
+    }
+
+    // ── Negative-cache regression tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn transient_resolver_errors_are_not_negative_cached() {
+        // Point the resolver at an unreachable PLC directory so fetches fail
+        // with a transport-level error (transient). The legitimate user whose
+        // request races such a failure must not be locked out for the cache
+        // TTL — the negative cache must skip transient errors, so a retry
+        // after the transient clears should issue a fresh fetch rather than
+        // receiving the cached failure.
+        let resolver = DidResolver::with_plc_directory("http://127.0.0.1:1".to_string());
+
+        let err = resolver
+            .resolve_key("did:plc:probe1")
+            .await
+            .err()
+            .expect("unreachable PLC must fail");
+        assert!(
+            err.is_transient(),
+            "connect-refused must map to Transient, got: {err:?}"
+        );
+
+        // The negative cache must NOT contain this DID.
+        assert!(
+            resolver.negative_cache.get("did:plc:probe1").is_none(),
+            "transient errors must not be negative-cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_errors_are_authoritative_and_cached() {
+        // An SSRF-blocked did:web resolves deterministically (same private IP
+        // every time). Caching it for 60s is safe and prevents the relay from
+        // re-running DNS + IP validation on every handshake for a known-bad DID.
+        // We use an IP literal so the test does not depend on external DNS.
+        let resolver = DidResolver::new();
+        let did = "did:web:127.0.0.1";
+        let err = resolver
+            .resolve_key(did)
+            .await
+            .err()
+            .expect("loopback did:web must be rejected");
+        assert!(
+            !err.is_transient(),
+            "SSRF block must be Authoritative so the negative cache can retain it, got: {err:?}"
+        );
+        assert!(
+            resolver.negative_cache.get(&normalize_did(did)).is_some(),
+            "authoritative SSRF block should populate the negative cache"
         );
     }
 }

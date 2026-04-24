@@ -17,7 +17,7 @@
 //! Callers must ensure a resolver is available before calling
 //! [`validate_atproto_jwt`] — unverified JWTs are never trusted for identity.
 
-use super::did_resolver::{DidResolver, ResolvedKey};
+use super::did_resolver::{DidError, DidResolver, ResolvedKey};
 use base64::Engine;
 use jsonwebtoken::{Algorithm, Validation, decode};
 use serde::Deserialize;
@@ -157,13 +157,17 @@ pub async fn validate_atproto_jwt(
         }
     }
 
-    // Step 2: Resolve the DID document key. Resolution failures (DNS down,
-    // concurrency limit exceeded) are transient — map to AuthError::Transient
-    // so callers can return 503 rather than 401.
-    let resolved = resolver
-        .resolve_key(did)
-        .await
-        .map_err(AuthError::Transient)?;
+    // Step 2: Resolve the DID document key. The resolver distinguishes
+    // transient infrastructure failures (DNS down, concurrency limit exceeded,
+    // 5xx from origin) from authoritative failures (404, malformed doc,
+    // SSRF-blocked IP). Map each onto the matching AuthError variant so that
+    // clients presenting a bogus DID see a hard 401 (not a 503 that would
+    // invite infinite retries), while a legitimate DID caught in a transient
+    // bottleneck still gets told to retry.
+    let resolved = resolver.resolve_key(did).await.map_err(|e| match e {
+        DidError::Authoritative(msg) => AuthError::InvalidToken(msg),
+        DidError::Transient(msg) => AuthError::Transient(msg),
+    })?;
 
     // Step 3: Verify the JWT signature on a blocking thread (ECDSA is CPU-bound;
     // running it on the async executor starves other tasks under connection floods).

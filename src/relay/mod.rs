@@ -89,9 +89,15 @@
 //! - **Invalid message disconnect** — Peers that send 10 cumulative invalid
 //!   messages (malformed JSON, binary frames, forged control signals) are
 //!   disconnected, preventing log exhaustion attacks.
-//! - **Negative DID cache** — Failed DID resolutions are cached for 60 seconds,
-//!   preventing attackers from using the relay as a DDoS reflector by spamming
-//!   handshakes with the same DID pointing at a victim server.
+//! - **Negative DID cache** — Authoritative DID resolution failures (404,
+//!   malformed document, SSRF-blocked IP, unsupported key type) are cached
+//!   for 60 seconds, preventing attackers from using the relay as a DDoS
+//!   reflector by spamming handshakes with the same DID pointing at a victim
+//!   server. **Transient** failures (DNS timeout, concurrency-limit
+//!   rejection, 5xx origin response) are deliberately **not** cached so that
+//!   a local bottleneck cannot be amplified into a 60-second outage for a
+//!   DID that remains perfectly valid — the legitimate user whose handshake
+//!   races a bottleneck is free to retry as soon as the transient clears.
 //! - **DID request coalescing** — The key cache uses [`moka::future::Cache`]
 //!   with `try_get_with`, deduplicating concurrent lookups for the same DID.
 //!   This prevents the relay from amplifying connection bursts into outbound
@@ -104,32 +110,35 @@
 //!   seconds. Browsers cannot initiate WebSocket pings (the API only supports
 //!   *responding* to pings), so without server-side pings, idle WASM clients
 //!   would be reaped by the idle timeout.
-//! - **Backpressure** — When the per-peer relay channel (256 slots)
-//!   is full, signals are dropped and logged. Each sender tracks per-target
-//!   strike counters independently. If a sender accumulates 50 consecutive
-//!   channel-full strikes against the same target, the sender silently stops
-//!   delivering to that target for the remainder of the connection. Stalled
-//!   peers are reaped by the idle timeout rather than by sender-driven eviction,
-//!   preventing a malicious sender from kicking arbitrary targets by flooding
-//!   their channel. Successful sends reset the strike counter, so live peers
-//!   that are merely slow will not be affected. Closed channels (peer
-//!   disconnected but not yet cleaned up) are skipped per-message without
-//!   accumulating strikes, so a peer that reconnects can immediately receive
-//!   signals again.
+//! - **Backpressure** — When the per-peer relay channel (256 slots) is full,
+//!   signals are dropped and each sender's per-target strike counter is
+//!   incremented; per-sender log emission is silenced after 50 strikes to
+//!   bound log noise. An **aggregate** counter per target (shared across all
+//!   senders) accumulates a strike on every `TrySendError::Full` and drips
+//!   on every successful send. Once the aggregate crosses 256 strikes
+//!   (matching `RELAY_CHANNEL_CAPACITY`), the target's write task is
+//!   signalled to shut down, closing the WebSocket with code 1013 ("Try
+//!   Again Later"). This is deliberate: WebRTC does not retransmit SDP
+//!   offers or ICE candidates over the signaling channel, so a silently
+//!   dropped message permanently stalls the mesh — disconnecting the target
+//!   surfaces a hard error that the client's reconnect logic can recover
+//!   from. The tight per-sender burst limit (16) means a single flooding
+//!   peer contributes at most 16 of the 256 strikes required, so no single
+//!   attacker can kick an arbitrary target on its own.
 //! - **Handshake slot budget** — At most `max_peers / 4` connections may be
 //!   in the authentication/DID-resolution phase simultaneously. This prevents
 //!   attackers from exhausting all connection slots by tarpitting the DID
 //!   fetch with slow-responding servers. When `max_peers == 0` (unlimited),
 //!   the budget falls back to a fixed cap so the tarpit protection is never
 //!   silently disabled by an unlimited-peers configuration.
-//! - **Per-target burst limiting** — Each sender may route at most 64 messages
-//!   to the same target within a single rate-refill window. This prevents one
+//! - **Per-target burst limiting** — Each sender may route at most 16 messages
+//!   to the same target within a single per-target window. This prevents one
 //!   sender from filling a target's relay channel (256 slots) with garbage,
 //!   which would cause legitimate signalling messages from other peers to be
-//!   silently dropped (WebRTC negotiation sabotage). The limit is generous for
-//!   legitimate mesh setup (~1 SDP + ~10 ICE per target) but well below the
-//!   channel capacity, leaving room for other senders. Counters reset when the
-//!   per-sender token bucket refills to capacity.
+//!   silently dropped (WebRTC negotiation sabotage). Set to 16: comfortably
+//!   above legitimate mesh setup (~1 SDP + ~10 ICE per target) while keeping
+//!   a single sender's contribution to ~6% of channel capacity, raising the
+//!   coordination cost of stuffing a victim's channel to 16 attackers.
 //! - **Per-sender rate limiting** — Each peer is rate-limited via a token bucket
 //!   with a burst capacity of 500 messages and a steady-state refill of 20
 //!   tokens per second. The high burst accommodates WebRTC mesh initialization
@@ -142,10 +151,13 @@
 //!   each fetch completes (via RAII guard), so attacker requests that fail
 //!   quickly cannot permanently exhaust the budget for legitimate users.
 //! - **Global `did:web` fetch concurrency limit** — Total concurrent `did:web`
-//!   fetches across all domains are capped at 50. This prevents subdomain
-//!   spraying attacks from exhausting the Tokio blocking thread pool with DNS
-//!   resolution calls. Like the per-domain limit, slots are freed on
-//!   completion, making the limit resistant to unauthenticated DoS.
+//!   fetches across all domains are capped at 50. DNS resolution runs on the
+//!   pure-Rust `hickory-resolver` with its own UDP/TCP sockets (no OS-blocking
+//!   `getaddrinfo`), so dropping the future closes the socket and releases
+//!   the concurrency guard synchronously — an attacker with a tarpit
+//!   nameserver cannot hold slots past the client's 15 s handshake timeout.
+//!   Slots are also freed on normal completion, making the limit resistant
+//!   to unauthenticated DoS.
 //! - **Peer ID length validation** — The `peer_id` field in incoming
 //!   [`SignalEnvelope`] messages is capped at 512 bytes after deserialization.
 //!   DIDs and UUIDs are well under this limit; oversized values are rejected
@@ -184,8 +196,8 @@ mod handler;
 
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use tokio::sync::{Notify, mpsc};
 
 // Re-export protocol types so existing `use relay::SignalEnvelope` still works.
 pub use crate::protocol::{SignalEnvelope, SignalPayload};
@@ -223,6 +235,17 @@ pub struct PeerEntry {
     /// Unique ID for this specific WebSocket connection, used to distinguish
     /// reconnects and prevent stale cleanup from clobbering a newer session.
     pub conn_id: uuid::Uuid,
+    /// Aggregate backpressure strike counter across all senders targeting
+    /// this peer. Incremented by `TrySendError::Full` and decremented by
+    /// successful sends. Once it crosses the kick threshold, [`Self::shutdown`]
+    /// is fired so the peer's write task exits and the client reconnect logic
+    /// can rebuild the WebRTC mesh — preferable to silently blackholing SDP
+    /// offers/ICE candidates which never retransmit on the signaling channel.
+    pub backpressure_strikes: Arc<AtomicU64>,
+    /// Force-shutdown signal for this peer's write task. Cleanly breaks the
+    /// write loop (peer receives a WebSocket close) so reconnect logic fires
+    /// instead of the mesh stalling forever in the "connecting" state.
+    pub shutdown: Arc<Notify>,
 }
 
 /// Shared server state holding the map of connected peers.

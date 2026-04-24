@@ -12,9 +12,9 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 /// RAII guard that decrements an atomic counter on drop.
@@ -135,9 +135,35 @@ const RATE_REFILL_PER_SECOND: u32 = 20;
 /// Prevents one sender from filling a target's relay channel
 /// ([`RELAY_CHANNEL_CAPACITY`] = 256) with garbage, which would cause
 /// legitimate signalling messages from other peers to be silently dropped.
-/// Set to 64: generous for legitimate mesh setup (~1 SDP + ~10 ICE per target)
-/// but well below the channel capacity, leaving room for other senders.
-const PER_TARGET_BURST_LIMIT: u32 = 64;
+///
+/// Set to 16 — tight enough that a single sender can contribute at most
+/// ~6% of [`RELAY_CHANNEL_CAPACITY`]. Combined with [`TARGET_KICK_STRIKES`],
+/// filling a victim's channel to the point of eviction now requires ~16
+/// coordinated attackers within one per-target window, an order of magnitude
+/// harder than the previous 4-attacker threshold at `PER_TARGET_BURST_LIMIT = 64`.
+/// Still comfortably above a legitimate mesh-init cost of ~1 SDP + ~10 ICE
+/// candidates per target.
+const PER_TARGET_BURST_LIMIT: u32 = 16;
+
+/// Aggregate backpressure strikes (across all senders) after which the
+/// target peer is kicked. Strikes are incremented on every `TrySendError::Full`
+/// and decremented on every successful send, so a target whose channel is
+/// genuinely draining never reaches this threshold.
+///
+/// Set equal to [`RELAY_CHANNEL_CAPACITY`] so that triggering requires the
+/// channel to have held at full capacity for an equivalent number of failed
+/// sends net of recoveries — a transient burst during mesh init cannot
+/// trigger eviction. The rationale for kicking (rather than silently
+/// dropping) is that WebRTC's signaling layer does not retransmit SDP
+/// offers or ICE candidates: blackholing them permanently stalls the mesh,
+/// while disconnecting the target surfaces a hard error that the client's
+/// reconnect logic can recover from.
+///
+/// This reopens the "kick arbitrary target by flooding" vector that the
+/// leaky-bucket silencer was originally designed to avoid, but [`PER_TARGET_BURST_LIMIT`]
+/// caps each attacker's contribution to `PER_TARGET_BURST_LIMIT` strikes per
+/// window, so no single peer can trigger the kick on its own.
+const TARGET_KICK_STRIKES: u64 = RELAY_CHANNEL_CAPACITY as u64;
 
 /// Interval at which per-target message counters are reset. Decoupled from
 /// the token-bucket refill to prevent an attacker from keeping the bucket
@@ -522,6 +548,8 @@ async fn handle_socket(
     let conn_id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (relay_tx, mut relay_rx) = mpsc::channel::<SignalEnvelope>(RELAY_CHANNEL_CAPACITY);
+    let self_backpressure_strikes = Arc::new(AtomicU64::new(0));
+    let self_shutdown = Arc::new(Notify::new());
 
     // Atomically get-or-create the room's inner map and replace any existing
     // connection for this `session_id` within it.
@@ -540,6 +568,8 @@ async fn handle_socket(
         let new_peer = PeerEntry {
             tx: relay_tx,
             conn_id,
+            backpressure_strikes: Arc::clone(&self_backpressure_strikes),
+            shutdown: Arc::clone(&self_shutdown),
         };
         let room_ref = state
             .peers
@@ -644,6 +674,13 @@ async fn handle_socket(
     // WASM clients (browsers) cannot initiate WebSocket pings — they only
     // *respond* to server pings — so without server-side pings, idle WASM
     // connections would be reaped by WS_IDLE_TIMEOUT.
+    //
+    // The task also listens on `self_shutdown` so that when too many senders
+    // pile up on this peer's channel (aggregate strikes exceed
+    // `TARGET_KICK_STRIKES`), the write loop terminates and the client
+    // receives a hard WebSocket close — allowing reconnect logic to rebuild
+    // the WebRTC mesh rather than stalling silently on blackholed SDP/ICE.
+    let shutdown_for_write = Arc::clone(&self_shutdown);
     let write_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
         // The first tick fires immediately; skip it so the first ping is
@@ -674,6 +711,22 @@ async fn handle_socket(
                         tracing::warn!("disconnecting peer: write timeout or error");
                         break;
                     }
+                }
+                _ = shutdown_for_write.notified() => {
+                    tracing::warn!(
+                        "disconnecting peer: sustained channel-full backpressure \
+                         ({TARGET_KICK_STRIKES} aggregate strikes)"
+                    );
+                    // Best-effort close frame so the client knows to reconnect
+                    // instead of assuming the network dropped.
+                    let _ = tokio::time::timeout(
+                        WS_WRITE_TIMEOUT,
+                        ws_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1013, // "Try Again Later"
+                            reason: "relay queue saturated".into(),
+                        }))),
+                    ).await;
+                    break;
                 }
             }
         }
@@ -953,14 +1006,31 @@ async fn handle_socket(
 
             // Look up the target by room first, then session_id, so
             // cross-room forwarding is impossible by construction: a peer in
-            // room A cannot synthesise a key into room B.
-            let target_entry = state_write
-                .peers
-                .get(&room)
-                .and_then(|inner| inner.get(&target_id).map(|e| e.value().tx.clone()));
-            if let Some(target_tx) = target_entry {
+            // room A cannot synthesise a key into room B. We clone handles
+            // for the channel, the target's aggregate strike counter, and
+            // its shutdown notify so the inner DashMap reference can be
+            // released before the send.
+            let target_entry = state_write.peers.get(&room).and_then(|inner| {
+                inner.get(&target_id).map(|e| {
+                    let entry = e.value();
+                    (
+                        entry.tx.clone(),
+                        Arc::clone(&entry.backpressure_strikes),
+                        Arc::clone(&entry.shutdown),
+                    )
+                })
+            });
+            if let Some((target_tx, target_strikes, target_shutdown)) = target_entry {
                 match target_tx.try_send(forwarded) {
                     Ok(()) => {
+                        // Net-positive progress: relax the aggregate strike
+                        // counter on the target. Underflow is avoided by the
+                        // fetch_update clamp at zero.
+                        let _ = target_strikes.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(1)),
+                        );
                         if let Some(state) = backpressure_strikes.get_mut(&target_id) {
                             state.strikes = state.strikes.saturating_sub(1);
                             if state.strikes == SILENCER_REARM_THRESHOLD {
@@ -978,6 +1048,18 @@ async fn handle_socket(
                         }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Charge a strike against the *target* (aggregate
+                        // across all senders). If the total crosses the kick
+                        // threshold, fire the target's shutdown signal so the
+                        // client reconnects rather than stalling on dropped
+                        // SDP/ICE. Using fetch_add with a post-increment
+                        // comparison ensures exactly one sender triggers the
+                        // kick even under concurrency.
+                        let prev = target_strikes.fetch_add(1, Ordering::Relaxed);
+                        if prev + 1 >= TARGET_KICK_STRIKES {
+                            target_shutdown.notify_waiters();
+                        }
+
                         let state = backpressure_strikes.entry(target_id.clone()).or_default();
                         state.strikes = state
                             .strikes
@@ -1148,5 +1230,36 @@ mod tests {
         // configured cap and we still want to comfortably accommodate large
         // rooms without trapping legitimate clients.
         assert_eq!(unique_targets_for(0), MAX_UNIQUE_TARGETS_CEILING);
+    }
+
+    #[test]
+    fn per_target_burst_limit_well_below_channel_capacity() {
+        // The whole point of PER_TARGET_BURST_LIMIT is to keep any single
+        // sender from monopolising a target's relay channel. If the burst
+        // limit ever creeps up to (or past) RELAY_CHANNEL_CAPACITY, one sender
+        // alone could fill the channel — negating the protection. We enforce
+        // at least a 16× headroom so at least 16 coordinated senders are
+        // required to saturate a victim's queue.
+        assert!(
+            RELAY_CHANNEL_CAPACITY as u32 / PER_TARGET_BURST_LIMIT >= 16,
+            "PER_TARGET_BURST_LIMIT must leave at least 16× headroom below \
+             RELAY_CHANNEL_CAPACITY so a single sender cannot fill the channel"
+        );
+    }
+
+    #[test]
+    fn target_kick_threshold_bounds_single_sender_contribution() {
+        // A single sender can contribute at most PER_TARGET_BURST_LIMIT
+        // strikes within one per-target window (the sender gets disconnected
+        // or throttled after that). The kick threshold must be strictly
+        // greater than this single-sender ceiling, or a single flooding
+        // attacker could evict any target they choose — re-introducing the
+        // "kick arbitrary target" attack the earlier silencer design
+        // deliberately rejected.
+        assert!(
+            TARGET_KICK_STRIKES > PER_TARGET_BURST_LIMIT as u64,
+            "TARGET_KICK_STRIKES ({TARGET_KICK_STRIKES}) must exceed one sender's \
+             contribution ({PER_TARGET_BURST_LIMIT}) so no single peer can kick a target"
+        );
     }
 }
