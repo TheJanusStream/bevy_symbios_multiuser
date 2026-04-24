@@ -147,14 +147,6 @@ The relay applies multiple independent layers of defense:
 cargo run --example basic_chat
 ```
 
-### Running the Oasis Example
-
-> **Note:** the `oasis` example predates the 0.3 OAuth refactor and is disabled by default. It is retained under the `legacy_oasis_example` Cargo feature until it has been ported to the new OAuth-driven flow; do not use it as a reference for the current API. The downstream `symbios-overlands` client carries the canonical OAuth wiring in the meantime.
-
-```sh
-cargo run --example oasis --features legacy_oasis_example   # legacy, will not compile against 0.3 API
-```
-
 ## ATProto Authentication
 
 As of 0.3, this crate no longer offers App-Password login helpers. The host application is responsible for driving the OAuth 2.0 + DPoP authorization-code flow (via [`proto-blue-oauth`](https://crates.io/crates/proto-blue-oauth)) and building an [`AtprotoSession`] from the resulting `OAuthSession`. The `auth` module then exposes one helper — [`get_service_auth`] — that mints a relay-bound service auth token from the authenticated session.
