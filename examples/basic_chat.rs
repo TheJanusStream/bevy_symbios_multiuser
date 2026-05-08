@@ -37,8 +37,12 @@ fn main() {
 }
 
 /// Reads incoming chat messages and logs them.
-fn handle_incoming(mut queue: ResMut<NetworkQueue<ChatMessage>>) {
-    for msg in queue.drain() {
+///
+/// Uses the high-level [`MessagesReceived<T>`] system parameter; the
+/// underlying [`NetworkQueue<T>`] resource is still accessible directly
+/// for callers that want byte-budget introspection.
+fn handle_incoming(mut messages: MessagesReceived<ChatMessage>) {
+    for msg in messages.drain() {
         match &msg.payload {
             ChatMessage::Text { author, body } => {
                 info!("[{author}]: {body}");
@@ -54,20 +58,24 @@ fn handle_incoming(mut queue: ResMut<NetworkQueue<ChatMessage>>) {
 }
 
 /// Broadcasts a hello message every 3 seconds as a demonstration.
+///
+/// Uses the high-level [`SendMessage<T>`] system parameter, which covers
+/// both [`SendMessage::broadcast`] (used here) and [`SendMessage::to`] for
+/// peer-targeted sends.
 fn send_periodic_hello(
     time: Res<Time>,
     mut timer: Local<Option<Timer>>,
-    mut writer: MessageWriter<Broadcast<ChatMessage>>,
+    mut sender: SendMessage<ChatMessage>,
 ) {
     let timer = timer.get_or_insert_with(|| Timer::from_seconds(3.0, TimerMode::Repeating));
     timer.tick(time.delta());
     if timer.just_finished() {
-        writer.write(Broadcast {
-            payload: ChatMessage::Text {
+        sender.broadcast(
+            ChatMessage::Text {
                 author: "local_peer".to_string(),
                 body: "Hello from bevy_symbios_multiuser!".to_string(),
             },
-            channel: ChannelKind::Reliable,
-        });
+            ChannelKind::Reliable,
+        );
     }
 }

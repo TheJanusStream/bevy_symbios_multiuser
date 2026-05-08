@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::error::SymbiosError;
 use bevy::prelude::*;
-use proto_blue_oauth::OAuthSession;
+use proto_blue_oauth::{OAuthClient, OAuthServerMetadata, OAuthSession};
 use serde::Deserialize;
 
 /// Response from `com.atproto.server.getServiceAuth`.
@@ -103,6 +103,88 @@ pub async fn get_service_auth(session: &AtprotoSession, aud: &str) -> Result<Str
         .await
         .map_err(|e| SymbiosError::AuthFailed(format!("getServiceAuth decode: {e}")))?;
     Ok(parsed.token)
+}
+
+/// Best-effort logout: revoke the session's tokens at the OAuth provider's
+/// revocation endpoint (RFC 7009).
+///
+/// Refresh-then-access ordering is intentional: per RFC 7009 §2.1, revoking a
+/// refresh token typically also invalidates every access token derived from
+/// it on the same authorization grant, so revoking it first means even if the
+/// access-token call fails the refresh token is already dead and the access
+/// token will time out on its own short TTL. Both calls are attempted; the
+/// first error short-circuits and is returned, leaving any later token still
+/// live until expiry — consistent with RFC 7009's "implementation-specific
+/// best effort" guidance.
+///
+/// # Local state
+///
+/// This function only handles the *server-side* revocation. The host
+/// application is still responsible for clearing local state — calling
+/// [`crate::signaller::TokenSource::set`]`(None)`, removing the
+/// [`AtprotoSession`] resource, and dropping any persisted session blobs.
+/// Crucially, **clear local state regardless of whether this returns
+/// `Ok` or `Err`**: a failed revocation is a network glitch, not a reason
+/// to leave the user partly logged in.
+///
+/// # Arguments
+///
+/// - `session` — the active [`AtprotoSession`] whose tokens should be revoked.
+/// - `oauth_client` — the [`OAuthClient`] used to acquire `session` (carries
+///   the registered client_id required by the revocation request).
+/// - `server_metadata` — the OAuth server metadata for the user's PDS,
+///   discovered during the original auth flow. Supplies `revocation_endpoint`.
+///
+/// `oauth_client` and `server_metadata` are taken as parameters rather than
+/// pulled off [`AtprotoSession`] to avoid bloating that resource with auth
+/// machinery the rest of the crate never reads. Host applications typically
+/// keep them together with the session in their own login bundle (see e.g.
+/// `symbios-overlands`'s `OauthRefreshCtx`).
+///
+/// # Runtime
+///
+/// Like [`get_service_auth`], requires a Tokio runtime on native targets.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use bevy_symbios_multiuser::auth::{AtprotoSession, logout};
+/// # use bevy_symbios_multiuser::signaller::TokenSource;
+/// # use proto_blue_oauth::{OAuthClient, OAuthServerMetadata};
+/// # async fn run(
+/// #     session: AtprotoSession,
+/// #     oauth_client: OAuthClient,
+/// #     server_metadata: OAuthServerMetadata,
+/// #     token_source: TokenSource,
+/// # ) {
+/// // Best-effort revoke. Clear local state whether or not this succeeds.
+/// if let Err(e) = logout(&session, &oauth_client, &server_metadata).await {
+///     tracing::warn!(%e, "token revocation failed; clearing local state anyway");
+/// }
+/// token_source.set(None);
+/// // …then drop the AtprotoSession resource and any persisted session blob.
+/// # }
+/// ```
+pub async fn logout(
+    session: &AtprotoSession,
+    oauth_client: &OAuthClient,
+    server_metadata: &OAuthServerMetadata,
+) -> Result<(), SymbiosError> {
+    let token_set = session.session.token_set();
+
+    if let Some(refresh_token) = token_set.refresh_token.as_deref() {
+        oauth_client
+            .revoke_token(server_metadata, refresh_token)
+            .await
+            .map_err(|e| SymbiosError::AuthFailed(format!("revoke refresh token: {e}")))?;
+    }
+
+    oauth_client
+        .revoke_token(server_metadata, &token_set.access_token)
+        .await
+        .map_err(|e| SymbiosError::AuthFailed(format!("revoke access token: {e}")))?;
+
+    Ok(())
 }
 
 /// Minimal percent-encoder for the `aud` query parameter. `did:` identifiers

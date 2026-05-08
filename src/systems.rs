@@ -1,6 +1,6 @@
 use crate::messages::{
     Broadcast, ChannelKind, NetworkQueue, NetworkReceived, PeerConnectionState, PeerStateChanged,
-    PeerStateQueue,
+    PeerStateQueue, SendTo,
 };
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
@@ -117,6 +117,32 @@ where
     }
 }
 
+/// Returns `true` if `payload` fits the unreliable-channel MTU budget when
+/// serialized. Reliable channels have no such constraint and skip the check.
+fn fits_unreliable_budget<T: Serialize + Send + Sync + 'static>(
+    payload: &T,
+    channel: ChannelKind,
+) -> bool {
+    if channel != ChannelKind::Unreliable {
+        return true;
+    }
+    match bincode_options().serialized_size(payload) {
+        Ok(size) if size as usize > MAX_UNRELIABLE_MESSAGE_SIZE => {
+            tracing::warn!(
+                size = size,
+                max = MAX_UNRELIABLE_MESSAGE_SIZE,
+                "dropping oversized unreliable message (exceeds WebRTC MTU safe limit)"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute outbound message size");
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Reads [`Broadcast<T>`] messages, serializes them via `bincode`, and
 /// sends the bytes to all connected peers on the specified channel.
 pub fn transmit_messages<T>(
@@ -134,25 +160,8 @@ pub fn transmit_messages<T>(
     }
 
     for event in broadcasts.read() {
-        // For unreliable messages, check the serialized size before allocating
-        // the full buffer. This avoids serializing (and immediately discarding)
-        // arbitrarily large payloads that exceed the MTU limit.
-        if event.channel == ChannelKind::Unreliable {
-            match bincode_options().serialized_size(&event.payload) {
-                Ok(size) if size as usize > MAX_UNRELIABLE_MESSAGE_SIZE => {
-                    tracing::warn!(
-                        size = size,
-                        max = MAX_UNRELIABLE_MESSAGE_SIZE,
-                        "dropping oversized unreliable message (exceeds WebRTC MTU safe limit)"
-                    );
-                    continue;
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to compute broadcast message size");
-                    continue;
-                }
-                _ => {}
-            }
+        if !fits_unreliable_budget(&event.payload, event.channel) {
+            continue;
         }
 
         let bytes = match bincode_options().serialize(&event.payload) {
@@ -181,5 +190,47 @@ pub fn transmit_messages<T>(
             }
             channel.send(packet, last);
         }
+    }
+}
+
+/// Reads [`SendTo<T>`] messages and sends each one to its named peer.
+///
+/// The relay never sees directed traffic — WebRTC data channels are
+/// already point-to-point per peer — so this system is a thin
+/// serialize-and-forward layer. Sends to peers that are not (or no longer)
+/// in the connected set are silently dropped at the matchbox channel
+/// layer; we do not pre-check the connected set here because a peer that
+/// disconnected between this system and `channel.send` would race the
+/// check anyway, and matchbox handles the drop without panicking.
+pub fn transmit_directed_messages<T>(
+    mut socket: ResMut<MatchboxSocket>,
+    mut directed: MessageReader<SendTo<T>>,
+) where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    for event in directed.read() {
+        if !fits_unreliable_budget(&event.payload, event.channel) {
+            continue;
+        }
+
+        let bytes = match bincode_options().serialize(&event.payload) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize directed message");
+                continue;
+            }
+        };
+        let packet: Box<[u8]> = bytes.into_boxed_slice();
+        let channel_idx = event.channel.index();
+
+        let channel = match socket.get_channel_mut(channel_idx) {
+            Ok(ch) => ch,
+            Err(err) => {
+                tracing::error!(channel = channel_idx, error = ?err, "channel unavailable");
+                continue;
+            }
+        };
+
+        channel.send(packet, event.target);
     }
 }

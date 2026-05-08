@@ -1,4 +1,6 @@
-use crate::messages::{Broadcast, NetworkQueue, PeerStateQueue};
+use crate::messages::{
+    Broadcast, LocalSocketReopened, NetworkQueue, PeerStateQueue, SendTo, WelcomeHandshakeComplete,
+};
 use crate::systems;
 use bevy::prelude::*;
 use bevy_matchbox::prelude::*;
@@ -47,6 +49,11 @@ struct SocketOpened<T> {
     /// [`INITIAL_RECONNECT_DELAY`] rather than inheriting a stale 60-second
     /// ceiling.
     opened_at: Duration,
+    /// `None` until the relay's welcome handshake completes and `socket.id()`
+    /// surfaces the assigned local [`PeerId`]. Once `Some`,
+    /// [`WelcomeHandshakeComplete`] has already been emitted exactly once
+    /// for this socket — guards against re-firing on later frames.
+    welcomed_peer_id: Option<PeerId>,
     _marker: PhantomData<T>,
 }
 
@@ -216,7 +223,10 @@ where
         app.init_resource::<NetworkQueue<T>>()
             .init_resource::<PeerStateQueue<T>>()
             .init_resource::<crate::signaller::PeerSessionMapRes>()
-            .add_message::<Broadcast<T>>();
+            .add_message::<Broadcast<T>>()
+            .add_message::<SendTo<T>>()
+            .add_message::<LocalSocketReopened>()
+            .add_message::<WelcomeHandshakeComplete>();
 
         // On wasm the signaller's blind-retry counter must persist across
         // ECS-level socket respawns, otherwise a permanently-expired token
@@ -233,8 +243,10 @@ where
                 open_socket::<T>,
                 (
                     systems::poll_peers::<T>,
+                    detect_welcome_handshake::<T>,
                     systems::receive_messages::<T>,
                     systems::transmit_messages::<T>,
+                    systems::transmit_directed_messages::<T>,
                 )
                     .chain()
                     .run_if(resource_exists::<MatchboxSocket>),
@@ -257,6 +269,7 @@ fn open_socket<T: Send + Sync + 'static>(
     opened: Option<Res<SocketOpened<T>>>,
     socket: Option<Res<MatchboxSocket>>,
     cooldown: Option<Res<ReconnectCooldown<T>>>,
+    mut reopened: MessageWriter<LocalSocketReopened>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
     #[cfg(feature = "client")] session_map: Res<crate::signaller::PeerSessionMapRes>,
     #[cfg(all(feature = "client", target_arch = "wasm32"))] wasm_retry: Res<
@@ -417,6 +430,37 @@ fn open_socket<T: Send + Sync + 'static>(
         room_url: config.room_url.clone(),
         ice: config.ice_servers.clone(),
         opened_at: time.elapsed(),
+        welcomed_peer_id: None,
         _marker: PhantomData,
     });
+    // Notify consumers that a fresh socket exists (initial connect or
+    // reconnect). The relay's welcome handshake has not yet completed —
+    // [`WelcomeHandshakeComplete`] fires separately once `socket.id()`
+    // surfaces the assigned local PeerId.
+    reopened.write(LocalSocketReopened);
+}
+
+/// Watch for the relay's welcome handshake completing and emit
+/// [`WelcomeHandshakeComplete`] exactly once per socket. The Symbios
+/// signaller's `read_welcome` parses `session_id` + `peer_list` and queues an
+/// `IdAssigned` matchbox event; matchbox surfaces it through `socket.id()`,
+/// which transitions from `None` to `Some(local_peer_id)` on the first frame
+/// the welcome has been processed.
+#[cfg(feature = "client")]
+fn detect_welcome_handshake<T: Send + Sync + 'static>(
+    socket: Option<ResMut<MatchboxSocket>>,
+    opened: Option<ResMut<SocketOpened<T>>>,
+    mut writer: MessageWriter<WelcomeHandshakeComplete>,
+) {
+    let (Some(mut socket), Some(mut opened)) = (socket, opened) else {
+        return;
+    };
+    if opened.welcomed_peer_id.is_some() {
+        return;
+    }
+    if let Some(local_peer_id) = socket.id() {
+        opened.welcomed_peer_id = Some(local_peer_id);
+        tracing::debug!(%local_peer_id, "relay welcome handshake complete");
+        writer.write(WelcomeHandshakeComplete { local_peer_id });
+    }
 }

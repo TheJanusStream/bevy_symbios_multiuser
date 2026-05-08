@@ -763,18 +763,26 @@ impl SymbiosSignaller {
             match self.ws.next().await {
                 Some(Ok(tungstenite::Message::Text(t))) => {
                     // `Utf8Bytes` wraps `tungstenite::Bytes` with a UTF-8
-                    // invariant that tungstenite already validated when it
-                    // constructed the frame. Go through `Bytes -> Vec<u8>`:
-                    // for the usual case where the `Bytes` view has a unique
-                    // owner (just handed to us from the frame reader) this
-                    // reuses the existing allocation, avoiding the alloc +
-                    // memcpy that `.to_string()` would force on every
-                    // signaling message. When the view is shared, `From<Bytes>`
-                    // falls back to a copy — same cost as before.
+                    // invariant tungstenite already validated when it built the
+                    // frame. Go through `Bytes -> Vec<u8>` so the unique-owner
+                    // case (just handed to us from the frame reader) reuses
+                    // the existing allocation rather than paying the alloc +
+                    // memcpy of `.to_string()`; shared views fall back to a
+                    // copy via `From<Bytes>` — same cost as before. We then
+                    // re-validate with the checked decode: skipping it would
+                    // turn any future tungstenite bug, API change, or
+                    // misrouted binary frame into UB. The validation cost is
+                    // negligible for typical signaling frames (< 1 KiB) and a
+                    // failure is treated as a relay protocol violation,
+                    // dropping the connection so the reconnect path picks up.
                     let bytes: tungstenite::Bytes = t.into();
                     let vec: Vec<u8> = bytes.into();
-                    // SAFETY: `Utf8Bytes` guarantees `vec` is valid UTF-8.
-                    return Ok(unsafe { String::from_utf8_unchecked(vec) });
+                    return String::from_utf8(vec).map_err(|e| {
+                        tracing::warn!(error = %e, "relay sent non-UTF-8 text frame; closing socket");
+                        SignalingError::UserImplementationError(format!(
+                            "relay protocol violation: text frame contained invalid UTF-8 ({e})"
+                        ))
+                    });
                 }
                 Some(Ok(tungstenite::Message::Close(_))) | None => {
                     return Err(SignalingError::StreamExhausted);

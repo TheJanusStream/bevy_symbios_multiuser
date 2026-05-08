@@ -104,6 +104,7 @@ pub mod error;
 pub mod messages;
 pub mod plugin;
 pub mod protocol;
+pub mod smoother;
 pub mod systems;
 
 #[cfg(feature = "client")]
@@ -126,10 +127,12 @@ pub mod relay;
 pub mod prelude {
     pub use crate::error::SymbiosError;
     pub use crate::messages::{
-        Broadcast, ChannelKind, NetworkQueue, NetworkReceived, PeerConnectionState,
-        PeerStateChanged, PeerStateQueue,
+        Broadcast, ChannelKind, LocalSocketReopened, MessagesReceived, NetworkQueue,
+        NetworkReceived, PeerConnectionState, PeerStateChanged, PeerStateQueue, SendMessage,
+        SendTo, WelcomeHandshakeComplete,
     };
     pub use crate::plugin::{SymbiosMultiuserConfig, SymbiosMultiuserPlugin};
+    pub use crate::smoother::{SmootherConfig, TransformBuffer, TransformSample};
     pub use bevy_matchbox::prelude::{ChannelConfig, PeerId, PeerState};
 
     #[cfg(feature = "client")]

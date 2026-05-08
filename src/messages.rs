@@ -1,3 +1,4 @@
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use matchbox_socket::PeerId;
 use serde::{Serialize, de::DeserializeOwned};
@@ -8,11 +9,39 @@ use std::collections::VecDeque;
 /// The payload is serialized via `bincode` and pushed to the appropriate channel
 /// based on the [`ChannelKind`] field.
 ///
+/// Most consumers should reach for the higher-level [`SendMessage`] system
+/// parameter instead of writing this message type by hand — it removes the
+/// `MessageWriter<Broadcast<T>>` boilerplate and keeps the broadcast and
+/// directed-send paths discoverable in one place.
+///
 /// # Type Parameters
 /// * `T` - The domain-specific payload type. Must implement `Serialize + Deserialize`.
 #[derive(Message, Debug, Clone)]
 pub struct Broadcast<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
     /// The payload to broadcast to all connected peers.
+    pub payload: T,
+    /// Which channel to send on: [`ChannelKind::Reliable`] for state mutations,
+    /// [`ChannelKind::Unreliable`] for ephemeral presence data.
+    pub channel: ChannelKind,
+}
+
+/// Send a payload to a single peer.
+///
+/// Unlike [`Broadcast`], which fans out to every connected peer, `SendTo`
+/// addresses one specific [`PeerId`]. WebRTC data channels are already
+/// point-to-point — the relay does not see directed traffic — so directing a
+/// send is a pure ECS-level abstraction over the existing matchbox channel
+/// API. Targeting a peer that is not (or no longer) connected is a no-op:
+/// the underlying matchbox channel silently drops the packet.
+///
+/// As with [`Broadcast`], most consumers should write this message via
+/// [`SendMessage`] rather than constructing a `MessageWriter<SendTo<T>>` by
+/// hand.
+#[derive(Message, Debug, Clone)]
+pub struct SendTo<T: Serialize + DeserializeOwned + Send + Sync + 'static> {
+    /// The peer that should receive the payload.
+    pub target: PeerId,
+    /// The payload to send.
     pub payload: T,
     /// Which channel to send on: [`ChannelKind::Reliable`] for state mutations,
     /// [`ChannelKind::Unreliable`] for ephemeral presence data.
@@ -149,6 +178,16 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetworkQueue<T> {
         self.incoming.len()
     }
 
+    /// Borrow the queued messages without consuming them.
+    ///
+    /// Useful for read-only inspection (e.g. UI debug overlays). Note that
+    /// the queue is **not** drained automatically each frame, so iter-only
+    /// consumers will see the same messages on every subsequent call until
+    /// some other system calls [`drain`](Self::drain).
+    pub fn iter(&self) -> impl Iterator<Item = &NetworkReceived<T>> {
+        self.incoming.iter()
+    }
+
     /// Returns `true` if this packet would be dropped by [`push`](Self::push),
     /// and logs a warning the first time the queue is found full (resetting on
     /// the next [`drain`](Self::drain)).
@@ -266,6 +305,40 @@ pub enum PeerConnectionState {
     Disconnected,
 }
 
+/// Fired by the plugin whenever it has opened a fresh
+/// [`bevy_matchbox::prelude::MatchboxSocket`] — once on initial connect, and
+/// again on every reconnect after a drop.
+///
+/// Use this to drive UI status indicators ("connecting…" / "connected") or
+/// to trigger a fresh authoritative-state pull on resync. Note that the
+/// socket has only just been opened: the relay's welcome handshake (the
+/// `session_id` + `peer_list` messages that assign the local
+/// [`bevy_matchbox::prelude::PeerId`]) has not yet completed. Listen for
+/// [`WelcomeHandshakeComplete`] if you need the local PeerId.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct LocalSocketReopened;
+
+/// Fired once per socket lifetime when the relay's welcome handshake has
+/// completed and the local [`bevy_matchbox::prelude::PeerId`] is known.
+///
+/// Internally this is detected as the first frame on which
+/// `MatchboxSocket::id()` returns `Some` after a fresh
+/// [`LocalSocketReopened`]: the matchbox signaller buffers the relay's
+/// `IdAssigned` event during the welcome handshake (`session_id`/`peer_list`
+/// from the Symbios signaller's `read_welcome`) and surfaces it through
+/// `socket.id()` once the ECS pulls it.
+///
+/// Use this when you need the local PeerId before sending peer-targeted
+/// messages, or to know that the relay has actually accepted the connection
+/// (vs. just having opened the WebSocket).
+#[derive(Message, Debug, Clone, Copy)]
+pub struct WelcomeHandshakeComplete {
+    /// The local peer's id, as assigned by the relay during the welcome
+    /// handshake. Stable for the lifetime of this socket; a reconnect will
+    /// produce a new id and a new event.
+    pub local_peer_id: PeerId,
+}
+
 /// Selects which WebRTC data channel to use for a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelKind {
@@ -284,5 +357,122 @@ impl ChannelKind {
             Self::Reliable => 0,
             Self::Unreliable => 1,
         }
+    }
+}
+
+/// Ergonomic [`SystemParam`] wrapper around [`NetworkQueue<T>`] for
+/// inbound traffic.
+///
+/// Replaces the boilerplate of writing `mut queue: ResMut<NetworkQueue<T>>`
+/// in every receiving system with a name that documents intent. Forwards
+/// [`drain`](Self::drain), [`iter`](Self::iter), [`is_empty`](Self::is_empty),
+/// and [`len`](Self::len) onto the underlying queue — the original
+/// [`NetworkQueue<T>`] resource is still accessible directly when callers
+/// need byte-budget introspection or other low-level operations.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use bevy::prelude::*;
+/// # use bevy_symbios_multiuser::prelude::*;
+/// # use serde::{Deserialize, Serialize};
+/// # #[derive(Serialize, Deserialize, Debug, Clone)]
+/// # enum GameMessage { Move { x: f32, y: f32 } }
+/// fn handle_incoming(mut messages: MessagesReceived<GameMessage>) {
+///     for msg in messages.drain() {
+///         info!("from {:?}: {:?}", msg.sender, msg.payload);
+///     }
+/// }
+/// ```
+#[derive(SystemParam)]
+pub struct MessagesReceived<'w, T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    queue: ResMut<'w, NetworkQueue<T>>,
+}
+
+impl<T> MessagesReceived<'_, T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    /// Drain every queued message, leaving the queue empty.
+    pub fn drain(&mut self) -> impl Iterator<Item = NetworkReceived<T>> {
+        self.queue.drain()
+    }
+
+    /// Borrow the queued messages without removing them.
+    pub fn iter(&self) -> impl Iterator<Item = &NetworkReceived<T>> {
+        self.queue.iter()
+    }
+
+    /// `true` if no messages are currently queued.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Number of currently queued messages.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+/// Ergonomic [`SystemParam`] for outbound traffic, covering both
+/// [`Broadcast<T>`] (fan-out) and [`SendTo<T>`] (peer-targeted) sends behind
+/// a single name.
+///
+/// Replaces the pair of writers (`MessageWriter<Broadcast<T>>` +
+/// `MessageWriter<SendTo<T>>`) that consumers would otherwise enumerate by
+/// hand in every system that mixes broadcasts with directed messages.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use bevy::prelude::*;
+/// # use bevy_symbios_multiuser::prelude::*;
+/// # use serde::{Deserialize, Serialize};
+/// # #[derive(Serialize, Deserialize, Debug, Clone)]
+/// # enum GameMessage { Pong, Hello }
+/// fn replies(
+///     mut messages: MessagesReceived<GameMessage>,
+///     mut sender: SendMessage<GameMessage>,
+/// ) {
+///     for msg in messages.drain() {
+///         match msg.payload {
+///             GameMessage::Hello => sender.broadcast(GameMessage::Hello, ChannelKind::Reliable),
+///             GameMessage::Pong  => sender.to(msg.sender, GameMessage::Pong, ChannelKind::Reliable),
+///         }
+///     }
+/// }
+/// ```
+#[derive(SystemParam)]
+pub struct SendMessage<'w, T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    broadcasts: MessageWriter<'w, Broadcast<T>>,
+    directed: MessageWriter<'w, SendTo<T>>,
+}
+
+impl<T> SendMessage<'_, T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + std::fmt::Debug + Clone,
+{
+    /// Send `payload` to every connected peer on `channel`.
+    pub fn broadcast(&mut self, payload: T, channel: ChannelKind) {
+        self.broadcasts.write(Broadcast { payload, channel });
+    }
+
+    /// Send `payload` only to the peer identified by `target` on `channel`.
+    ///
+    /// Targeting a peer that is not (or no longer) connected is a silent
+    /// no-op at the matchbox channel layer — there is no error path to
+    /// observe and no event is emitted.
+    pub fn to(&mut self, target: PeerId, payload: T, channel: ChannelKind) {
+        self.directed.write(SendTo {
+            target,
+            payload,
+            channel,
+        });
     }
 }
