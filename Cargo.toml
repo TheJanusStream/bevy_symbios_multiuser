@@ -89,6 +89,21 @@ image = "0.25.10"
 futures-lite = "2.6.1"
 bevy_asset = "0.18.1"
 
+# Native-only example deps for `examples/login_to_relay.rs`:
+# `tiny_http` for the OAuth callback loopback listener, `serde_json` for
+# parsing `.well-known/oauth-protected-resource`. WASM has no loopback
+# callback story, so this example is native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tiny_http = "0.12"
+serde_json = "1"
+
 [[bench]]
 name = "message_serialization"
 harness = false
+
+# `login_to_relay` walks the full OAuth + DPoP flow up to inserting
+# `TokenSourceRes` and the plugin config. Native-only because the loopback
+# callback uses `tiny_http`.
+[[example]]
+name = "login_to_relay"
+required-features = ["client"]

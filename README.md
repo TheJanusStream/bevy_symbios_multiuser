@@ -229,6 +229,42 @@ token_source.set(Some(new_service_token));
 
 `TokenSource::get` clones the inner value and releases the read guard before returning, and `TokenSource::set` acquires the write guard only for the duration of the swap — the lock is never held across an `.await`, so the signaller's reconnect path cannot deadlock against a host refreshing tokens over the network.
 
+### Migrating from earlier versions
+
+#### To v0.5 — `TokenSource` is now an opaque struct
+
+Prior to v0.5, `TokenSource` was a transparent type alias:
+
+```rust
+pub type TokenSource = Arc<RwLock<Option<String>>>;
+```
+
+This let callers reach into the lock directly, which made the deadlock footgun easy to hit
+— holding the write guard across an `.await` (e.g. while the signaller's reconnect path
+was also reading) deadlocked the runtime. In v0.5 (#119), `TokenSource` became an opaque
+struct exposing only `new`, `get`, and `set`. The lock is never visible to callers, so the
+"hold across await" mistake is impossible.
+
+Migration is mechanical:
+
+```rust
+// before (v0.4 and earlier)
+use std::sync::{Arc, RwLock};
+let source: TokenSource = Arc::new(RwLock::new(Some(service_token)));
+*source.write().unwrap() = Some(new_service_token);
+let current = source.read().unwrap().clone();
+
+// after (v0.5+)
+use bevy_symbios_multiuser::signaller::TokenSource;
+let source = TokenSource::new(Some(service_token));
+source.set(Some(new_service_token));
+let current = source.get();
+```
+
+Public API names (`TokenSourceRes`, `signaller_with_token_source`) and the resource-insert
+pattern are unchanged — only the inner type shape moved. If you were treating
+`TokenSource` purely through the helper methods, no code changes are required.
+
 ## Modules
 
 | Module | Description |
