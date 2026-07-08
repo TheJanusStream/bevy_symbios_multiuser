@@ -50,6 +50,7 @@ use matchbox_socket::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -87,6 +88,21 @@ fn session_id_to_peer_id(session_id: &str) -> PeerId {
         Ok(uuid) => PeerId(uuid),
         Err(_) => PeerId(Uuid::new_v5(&DID_NAMESPACE, session_id.as_bytes())),
     }
+}
+
+/// Core of the WebRTC Offerer/Answerer arbitration, factored out of
+/// [`SymbiosSignaller::should_offer`] as a free function so the rule is
+/// unit-testable without a live signaller or socket.
+///
+/// Returns `true` iff the local peer — identified by `local_peer_id`, which is
+/// the deterministic [`session_id_to_peer_id`] of the local session — is the
+/// designated Offerer for the pair with `remote_session_id`. The order is a
+/// strict total order over the two peers' deterministic session `PeerId`s, so
+/// for any two distinct sessions exactly one side offers and the other answers,
+/// independent of join order or timing. Both peers compute the same order from
+/// the same two session ids, which is what prevents simultaneous-join glare.
+fn local_is_offerer(local_peer_id: PeerId, remote_session_id: &str) -> bool {
+    local_peer_id > session_id_to_peer_id(remote_session_id)
 }
 
 // ── Peer session map (PeerId → authenticated session_id / DID) ───────────────
@@ -245,6 +261,56 @@ impl std::fmt::Debug for TokenSource {
 #[derive(bevy::prelude::Resource, Clone, Debug, Default)]
 pub struct TokenSourceRes(pub TokenSource);
 
+// ── Signalling diagnostics (observability into the WebRTC handshake) ──────────
+
+/// Shared, lock-free counters the signaller bumps as it drives the WebRTC
+/// handshake, exposing the signalling layer that matchbox otherwise hides
+/// behind a bare `Connected`/`Disconnected` peer state.
+///
+/// The application reads these through [`SignalDiagnosticsRes`]. The key
+/// diagnostic is `last_peer_list_len >= 1` while **no** peer ever reaches
+/// `Connected`: that is the fingerprint of a stalled handshake — the relay
+/// reported a non-empty room yet no data channel formed — which a bare
+/// connected-peer count cannot distinguish from genuinely being alone. A
+/// classic offer glare additionally shows `offers_sent > 0` and
+/// `offers_received > 0` with `answers_received == 0`.
+///
+/// All counters are cumulative for the lifetime of the shared handle (they
+/// persist across reconnects because the plugin threads the same `Arc` into
+/// every signaller it builds).
+#[derive(Debug, Default)]
+pub struct SignalDiagnostics {
+    /// Number of `peer_list` welcome messages processed — one per successful
+    /// (re)connect handshake.
+    pub peer_lists_received: AtomicU64,
+    /// Size of the most recent `peer_list`: how many peers were already in the
+    /// room when we last joined.
+    pub last_peer_list_len: AtomicU64,
+    /// `NewPeer` events emitted to matchbox — the pairs this peer is the
+    /// Offerer for (per the deterministic tie-break in [`local_is_offerer`]).
+    pub offers_initiated: AtomicU64,
+    /// SDP offers this peer sent over the signalling channel.
+    pub offers_sent: AtomicU64,
+    /// SDP offers this peer received (it answers these).
+    pub offers_received: AtomicU64,
+    /// SDP answers this peer sent, in response to a received offer.
+    pub answers_sent: AtomicU64,
+    /// SDP answers this peer received, completing an offer it initiated.
+    pub answers_received: AtomicU64,
+}
+
+/// Cheap-to-clone shared handle to [`SignalDiagnostics`].
+pub type SharedSignalDiagnostics = Arc<SignalDiagnostics>;
+
+/// Bevy [`Resource`](bevy::prelude::Resource) wrapper around
+/// [`SharedSignalDiagnostics`].
+///
+/// [`crate::plugin::SymbiosMultiuserPlugin`] inserts this automatically and
+/// threads the inner handle into every signaller it builds, so the counters
+/// survive reconnects and the application and signaller observe the same view.
+#[derive(bevy::prelude::Resource, Clone, Default)]
+pub struct SignalDiagnosticsRes(pub SharedSignalDiagnostics);
+
 /// A [`SignallerBuilder`] that injects a service auth JWT into the WebSocket
 /// upgrade request's `Authorization` header.
 ///
@@ -271,6 +337,10 @@ pub struct SymbiosSignallerBuilder {
     /// stay uniform across targets — the field is simply never read.
     #[cfg(target_arch = "wasm32")]
     wasm_retry_state: Option<WasmBlindRetryStateHandle>,
+    /// Shared signalling counters bumped by every signaller this builder
+    /// produces. Threaded through so the counts survive reconnects. `None`
+    /// disables diagnostics (the default for one-shot programmatic use).
+    diagnostics: Option<SharedSignalDiagnostics>,
 }
 
 impl SymbiosSignallerBuilder {
@@ -448,6 +518,7 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                 peer_to_session: HashMap::new(),
                 pending_events: VecDeque::new(),
                 session_map: self.session_map.clone(),
+                diagnostics: self.diagnostics.clone(),
             };
 
             // Read the relay's welcome messages (session_id + peer_list).
@@ -616,9 +687,20 @@ pub struct SymbiosSignaller {
     /// [`PeerSessionMapRes`]. `None` if no map was threaded through the
     /// builder (e.g. crate consumers that never need DID verification).
     session_map: Option<PeerSessionMap>,
+    /// Shared signalling counters ([`SignalDiagnostics`]) the application reads
+    /// through [`SignalDiagnosticsRes`]. `None` disables diagnostics.
+    diagnostics: Option<SharedSignalDiagnostics>,
 }
 
 impl SymbiosSignaller {
+    /// Increment one [`SignalDiagnostics`] counter, if a diagnostics sink was
+    /// threaded through the builder. `select` picks the counter to bump.
+    fn bump(&self, select: impl FnOnce(&SignalDiagnostics) -> &AtomicU64) {
+        if let Some(d) = &self.diagnostics {
+            select(d).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Publish a peer → session binding to the shared map, if the application
     /// provided one. Called whenever the signaller learns a new peer.
     fn publish_peer(&self, peer: PeerId, session_id: &str) {
@@ -667,16 +749,66 @@ impl SymbiosSignaller {
                 SignalingError::UserImplementationError(format!("invalid peer_list message: {e}"))
             })?;
 
+        // Register every peer already in the room, but emit `NewPeer` (which
+        // makes matchbox create an SDP offer) only for the subset this peer is
+        // the designated Offerer for — see [`should_offer`]. Emitting `NewPeer`
+        // for every `peer_list` entry unconditionally is what caused
+        // simultaneous-join glare: under a near-simultaneous join the relay
+        // hands *both* peers a `peer_list` containing the other, so both would
+        // become Offerers and deadlock (matchbox cannot recover from two
+        // offers). The deterministic tie-break makes exactly one side offer;
+        // the other registers the mapping only and lazily answers the incoming
+        // offer via matchbox's `accept_handshake` path.
+        let mut peer_list_len: u64 = 0;
         if let Some(peers) = peer_list_json.get("peers").and_then(|v| v.as_array()) {
             for peer_val in peers {
                 if let Some(sid) = peer_val.as_str() {
+                    peer_list_len += 1;
+                    let is_new = !self.session_to_peer.contains_key(sid);
+                    let should_offer = self.should_offer(sid);
                     let pid = self.get_or_create_peer_id(sid);
-                    self.pending_events.push_back(PeerEvent::NewPeer(pid));
+                    if is_new && should_offer {
+                        self.pending_events.push_back(PeerEvent::NewPeer(pid));
+                        self.bump(|d| &d.offers_initiated);
+                    }
                 }
             }
         }
+        if let Some(d) = &self.diagnostics {
+            d.peer_lists_received.fetch_add(1, Ordering::Relaxed);
+            d.last_peer_list_len.store(peer_list_len, Ordering::Relaxed);
+        }
 
         Ok(())
+    }
+
+    /// Decide whether *this* peer should be the WebRTC **Offerer** for the pair
+    /// `(self, remote)`, using a deterministic total order over the two peers'
+    /// relay session identifiers.
+    ///
+    /// matchbox requires exactly one side of every pair to be the Offerer: it
+    /// delivers `NewPeer` to that side (which creates the SDP offer) and the
+    /// other side answers. The relay cannot guarantee this alone — under a
+    /// near-simultaneous join it inserts each joiner into the room map before
+    /// computing its `peer_list`, so both peers receive a `peer_list`
+    /// containing the other. A naive "whoever sees the other offers" rule then
+    /// makes both offer, producing WebRTC "glare": each `offer_handshake` spins
+    /// forever awaiting an Answer that never arrives (the peer sent an Offer
+    /// instead), no data channel opens, and both clients see an empty room.
+    ///
+    /// The tie-break removes the timing dependency: the peer whose deterministic
+    /// session `PeerId` compares greater is always the Offerer, regardless of
+    /// join order or of which relay message (`peer_list` vs `PeerJoined`) first
+    /// revealed the pairing. Both peers derive the same order from the same two
+    /// session ids, so exactly one offers and the other answers.
+    ///
+    /// The comparison uses the *deterministic* [`session_id_to_peer_id`] UUID
+    /// (`self.local_peer_id` is already that value for the local peer), **not**
+    /// the random `PeerId` that [`get_or_create_peer_id`] mints for matchbox's
+    /// per-connection state machine — that random value differs on each side
+    /// and would not yield a consistent order.
+    fn should_offer(&self, remote_session_id: &str) -> bool {
+        local_is_offerer(self.local_peer_id, remote_session_id)
     }
 
     /// Look up or create a `PeerId` for the given session ID string.
@@ -838,8 +970,14 @@ impl Signaller for SymbiosSignaller {
                 );
 
                 let signal = match data {
-                    PeerSignal::Offer(sdp) => SignalPayload::Offer(sdp),
-                    PeerSignal::Answer(sdp) => SignalPayload::Answer(sdp),
+                    PeerSignal::Offer(sdp) => {
+                        self.bump(|d| &d.offers_sent);
+                        SignalPayload::Offer(sdp)
+                    }
+                    PeerSignal::Answer(sdp) => {
+                        self.bump(|d| &d.answers_sent);
+                        SignalPayload::Answer(sdp)
+                    }
                     PeerSignal::IceCandidate(c) => SignalPayload::IceCandidate(c),
                 };
 
@@ -885,6 +1023,7 @@ impl Signaller for SymbiosSignaller {
 
                 return match envelope.signal {
                     SignalPayload::Offer(sdp) => {
+                        self.bump(|d| &d.offers_received);
                         let pid = self.get_or_create_peer_id(sender_id);
                         tracing::debug!(
                             local = %self.local_peer_id,
@@ -898,6 +1037,7 @@ impl Signaller for SymbiosSignaller {
                         })
                     }
                     SignalPayload::Answer(sdp) => {
+                        self.bump(|d| &d.answers_received);
                         let pid = self.get_or_create_peer_id(sender_id);
                         tracing::debug!(
                             local = %self.local_peer_id,
@@ -919,25 +1059,42 @@ impl Signaller for SymbiosSignaller {
                     }
                     SignalPayload::PeerJoined(ref id) => {
                         // Register the session→PeerId mapping so subsequent
-                        // signals from this peer resolve correctly, but do NOT
-                        // emit `NewPeer`.  Matchbox treats `NewPeer` as "you
-                        // are the Offerer" and immediately creates an SDP offer.
-                        // The joining peer already received us in its peer_list
-                        // and will send its own Offer; emitting `NewPeer` here
-                        // would make both sides offer simultaneously (WebRTC
-                        // "glare"), which matchbox does not recover from.
+                        // signals from this peer resolve correctly. Matchbox
+                        // treats `NewPeer` as "you are the Offerer" and creates
+                        // an SDP offer, so we emit it only when the deterministic
+                        // tie-break ([`should_offer`]) designates us the Offerer
+                        // for this pair *and* we have not already started
+                        // offering to it. A near-simultaneous join can surface
+                        // the same peer via both `peer_list` (in `read_welcome`)
+                        // and this `PeerJoined`; the `is_new` guard prevents a
+                        // duplicate offer that would clobber the in-flight
+                        // handshake.
                         //
-                        // When the joiner's Offer arrives as a `PeerEvent::Signal`
-                        // from an unknown PeerId, matchbox lazily creates the
-                        // peer via `accept_handshake` (the `or_insert_with` path
-                        // in `message_loop`).
+                        // If we are the Answerer, we register the mapping only
+                        // and wait: when the Offerer's Offer arrives as a
+                        // `PeerEvent::Signal` from a not-yet-handshaking PeerId,
+                        // matchbox lazily creates the peer via `accept_handshake`
+                        // (the `or_insert_with` path in `message_loop`).
+                        let is_new = !self.session_to_peer.contains_key(id);
+                        let should_offer = self.should_offer(id);
                         let pid = self.get_or_create_peer_id(id);
+                        if is_new && should_offer {
+                            self.bump(|d| &d.offers_initiated);
+                            tracing::debug!(
+                                local = %self.local_peer_id,
+                                joined_session = %id,
+                                mapped_peer = %pid,
+                                "RX PeerJoined → tie-break makes us the Offerer → emitting NewPeer",
+                            );
+                            return Ok(PeerEvent::NewPeer(pid));
+                        }
                         tracing::debug!(
                             local = %self.local_peer_id,
                             joined_session = %id,
                             mapped_peer = %pid,
-                            "RX PeerJoined → registered mapping (not emitting NewPeer \
-                             to avoid offer glare; will accept incoming Offer lazily)",
+                            already_known = !is_new,
+                            "RX PeerJoined → tie-break makes us the Answerer → registered \
+                             mapping, will accept incoming Offer lazily",
                         );
                         continue;
                     }
@@ -1028,6 +1185,7 @@ pub fn signaller_with_token_source(source: TokenSource) -> Arc<dyn SignallerBuil
         session_map: None,
         #[cfg(target_arch = "wasm32")]
         wasm_retry_state: None,
+        diagnostics: None,
     })
 }
 
@@ -1043,6 +1201,7 @@ pub fn signaller_anonymous() -> Arc<dyn SignallerBuilder> {
         session_map: None,
         #[cfg(target_arch = "wasm32")]
         wasm_retry_state: None,
+        diagnostics: None,
     })
 }
 
@@ -1061,6 +1220,7 @@ pub fn signaller_anonymous_with_map(session_map: PeerSessionMap) -> Arc<dyn Sign
         session_map: Some(session_map),
         #[cfg(target_arch = "wasm32")]
         wasm_retry_state: None,
+        diagnostics: None,
     })
 }
 
@@ -1074,6 +1234,7 @@ pub fn signaller_with_token_source_and_map(
         session_map: Some(session_map),
         #[cfg(target_arch = "wasm32")]
         wasm_retry_state: None,
+        diagnostics: None,
     })
 }
 
@@ -1092,9 +1253,15 @@ pub fn signaller_with_token_source_and_map(
 /// or [`signaller_anonymous_with_map`] — they produce a builder whose WASM
 /// retry state is local to a single `new_signaller` call, which is the correct
 /// scope for one-shot programmatic use.
+///
+/// `diagnostics` threads a shared [`SignalDiagnostics`] sink through every
+/// signaller the builder produces, so the host application can observe the
+/// signalling layer (peer_list size, offers/answers) that matchbox otherwise
+/// hides. Pass `None` to disable diagnostics.
 pub fn signaller_full(
     token_source: Option<TokenSource>,
     session_map: Option<PeerSessionMap>,
+    diagnostics: Option<SharedSignalDiagnostics>,
     #[cfg(target_arch = "wasm32")] wasm_retry_state: Option<WasmBlindRetryStateHandle>,
 ) -> Arc<dyn SignallerBuilder> {
     Arc::new(SymbiosSignallerBuilder {
@@ -1102,5 +1269,78 @@ pub fn signaller_full(
         session_map,
         #[cfg(target_arch = "wasm32")]
         wasm_retry_state,
+        diagnostics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The core anti-glare invariant: the offerer arbitration is a strict total
+    /// order, so for any two distinct sessions exactly one side is the Offerer.
+    /// This is what prevents BOTH the simultaneous-join glare (both offering,
+    /// the bug this fixes) and its inverse (neither offering — a silent
+    /// no-connection). `^` asserts exactly-one, never both, never neither.
+    #[test]
+    fn exactly_one_peer_offers_per_pair() {
+        let pairs = [
+            ("did:plc:alice", "did:plc:bob"),
+            ("did:web:example.com", "did:plc:zzz"),
+            ("11111111-1111-1111-1111-111111111111", "did:plc:someone"),
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ),
+        ];
+        for (a, b) in pairs {
+            let a_offers = local_is_offerer(session_id_to_peer_id(a), b);
+            let b_offers = local_is_offerer(session_id_to_peer_id(b), a);
+            assert!(
+                a_offers ^ b_offers,
+                "exactly one of ({a}, {b}) must offer, got a_offers={a_offers} b_offers={b_offers}",
+            );
+        }
+    }
+
+    /// The decision does not depend on evaluation order or join timing — the
+    /// whole point of the tie-break. The higher deterministic PeerId always
+    /// offers, whichever side computes it.
+    #[test]
+    fn decision_is_order_independent_and_deterministic() {
+        let a = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let first = local_is_offerer(session_id_to_peer_id(a), b);
+        let again = local_is_offerer(session_id_to_peer_id(a), b);
+        assert_eq!(first, again, "decision must be deterministic");
+        let expected = session_id_to_peer_id(a) > session_id_to_peer_id(b);
+        assert_eq!(
+            first, expected,
+            "higher deterministic PeerId must be the offerer"
+        );
+    }
+
+    /// A peer never offers to itself (`>` is irreflexive), so a self-entry
+    /// accidentally left in a peer_list can never spawn a pointless self-offer.
+    #[test]
+    fn a_peer_never_offers_to_itself() {
+        let me = "did:plc:selfselfselfselfselfself";
+        assert!(!local_is_offerer(session_id_to_peer_id(me), me));
+    }
+
+    /// `session_id_to_peer_id` is deterministic — the same session string maps
+    /// to the same PeerId on both peers — which is what lets them agree on the
+    /// order. A raw UUID session id is used verbatim; a DID is hashed via v5.
+    #[test]
+    fn session_id_to_peer_id_is_deterministic() {
+        assert_eq!(
+            session_id_to_peer_id("did:plc:example"),
+            session_id_to_peer_id("did:plc:example"),
+        );
+        let u = "abcdef00-1234-5678-9abc-def012345678";
+        assert_eq!(
+            session_id_to_peer_id(u),
+            PeerId(Uuid::parse_str(u).unwrap())
+        );
+    }
 }

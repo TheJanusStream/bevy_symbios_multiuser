@@ -134,10 +134,14 @@ pub mod prelude {
     pub use crate::plugin::{SymbiosMultiuserConfig, SymbiosMultiuserPlugin};
     pub use crate::smoother::{SmootherConfig, TransformBuffer, TransformSample};
     pub use bevy_matchbox::prelude::{ChannelConfig, PeerId, PeerState};
+    pub use matchbox_socket::RtcIceServerConfig;
 
     #[cfg(feature = "client")]
     pub use crate::auth::AtprotoSession;
 
     #[cfg(feature = "client")]
-    pub use crate::signaller::{PeerSessionMap, PeerSessionMapRes, SymbiosSignallerBuilder};
+    pub use crate::signaller::{
+        PeerSessionMap, PeerSessionMapRes, SharedSignalDiagnostics, SignalDiagnostics,
+        SignalDiagnosticsRes, SymbiosSignallerBuilder,
+    };
 }

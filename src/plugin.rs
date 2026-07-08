@@ -223,6 +223,7 @@ where
         app.init_resource::<NetworkQueue<T>>()
             .init_resource::<PeerStateQueue<T>>()
             .init_resource::<crate::signaller::PeerSessionMapRes>()
+            .init_resource::<crate::signaller::SignalDiagnosticsRes>()
             .add_message::<Broadcast<T>>()
             .add_message::<SendTo<T>>()
             .add_message::<LocalSocketReopened>()
@@ -272,6 +273,7 @@ fn open_socket<T: Send + Sync + 'static>(
     mut reopened: MessageWriter<LocalSocketReopened>,
     #[cfg(feature = "client")] token_source: Option<Res<crate::signaller::TokenSourceRes>>,
     #[cfg(feature = "client")] session_map: Res<crate::signaller::PeerSessionMapRes>,
+    #[cfg(feature = "client")] signal_diagnostics: Res<crate::signaller::SignalDiagnosticsRes>,
     #[cfg(all(feature = "client", target_arch = "wasm32"))] wasm_retry: Res<
         crate::signaller::WasmBlindRetryStateRes,
     >,
@@ -419,6 +421,7 @@ fn open_socket<T: Send + Sync + 'static>(
         let signaller = crate::signaller::signaller_full(
             token_source.map(|ts| ts.0.clone()),
             Some(session_map.0.clone()),
+            Some(signal_diagnostics.0.clone()),
             #[cfg(target_arch = "wasm32")]
             Some(wasm_retry.0.clone()),
         );
