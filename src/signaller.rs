@@ -297,6 +297,19 @@ pub struct SignalDiagnostics {
     pub answers_sent: AtomicU64,
     /// SDP answers this peer received, completing an offer it initiated.
     pub answers_received: AtomicU64,
+    /// Relay handshake rejections the signaller gave up on: an HTTP 4xx on the
+    /// WebSocket upgrade (native — chiefly `401` from an expired/invalid
+    /// service-auth token, but also `403`/`429`), or a wasm blind-retry
+    /// exhaustion (the browser hides handshake status codes). Unlike the other
+    /// counters this records a *failure to connect at all* — the socket never
+    /// opens, so no `peer_list`/offer/answer follows. The dominant cause is a
+    /// stale auth token; keep it fresh (re-issue via `get_service_auth` and
+    /// update the [`TokenSource`]) to keep this at zero.
+    pub auth_rejections: AtomicU64,
+    /// HTTP status of the most recent relay rejection (e.g. `401`). `0` when
+    /// unknown — including every wasm rejection, where the browser `WebSocket`
+    /// API does not expose the handshake status code.
+    pub last_reject_status: AtomicU64,
 }
 
 /// Cheap-to-clone shared handle to [`SignalDiagnostics`].
@@ -347,6 +360,18 @@ impl SymbiosSignallerBuilder {
     /// Return the current JWT from the refreshable [`TokenSource`], if any.
     fn current_token(&self) -> Option<String> {
         self.token_source.as_ref().and_then(|s| s.get())
+    }
+
+    /// Record a relay handshake rejection into the shared [`SignalDiagnostics`]
+    /// (if one was threaded through): bump the rejection counter and store the
+    /// HTTP status (`0` = unknown, e.g. every wasm rejection). Called from the
+    /// two give-up points in [`new_signaller`](Self::new_signaller) so a stale
+    /// token surfaces to the host application instead of only the log.
+    fn record_reject(&self, status: u64) {
+        if let Some(d) = &self.diagnostics {
+            d.auth_rejections.fetch_add(1, Ordering::Relaxed);
+            d.last_reject_status.store(status, Ordering::Relaxed);
+        }
     }
 
     /// Stable, non-cryptographic 64-bit fingerprint of the current token used
@@ -462,6 +487,7 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                     // HTTP 4xx errors are permanent client-side rejections (e.g. 401
                     // Invalid JWT). Retrying won't help — surface them immediately.
                     if is_http_client_error(&e) {
+                        self.record_reject(http_client_error_status(&e).unwrap_or(0));
                         return Err(e);
                     }
                     #[cfg(target_arch = "wasm32")]
@@ -478,6 +504,9 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
                             guard.failures
                         };
                         if failures >= WASM_MAX_BLIND_RETRIES {
+                            // Status unknown: the browser WebSocket API hides the
+                            // handshake HTTP code, so record it as `0`.
+                            self.record_reject(0);
                             tracing::error!(
                                 attempts = failures,
                                 "WASM relay connection failed {WASM_MAX_BLIND_RETRIES} times in \
@@ -568,6 +597,17 @@ impl SignallerBuilder for SymbiosSignallerBuilder {
 /// of burning through all reconnect attempts on a deterministic failure.
 fn is_http_client_error(e: &SignalingError) -> bool {
     matches!(e, SignalingError::UserImplementationError(s) if s.starts_with("http_client_error:"))
+}
+
+/// Extract the HTTP status code from an `http_client_error:{code}` error tag,
+/// for diagnostics. Returns `None` for any other error shape.
+fn http_client_error_status(e: &SignalingError) -> Option<u64> {
+    match e {
+        SignalingError::UserImplementationError(s) => s
+            .strip_prefix("http_client_error:")
+            .and_then(|code| code.trim().parse().ok()),
+        _ => None,
+    }
 }
 
 /// Maximum time to wait for a WebSocket handshake to complete.
