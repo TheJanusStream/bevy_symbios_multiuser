@@ -105,6 +105,7 @@ pub mod messages;
 pub mod plugin;
 pub mod protocol;
 pub mod smoother;
+pub mod socket;
 pub mod systems;
 
 #[cfg(feature = "client")]
@@ -133,8 +134,9 @@ pub mod prelude {
     };
     pub use crate::plugin::{SymbiosMultiuserConfig, SymbiosMultiuserPlugin};
     pub use crate::smoother::{SmootherConfig, TransformBuffer, TransformSample};
-    pub use bevy_matchbox::prelude::{ChannelConfig, PeerId, PeerState};
+    pub use crate::socket::{CloseSocketExt, MatchboxSocket, OpenSocketExt};
     pub use matchbox_socket::RtcIceServerConfig;
+    pub use matchbox_socket::{ChannelConfig, PeerId, PeerState};
 
     #[cfg(feature = "client")]
     pub use crate::auth::AtprotoSession;

@@ -306,20 +306,20 @@ pub enum PeerConnectionState {
 }
 
 /// Fired by the plugin whenever it has opened a fresh
-/// [`bevy_matchbox::prelude::MatchboxSocket`] — once on initial connect, and
+/// [`MatchboxSocket`](crate::socket::MatchboxSocket) — once on initial connect, and
 /// again on every reconnect after a drop.
 ///
 /// Use this to drive UI status indicators ("connecting…" / "connected") or
 /// to trigger a fresh authoritative-state pull on resync. Note that the
 /// socket has only just been opened: the relay's welcome handshake (the
 /// `session_id` + `peer_list` messages that assign the local
-/// [`bevy_matchbox::prelude::PeerId`]) has not yet completed. Listen for
+/// [`PeerId`](matchbox_socket::PeerId)) has not yet completed. Listen for
 /// [`WelcomeHandshakeComplete`] if you need the local PeerId.
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LocalSocketReopened;
 
 /// Fired once per socket lifetime when the relay's welcome handshake has
-/// completed and the local [`bevy_matchbox::prelude::PeerId`] is known.
+/// completed and the local [`PeerId`](matchbox_socket::PeerId) is known.
 ///
 /// Internally this is detected as the first frame on which
 /// `MatchboxSocket::id()` returns `Some` after a fresh

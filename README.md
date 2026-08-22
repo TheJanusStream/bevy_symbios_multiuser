@@ -293,9 +293,11 @@ On WASM targets, the browser `WebSocket` API does not allow custom HTTP headers,
 
 | Crate              | Version |
 |--------------------|---------|
-| `bevy`             | 0.18    |
-| `bevy_matchbox`    | 0.14    |
+| `bevy`             | 0.19    |
+| `matchbox_socket`  | 0.14    |
 | `serde`            | 1.0     |
+
+The Bevy-side socket wrapper (`MatchboxSocket`, `open_socket`/`close_socket`) lives in this crate's `socket` module rather than coming from `bevy_matchbox`, which stopped at Bevy 0.18.
 
 ## License
 

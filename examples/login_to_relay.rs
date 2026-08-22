@@ -375,9 +375,13 @@ async fn run_oauth_flow(
 /// Pending OAuth task. Polled from a Bevy system; once it completes the
 /// system inserts `TokenSourceRes` and `SymbiosMultiuserConfig`, which
 /// triggers the plugin's `open_socket` system on the next frame.
+/// What the OAuth task hands back: the session plus the relay URL, or the
+/// error text to show.
+type OauthResult = Result<(AtprotoSession, String), String>;
+
 #[derive(Resource)]
 struct OauthOutcome {
-    inner: Arc<Mutex<Option<Result<(AtprotoSession, String), String>>>>,
+    inner: Arc<Mutex<Option<OauthResult>>>,
 }
 
 #[derive(Resource)]

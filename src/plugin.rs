@@ -1,10 +1,10 @@
 use crate::messages::{
     Broadcast, LocalSocketReopened, NetworkQueue, PeerStateQueue, SendTo, WelcomeHandshakeComplete,
 };
+use crate::socket::{MatchboxSocket, OpenSocketExt};
 use crate::systems;
 use bevy::prelude::*;
-use bevy_matchbox::prelude::*;
-use matchbox_socket::RtcIceServerConfig;
+use matchbox_socket::{ChannelConfig, PeerId, RtcIceServerConfig, WebRtcSocketBuilder};
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use std::time::Duration;
@@ -311,9 +311,10 @@ fn open_socket<T: Send + Sync + 'static>(
         //
         // 1. The `MatchboxSocket` resource has been removed entirely (e.g. an
         //    external system called `commands.close_socket()`).
-        // 2. The signaling/message-loop task has terminated. `bevy_matchbox`
-        //    does *not* automatically remove the `MatchboxSocket` resource on
-        //    a signaling drop — the `WebRtcSocket` keeps living in the ECS
+        // 2. The signaling/message-loop task has terminated. The socket
+        //    wrapper (`crate::socket`, inherited from `bevy_matchbox`) does
+        //    *not* automatically remove the `MatchboxSocket` resource on a
+        //    signaling drop — the `WebRtcSocket` keeps living in the ECS
         //    world while its background task is dead — so relying on
         //    `socket.is_none()` alone would silently miss every real
         //    disconnect (idle timeout, network flap, server restart) and

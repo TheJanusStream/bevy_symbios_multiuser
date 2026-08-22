@@ -2,9 +2,10 @@ use crate::messages::{
     Broadcast, ChannelKind, NetworkQueue, NetworkReceived, PeerConnectionState, PeerStateChanged,
     PeerStateQueue, SendTo,
 };
+use crate::socket::MatchboxSocket;
 use bevy::prelude::*;
-use bevy_matchbox::prelude::*;
 use bincode::Options;
+use matchbox_socket::{PeerId, PeerState};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Maximum size in bytes for a single deserialized network message.
