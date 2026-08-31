@@ -17,6 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+          cache: false
       - run: cargo fmt -- --check
 
   # This job replaces a single `cargo build --verbose` on default features that
@@ -53,6 +58,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Reads the pinned version out of rust-toolchain.toml — that file is the
+      # single source of truth, and this action honours it, which
+      # `dtolnay/rust-toolchain@stable` does not: it installs whatever is
+      # newest and ignores the pin.
+      #
+      # `cache: false` because the Swatinem step already caches; two cache
+      # layers on one key fight each other.
+      - name: Install Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache: false
+
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
@@ -87,13 +105,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # As in the test job, but asking the action for the wasm target too, so
+      # the pin covers this job and the target is named in one place.
+      - name: Install Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache: false
+
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
-
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
 
       - name: Cache cargo registry and target dir
         uses: Swatinem/rust-cache@v2
