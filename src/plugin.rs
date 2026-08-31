@@ -1,12 +1,24 @@
+// Everything except `RtcIceServerConfig` (a field of the ungated
+// `SymbiosMultiuserConfig`) is reachable only from the `client`-gated `Plugin`
+// impl below and the systems it installs. The imports have to carry the same
+// gate the impl does, or a `--no-default-features` build is nine dead-import
+// warnings — which `-D warnings` makes a build failure.
+#[cfg(feature = "client")]
 use crate::messages::{
     Broadcast, LocalSocketReopened, NetworkQueue, PeerStateQueue, SendTo, WelcomeHandshakeComplete,
 };
+#[cfg(feature = "client")]
 use crate::socket::{MatchboxSocket, OpenSocketExt};
+#[cfg(feature = "client")]
 use crate::systems;
 use bevy::prelude::*;
-use matchbox_socket::{ChannelConfig, PeerId, RtcIceServerConfig, WebRtcSocketBuilder};
+use matchbox_socket::RtcIceServerConfig;
+#[cfg(feature = "client")]
+use matchbox_socket::{ChannelConfig, PeerId, WebRtcSocketBuilder};
+#[cfg(feature = "client")]
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
+#[cfg(feature = "client")]
 use std::time::Duration;
 
 /// Configuration for the symbios multiuser plugin.
@@ -141,6 +153,10 @@ fn ice_unchanged(
 /// developers insert the config after login/menu screens rather than being
 /// forced to connect immediately at app launch.
 pub struct SymbiosMultiuserPlugin<T> {
+    // Read only by the `client`-gated `Plugin::build` below. The constructors
+    // that fill it are ungated, so without `client` the field is written and
+    // never read.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     config: Option<SymbiosMultiuserConfig<T>>,
     _marker: PhantomData<T>,
 }

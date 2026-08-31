@@ -49,7 +49,13 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
+// The Quick Start installs `SymbiosMultiuserPlugin`, whose `Plugin` impl is
+// gated on `client` (see `plugin.rs`). Compiled as a doctest under
+// `--no-default-features` it fails to build, so the fence opens as `ignore`
+// there: the example still renders, and it is still compile-checked in every
+// configuration that can actually run it.
+#![cfg_attr(feature = "client", doc = "```rust,no_run")]
+#![cfg_attr(not(feature = "client"), doc = "```rust,ignore")]
 //! use bevy::prelude::*;
 //! use bevy_symbios_multiuser::prelude::*;
 //! use serde::{Serialize, Deserialize};

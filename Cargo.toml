@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_multiuser"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Janus"]
 description = "Multi-user networking for Bevy via ATProto auth with WebRTC p2p messaging."
@@ -105,4 +105,13 @@ harness = false
 # callback uses `tiny_http`.
 [[example]]
 name = "login_to_relay"
+required-features = ["client"]
+
+# `basic_chat` installs `SymbiosMultiuserPlugin`, whose `Plugin` impl is gated
+# on `client`. `relay_server` states the same dependency with an inner
+# `#[cfg(feature = "relay")]`; this one declares it here so a
+# `--no-default-features` build skips the target instead of failing to compile
+# it.
+[[example]]
+name = "basic_chat"
 required-features = ["client"]

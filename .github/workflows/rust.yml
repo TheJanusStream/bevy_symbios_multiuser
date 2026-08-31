@@ -10,21 +10,97 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Formatting needs no system libraries and no feature resolution, so it runs
+  # as its own fast job rather than repeating once per matrix entry.
+  fmt:
+    name: Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - run: cargo fmt -- --check
+
+  # This job replaces a single `cargo build --verbose` on default features that
+  # had carried no test step since 9b89a75 (2026-03-28). The consequence was
+  # not just untested code: `relay` is an optional feature, so the 3858-line
+  # relay module — the whole hostile-peer boundary, with its DID/JWT signature
+  # verification, SSRF guards and rate limiting — was never *compiled* here at
+  # all, and the 59 tests guarding it ran only on the author's machine.
+  #
+  # Every feature combination gets its own entry. bevy_symbios learned the same
+  # lesson from the other direction (#34, a `serde_json` dev-dep that shipped
+  # only under `asset-loader` and reached main because CI built one feature
+  # set); this is that workflow's shape. It caught two live breakages here on
+  # its first run: `--no-default-features` could not compile its own test
+  # target or the `basic_chat` example, because both install a plugin whose
+  # `Plugin` impl is deliberately gated on `client`.
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every broken combination in one run instead of stopping at the
+      # first failure.
+      fail-fast: false
+      matrix:
+        include:
+          - name: no default features
+            flags: "--no-default-features"
+          - name: default (client + tls)
+            flags: ""
+          - name: relay
+            flags: "--features relay"
+          - name: all features
+            flags: "--all-features"
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
 
-      - name: Check Formatting
-        run: cargo fmt -- --check
+      # Bevy is expensive to build from scratch; without this each matrix entry
+      # pays the full compile cost.
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
+      # `--all-targets` covers tests, examples and benches — the lib-only lint
+      # this replaces missed warnings in the test suite entirely.
       - name: Clippy (Linting)
-        run: cargo clippy -- -D warnings
+        run: cargo clippy ${{ matrix.flags }} --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose ${{ matrix.flags }}
+
+      - name: Run Tests
+        run: cargo test --verbose ${{ matrix.flags }}
+
+  # The client half of this crate ships to a browser, and nothing here ever
+  # built for one. Default features only: `relay` is `cfg`'d out on wasm32, but
+  # Cargo resolves optional dependencies without regard to target `cfg`, so
+  # `--all-features` would drag `tokio`'s net stack and `hickory-resolver` into
+  # a wasm build that never uses them.
+  wasm:
+    name: wasm32 check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      # `--lib` only: the examples and benches are native (loopback OAuth
+      # callbacks, criterion), and the browser only ever links the library.
+      - name: Check
+        run: cargo check --verbose --target wasm32-unknown-unknown --lib
