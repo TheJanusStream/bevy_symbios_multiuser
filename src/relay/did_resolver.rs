@@ -716,6 +716,13 @@ impl DidResolver {
         let client = reqwest::Client::builder()
             .timeout(DID_FETCH_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            // Name the TLS backend rather than inheriting it (#134).
+            // reqwest's `TlsBackend::default()` prefers native-tls whenever
+            // `default-tls` is anywhere in the graph, and it is: proto-blue's
+            // crates depend on reqwest WITH default features. Without this
+            // the `relay` feature's `reqwest/rustls-tls` was linked and
+            // unused while DID fetches went through OpenSSL.
+            .use_rustls_tls()
             .build()
             .expect("failed to build reqwest client");
 
@@ -947,6 +954,10 @@ impl DidResolver {
                     .timeout(DID_FETCH_TIMEOUT)
                     .redirect(reqwest::redirect::Policy::none())
                     .resolve(&host_only, validated_addr)
+                    // Same as `DidResolver::new` (#134): the pinned
+                    // per-domain client must not inherit a different TLS
+                    // backend from the one the resolver itself uses.
+                    .use_rustls_tls()
                     .build()
                     .map_err(|e| {
                         DidError::Transient(format!("failed to build pinned HTTP client: {e}"))
