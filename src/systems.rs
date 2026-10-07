@@ -1,3 +1,9 @@
+//! The systems the plugin schedules between the socket and the message
+//! types: [`poll_peers`] reports peer state, [`receive_messages`] decodes
+//! inbound payloads into the [`NetworkQueue`], and [`transmit_messages`] /
+//! [`transmit_directed_messages`] send what the host wrote.
+//! [`bincode_options`] is the one wire encoding both directions use.
+
 use crate::messages::{
     Broadcast, ChannelKind, NetworkQueue, NetworkReceived, PeerConnectionState, PeerStateChanged,
     PeerStateQueue, SendTo,
@@ -61,7 +67,7 @@ const MAX_DESER_WARNS_PER_FRAME: usize = 3;
 /// and pushes [`NetworkReceived<T>`] entries to the [`NetworkQueue<T>`] resource.
 ///
 /// Deserialization failures are logged at `warn` up to
-/// [`MAX_DESER_WARNS_PER_FRAME`] times per call, then demoted to `trace`
+/// `MAX_DESER_WARNS_PER_FRAME` times per call, then demoted to `trace`
 /// to prevent log-I/O floods from a malicious peer.
 pub fn receive_messages<T>(mut socket: ResMut<MatchboxSocket>, mut queue: ResMut<NetworkQueue<T>>)
 where

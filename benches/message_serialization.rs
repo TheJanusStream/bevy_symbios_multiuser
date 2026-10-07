@@ -1,3 +1,10 @@
+//! Serialization cost of a typical payload through the production bincode
+//! options: serialize, deserialize and the round trip.
+#![expect(
+    missing_docs,
+    reason = "criterion 0.6's criterion_group! defines an undocumented pub fn; 0.8 documents it, and this expectation then fails so it can go"
+)]
+
 use std::hint::black_box;
 
 use bincode::Options;

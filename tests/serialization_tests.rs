@@ -1,3 +1,6 @@
+//! Payloads round-trip through the production bincode options, and corrupt
+//! or empty input is an error rather than a panic.
+
 use bevy_symbios_multiuser::systems::bincode_options;
 use bincode::Options;
 use serde::{Deserialize, Serialize};

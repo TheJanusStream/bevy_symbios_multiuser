@@ -41,7 +41,7 @@
 //! 3. The relay (`relay` module, feature-gated) validates the JWT claims and — when
 //!    `auth_required` is enabled — resolves the issuer's DID document to
 //!    cryptographically verify the signature (ES256/P-256 or ES256K/secp256k1)
-//!    against the `#atproto` signing key. When [`RelayConfig::service_did`] is
+//!    against the `#atproto` signing key. When `relay::RelayConfig::service_did` is
 //!    set, the `aud` claim is also validated to prevent cross-service token
 //!    replay. The authenticated DID becomes the peer's session identity.
 //! 4. Once signaling completes, data flows directly peer-to-peer over
@@ -105,6 +105,8 @@
 //!   concurrency limiting, request coalescing, negative DID caching, peer ID
 //!   length validation, unique target cap, and JWT audience validation
 //!   (`service_did`). Built on `axum`.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod error;
 pub mod messages;

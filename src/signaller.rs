@@ -159,7 +159,7 @@ impl PeerSessionMapRes {
     /// assigned to `peer_id`, if the signaller currently knows that peer.
     ///
     /// Returns `None` for unknown peers, and for the brief window between
-    /// matchbox surfacing a [`PeerState::Connected`] event and the signaller
+    /// matchbox surfacing a [`PeerState::Connected`](matchbox_socket::PeerState::Connected) event and the signaller
     /// recording the underlying session ID. Callers that need a strict check
     /// should treat `None` as "not yet verified" rather than "verified absent".
     pub fn session_id(&self, peer_id: &matchbox_socket::PeerId) -> Option<String> {
@@ -287,7 +287,7 @@ pub struct SignalDiagnostics {
     /// room when we last joined.
     pub last_peer_list_len: AtomicU64,
     /// `NewPeer` events emitted to matchbox — the pairs this peer is the
-    /// Offerer for (per the deterministic tie-break in [`local_is_offerer`]).
+    /// Offerer for (per the deterministic tie-break in `local_is_offerer`).
     pub offers_initiated: AtomicU64,
     /// SDP offers this peer sent over the signalling channel.
     pub offers_sent: AtomicU64,
@@ -1286,7 +1286,7 @@ pub fn signaller_with_token_source_and_map(
 /// - [`PeerSessionMap`] so the DID ↔ `PeerId` binding survives the short window
 ///   where the old signaller is dropped and the new one has not yet replayed
 ///   `peer_list`,
-/// - [`WasmBlindRetryStateHandle`] (wasm only) so the blind-retry counter is
+/// - `WasmBlindRetryStateHandle` (wasm only) so the blind-retry counter is
 ///   not re-zeroed on every ECS respawn.
 ///
 /// Callers outside the plugin should prefer [`signaller_with_token_source_and_map`]

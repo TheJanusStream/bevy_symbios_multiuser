@@ -1,3 +1,7 @@
+//! [`SymbiosMultiuserPlugin`] and the [`SymbiosMultiuserConfig`] resource
+//! whose insertion opens the socket. The plugin installs the systems in
+//! [`crate::systems`] and reconnects with backoff when the socket drops.
+
 // Everything except `RtcIceServerConfig` (a field of the ungated
 // `SymbiosMultiuserConfig`) is reachable only from the `client`-gated `Plugin`
 // impl below and the systems it installs. The imports have to carry the same

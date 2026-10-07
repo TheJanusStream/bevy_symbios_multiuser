@@ -1,3 +1,7 @@
+//! The plugin's message shapes, and with `client` on, what installing
+//! `SymbiosMultiuserPlugin` registers and that an update without a socket
+//! does not panic.
+
 use bevy_symbios_multiuser::messages::{Broadcast, ChannelKind};
 use serde::{Deserialize, Serialize};
 

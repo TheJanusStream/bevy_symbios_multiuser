@@ -42,7 +42,9 @@ use std::collections::VecDeque;
 /// One pose sample on a remote peer's history line.
 #[derive(Clone, Copy, Debug)]
 pub struct TransformSample {
+    /// The sampled translation, at [`Self::timestamp`].
     pub position: Vec3,
+    /// The sampled rotation, at [`Self::timestamp`].
     pub rotation: Quat,
     /// Seconds since application start, taken from
     /// [`bevy::prelude::Time::elapsed_secs_f64`]. The buffer expects samples
@@ -112,6 +114,8 @@ impl Default for SmootherConfig {
 /// already uses for remote peers.
 #[derive(Component, Default, Debug)]
 pub struct TransformBuffer {
+    /// The received history line, oldest first: pushed at the back,
+    /// trimmed from the front.
     pub samples: VecDeque<TransformSample>,
 }
 

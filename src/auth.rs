@@ -7,11 +7,13 @@
 //!
 //! # Runtime requirement
 //!
-//! Every async function in this module uses `reqwest` (via proto-blue-oauth),
-//! which **requires a Tokio runtime** on native targets. Calling them from a
-//! Bevy system directly will panic with `"must be called from within a Tokio
-//! runtime"`. On WASM the browser's `fetch` backend is used and no runtime is
-//! required.
+//! Every async function in this module goes out through the host's
+//! transport: the `FetchHandler` its `OAuthSession` or `OAuthClient` was
+//! built with (`with_fetch_handler`; this crate turns on no default fetcher
+//! of proto-blue's). A reqwest-backed handler, the usual native choice,
+//! **requires a Tokio runtime**: calling these from a Bevy system directly
+//! panics with `"must be called from within a Tokio runtime"`. On WASM the
+//! browser's `fetch` backend is used and no runtime is required.
 //!
 //! The recommended pattern is to spawn a detached Tokio task from a Bevy
 //! `IoTaskPool` task, or to call them from inside a

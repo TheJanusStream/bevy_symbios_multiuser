@@ -1,3 +1,5 @@
+//! Value semantics of `ChannelKind` and `PeerConnectionState`.
+
 use bevy_symbios_multiuser::messages::{ChannelKind, PeerConnectionState};
 
 #[test]

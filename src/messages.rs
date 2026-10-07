@@ -1,3 +1,12 @@
+//! The messages and resources a host exchanges with the plugin. Outbound:
+//! [`Broadcast`] and [`SendTo`], or the [`SendMessage`] system param that
+//! writes them. Inbound: [`NetworkReceived`], and the [`NetworkQueue`] (read
+//! through [`MessagesReceived`]) that a fixed-step consumer drains without
+//! missing a frame. Peers joining and leaving arrive as [`PeerStateChanged`]
+//! in a [`PeerStateQueue`]; [`LocalSocketReopened`] and
+//! [`WelcomeHandshakeComplete`] mark the local socket's own lifecycle.
+//! [`ChannelKind`] picks the reliable or the unreliable data channel.
+
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use matchbox_socket::PeerId;
@@ -103,11 +112,12 @@ const MAX_NETWORK_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 /// consumer runs in `FixedUpdate` at a lower tick rate than the render
 /// framerate. The host application must drain the queue manually.
 ///
-/// The queue is bounded by both a count limit ([`MAX_NETWORK_QUEUE_LEN`] = 4,096
-/// entries) and a total byte budget ([`MAX_NETWORK_QUEUE_BYTES`] = 16 MiB of
+/// The queue is bounded by both a count limit (`MAX_NETWORK_QUEUE_LEN` = 4,096
+/// entries) and a total byte budget (`MAX_NETWORK_QUEUE_BYTES` = 16 MiB of
 /// raw wire bytes). When either limit is reached, new messages are dropped and
 /// a warning is logged, preventing an out-of-memory condition from a malicious
-/// flood. See [`MAX_NETWORK_QUEUE_BYTES`] for the wire-vs-heap caveats.
+/// flood. `MAX_NETWORK_QUEUE_BYTES`, in this module, documents the
+/// wire-vs-heap caveats.
 ///
 /// # Example
 ///
@@ -232,7 +242,7 @@ pub struct PeerStateChanged {
 ///
 /// Like [`NetworkQueue`], this avoids the double-buffer clearing issue with
 /// Bevy `Messages` so that `FixedUpdate` consumers never miss a peer
-/// connect/disconnect event. Capped at [`MAX_NETWORK_QUEUE_LEN`].
+/// connect/disconnect event. Capped at `MAX_NETWORK_QUEUE_LEN`.
 ///
 /// The type parameter `T` ties this queue to a specific
 /// [`SymbiosMultiuserPlugin<T>`](crate::plugin::SymbiosMultiuserPlugin)
@@ -313,13 +323,13 @@ pub enum PeerConnectionState {
 /// to trigger a fresh authoritative-state pull on resync. Note that the
 /// socket has only just been opened: the relay's welcome handshake (the
 /// `session_id` + `peer_list` messages that assign the local
-/// [`PeerId`](matchbox_socket::PeerId)) has not yet completed. Listen for
+/// [`PeerId`]) has not yet completed. Listen for
 /// [`WelcomeHandshakeComplete`] if you need the local PeerId.
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LocalSocketReopened;
 
 /// Fired once per socket lifetime when the relay's welcome handshake has
-/// completed and the local [`PeerId`](matchbox_socket::PeerId) is known.
+/// completed and the local [`PeerId`] is known.
 ///
 /// Internally this is detected as the first frame on which
 /// `MatchboxSocket::id()` returns `Some` after a fresh
