@@ -59,7 +59,7 @@ use uuid::Uuid;
 #[cfg(not(target_arch = "wasm32"))]
 use async_tungstenite::WebSocketStream;
 #[cfg(not(target_arch = "wasm32"))]
-use async_tungstenite::async_std::{ConnectStream, connect_async};
+use async_tungstenite::smol::{ConnectStream, connect_async};
 #[cfg(not(target_arch = "wasm32"))]
 use async_tungstenite::tungstenite;
 

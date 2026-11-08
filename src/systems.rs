@@ -11,7 +11,7 @@ use crate::messages::{
 use crate::socket::MatchboxSocket;
 use bevy::prelude::*;
 use bincode::Options;
-use matchbox_socket::{PeerId, PeerState};
+use matchbox_socket::{Packet, PeerId, PeerState};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Maximum size in bytes for a single deserialized network message.
@@ -178,7 +178,7 @@ pub fn transmit_messages<T>(
                 continue;
             }
         };
-        let packet: Box<[u8]> = bytes.into_boxed_slice();
+        let packet = Packet::from(bytes);
         let channel_idx = event.channel.index();
 
         let channel = match socket.get_channel_mut(channel_idx) {
@@ -189,8 +189,9 @@ pub fn transmit_messages<T>(
             }
         };
 
-        // Send to all peers, avoiding one unnecessary clone by sending the
-        // original packet to the last peer.
+        // Send to all peers, handing the original packet to the last one.
+        // A `Packet` is `bytes::Bytes` since matchbox_socket 0.15, so each
+        // clone is a reference-count bump, not a copy of the payload.
         if let Some((&last, rest)) = peers.split_last() {
             for &peer in rest {
                 channel.send(packet.clone(), peer);
@@ -227,7 +228,7 @@ pub fn transmit_directed_messages<T>(
                 continue;
             }
         };
-        let packet: Box<[u8]> = bytes.into_boxed_slice();
+        let packet = Packet::from(bytes);
         let channel_idx = event.channel.index();
 
         let channel = match socket.get_channel_mut(channel_idx) {

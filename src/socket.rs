@@ -15,7 +15,7 @@
 //! # Lifetime of the message loop
 //!
 //! [`MatchboxSocket`] owns the [`Task`] driving the socket's message loop.
-//! Dropping the resource drops the task, and on Bevy 0.19 a dropped task is
+//! Dropping the resource drops the task, and since Bevy 0.19 a dropped task is
 //! cancelled on every platform — including wasm, where earlier Bevy versions
 //! silently let it run on. Removing the resource is therefore the one way to
 //! stop the loop, and the plugin's reopen path relies on exactly that.
